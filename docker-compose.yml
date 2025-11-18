@@ -1,0 +1,33 @@
+version: "2.4"  # ← МЕНЯЕМ НА ПОДДЕРЖИВАЕМУЮ ВЕРСИЮ
+
+services:
+  redis:
+    image: redis:5-alpine  # ← Более старая версия для совместимости
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      - redis
+    volumes:
+      - ./uploads:/app/uploads
+      - ./books:/app/books
+
+  worker:
+    build: .
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      - redis
+    volumes:
+      - ./uploads:/app/uploads
+      - ./books:/app/books
+    command: celery -A worker.celery_app.celery_app worker --loglevel=info -Q default,analysis,translation,tts --concurrency=1
