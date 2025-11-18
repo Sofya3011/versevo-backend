@@ -22,8 +22,9 @@ matplotlib==3.8.0
 wordcloud==1.9.3
 scikit-learn==1.3.2
 numpy==1.26.2
-
+spacy==3.7.4  # ← ДОБАВИЛА ЭТУ СТРОЧКУ!
 # Environment
 python-dotenv==1.0.0
 pydantic==2.5.0
 requests==2.31.0
+
