@@ -3,35 +3,15 @@ import uuid
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
 from pathlib import Path
-from celery import Celery
-import shutil
-import json
-from . import db, models
-from .services.extractor import extract_text_from_file
-from .services.analysis import analyze_text
-from .config import settings
-# Эндпоинты
-@app.get("/")
-async def root():
-    return {
-        "message": "Versevo Backend API", 
-        "version": "1.0.0",
-        "endpoints": {
-            "analyze": "POST /analyze - анализ текста",
-            "upload": "POST /upload - загрузка файла",
-            "health": "GET /health - статус сервера"
-        }
-    }
-# Celery config - broker URL from env
-celery = Celery(
-    "versevo_tasks",
-    broker=os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"),
-    backend=os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/1"),
-)
+from pydantic import BaseModel
 
-app = FastAPI(title="Versevo Backend")
+from .services.analysis import analyze_text
+from .services.extractor import extract_text_from_file
+from .config import settings
+
+# Создаем приложение ОДИН раз!
+app = FastAPI(title="Versevo Backend", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,86 +20,131 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Ensure folders
+# Модели запросов
+class AnalyzeRequest(BaseModel):
+    text: str
+
+# Создаем необходимые папки
 Path(settings.UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
 Path(settings.BOOKS_FOLDER).mkdir(parents=True, exist_ok=True)
 
-# DB init
-db.init_db()
+# Основные эндпоинты
+@app.get("/")
+async def root():
+    return {
+        "message": "Versevo Backend API", 
+        "version": "1.0.0",
+        "endpoints": {
+            "analyze": "POST /analyze - анализ текста",
+            "upload": "POST /upload - загрузка файла", 
+            "health": "GET /health - статус сервера",
+            "test-analysis": "GET /test-analysis - тестовый анализ"
+        }
+    }
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": "Versevo Backend"}
+
+@app.post("/analyze")
+async def analyze_text_endpoint(request: AnalyzeRequest):
+    """Анализ текста через OpenAI"""
+    try:
+        result = analyze_text(request.text)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка анализа: {str(e)}")
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    file_id = uuid.uuid4().hex
-    ext = Path(file.filename).suffix
-    dest = Path(settings.UPLOAD_FOLDER) / f"{file_id}{ext}"
-    content = await file.read()
-    dest.write_bytes(content)
-
-    # extract text (sync)
+async def upload_file(file: UploadFile = File(...)):
+    """Загрузка файла"""
     try:
-        text = extract_text_from_file(str(dest), file.content_type)
+        # Читаем содержимое файла
+        content = await file.read()
+        text_content = content.decode('utf-8')
+        
+        file_id = str(uuid.uuid4())
+        
+        return {
+            "id": file_id,
+            "filename": file.filename,
+            "status": "uploaded", 
+            "message": "Файл успешно загружен",
+            "preview": text_content[:200] + "..." if len(text_content) > 200 else text_content,
+            "text_length": len(text_content)
+        }
     except Exception as e:
-        dest.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Text extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка загрузки: {str(e)}")
 
-    # save metadata to DB
-    session = db.SessionLocal()
-    book = models.Book(
-        filename=file.filename,
-        file_path=str(dest),
-        file_type=file.content_type or ext,
-        language="unknown",
-        needs_translation=False
-    )
-    session.add(book)
-    session.commit()
-    session.refresh(book)
-    session.close()
-
-    return {"id": book.id, "filename": book.filename, "preview": text[:300]}
-
-@app.post("/translate-job")
-def create_translation_job(document_id: int, mode: str = "artistic"):
+@app.get("/test-analysis")
+async def test_analysis():
+    """Тестовый анализ (для проверки работы)"""
+    test_text = """
+    Маленький принц жил на планете, которая была чуть больше его самого, и ему очень не хватало друга.
+    Однажды на его планете появилась роза, прекрасная и капризная. Маленький принц полюбил её, 
+    но её капризы заставили его отправиться в путешествие по другим планетам.
+    В ходе своих путешествий он встретил короля, который правил всем, но не имел подданных, 
+    честолюбца, который желал лишь восхищения, и пьяницу, который пил чтобы забыть о стыде.
     """
-    Enqueue translation job (using HF NLLB or LibreTranslate)
-    Returns celery task id
-    """
-    session = db.SessionLocal()
-    book = session.query(models.Book).filter(models.Book.id == document_id).first()
-    session.close()
-    if not book:
-        raise HTTPException(status_code=404, detail="Document not found")
+    
+    result = analyze_text(test_text)
+    return {
+        "test_text": test_text,
+        "analysis_result": result
+    }
 
-    payload = {"document_id": document_id, "mode": mode}
-    task = celery.send_task("worker.tasks.translate_task", args=[payload])
-    return {"task_id": task.id}
+# Дополнительные эндпоинты для расширенной функциональности
+@app.post("/upload-and-analyze")
+async def upload_and_analyze(file: UploadFile = File(...)):
+    """Загрузка файла и немедленный анализ"""
+    try:
+        # Загружаем файл
+        content = await file.read()
+        text_content = content.decode('utf-8')
+        
+        # Анализируем текст
+        analysis_result = analyze_text(text_content)
+        
+        return {
+            "filename": file.filename,
+            "text_length": len(text_content),
+            "analysis": analysis_result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-@app.post("/synthesize-job")
-def create_synthesize_job(document_id: int, voice: str = "default", style: str = "neutral"):
-    session = db.SessionLocal()
-    book = session.query(models.Book).filter(models.Book.id == document_id).first()
-    session.close()
-    if not book:
-        raise HTTPException(status_code=404, detail="Document not found")
+@app.get("/stats")
+async def get_stats():
+    """Статистика сервера"""
+    return {
+        "service": "Versevo Backend",
+        "status": "running",
+        "features": [
+            "Анализ текста через OpenAI",
+            "Извлечение персонажей и тем", 
+            "Анализ тональности",
+            "Создание облака слов",
+            "Загрузка файлов"
+        ]
+    }
 
-    payload = {"document_id": document_id, "voice": voice, "style": style}
-    task = celery.send_task("worker.tasks.synthesize_task", args=[payload])
-    return {"task_id": task.id}
+# Эндпоинты для Celery (пока закомментированы - будут работать когда добавим Redis)
+"""
+from celery import Celery
+
+# Celery config - будет работать когда добавим Redis
+celery = Celery(
+    "versevo_tasks",
+    broker=os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0"),
+    backend=os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1"),
+)
 
 @app.post("/analyze-job")
-def analyze_job(document_id: int):
-    payload = {"document_id": document_id}
-    task = celery.send_task("worker.tasks.analyze_task", args=[payload])
-    return {"task_id": task.id}
+def analyze_job_background(document_id: int):
+    # Будет работать когда добавим Celery
+    return {"message": "Celery tasks will be available soon", "status": "coming_soon"}
+"""
 
-@app.get("/task/{task_id}")
-def get_task_status(task_id: str):
-    res = celery.AsyncResult(task_id)
-    response = {"id": task_id, "state": res.state}
-    try:
-        result = res.get(timeout=0.5)
-        response["result"] = result
-    except Exception:
-        pass
-
-    return JSONResponse(response)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
