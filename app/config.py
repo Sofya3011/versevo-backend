@@ -3,6 +3,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Settings:
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    UPLOAD_FOLDER = "uploads"
+    BOOKS_FOLDER = "books"
     DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY")
     DEEPL_API_URL = os.getenv("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -19,5 +22,6 @@ class Settings:
     S3_KEY = os.getenv("S3_KEY")
     S3_SECRET = os.getenv("S3_SECRET")
     S3_BUCKET = os.getenv("S3_BUCKET", "versevo-audio")
+
 
 settings = Settings()
