@@ -12,7 +12,18 @@ from . import db, models
 from .services.extractor import extract_text_from_file
 from .services.analysis import analyze_text
 from .config import settings
-
+# Эндпоинты
+@app.get("/")
+async def root():
+    return {
+        "message": "Versevo Backend API", 
+        "version": "1.0.0",
+        "endpoints": {
+            "analyze": "POST /analyze - анализ текста",
+            "upload": "POST /upload - загрузка файла",
+            "health": "GET /health - статус сервера"
+        }
+    }
 # Celery config - broker URL from env
 celery = Celery(
     "versevo_tasks",
@@ -110,4 +121,5 @@ def get_task_status(task_id: str):
         response["result"] = result
     except Exception:
         pass
+
     return JSONResponse(response)
