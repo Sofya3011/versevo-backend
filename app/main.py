@@ -1,16 +1,14 @@
 import os
 import uuid
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pathlib import Path
 from pydantic import BaseModel
 
 from .services.analysis import analyze_text
-from .services.extractor import extract_text_from_file
 from .config import settings
 
-# Создаем приложение ОДИН раз!
 app = FastAPI(title="Versevo Backend", version="1.0.0")
 
 app.add_middleware(
@@ -34,22 +32,47 @@ async def root():
     return {
         "message": "Versevo Backend API", 
         "version": "1.0.0",
-        "endpoints": {
-            "analyze": "POST /analyze - анализ текста",
-            "upload": "POST /upload - загрузка файла", 
-            "health": "GET /health - статус сервера",
-            "test-analysis": "GET /test-analysis - тестовый анализ"
-        }
+        "status": "active",
+        "endpoints": [
+            {"method": "GET", "path": "/", "description": "Информация об API"},
+            {"method": "GET", "path": "/health", "description": "Статус сервера"},
+            {"method": "GET", "path": "/stats", "description": "Статистика сервера"},
+            {"method": "GET", "path": "/test-analysis", "description": "Тестовый анализ текста"},
+            {"method": "POST", "path": "/analyze", "description": "Анализ текста через OpenAI"},
+            {"method": "POST", "path": "/upload", "description": "Загрузка файла"}
+        ]
     }
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "Versevo Backend"}
+    return {
+        "status": "healthy", 
+        "service": "Versevo Backend",
+        "timestamp": "2024-01-01T00:00:00Z"
+    }
+
+@app.get("/stats")
+async def get_stats():
+    return {
+        "service": "Versevo Backend",
+        "status": "running", 
+        "version": "1.0.0",
+        "features": [
+            "Анализ текста через OpenAI",
+            "Извлечение персонажей и тем",
+            "Анализ тональности", 
+            "Создание облака слов",
+            "Загрузка файлов"
+        ]
+    }
 
 @app.post("/analyze")
 async def analyze_text_endpoint(request: AnalyzeRequest):
     """Анализ текста через OpenAI"""
     try:
+        if not request.text or len(request.text.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Текст не может быть пустым")
+        
         result = analyze_text(request.text)
         return result
     except Exception as e:
@@ -59,9 +82,17 @@ async def analyze_text_endpoint(request: AnalyzeRequest):
 async def upload_file(file: UploadFile = File(...)):
     """Загрузка файла"""
     try:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="Имя файла не указано")
+        
         # Читаем содержимое файла
         content = await file.read()
-        text_content = content.decode('utf-8')
+        
+        # Пытаемся декодировать как текст
+        try:
+            text_content = content.decode('utf-8')
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="Файл должен быть текстовым (UTF-8)")
         
         file_id = str(uuid.uuid4())
         
@@ -71,80 +102,44 @@ async def upload_file(file: UploadFile = File(...)):
             "status": "uploaded", 
             "message": "Файл успешно загружен",
             "preview": text_content[:200] + "..." if len(text_content) > 200 else text_content,
-            "text_length": len(text_content)
+            "text_length": len(text_content),
+            "file_size": len(content)
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка загрузки: {str(e)}")
 
 @app.get("/test-analysis")
 async def test_analysis():
     """Тестовый анализ (для проверки работы)"""
-    test_text = """
-    Маленький принц жил на планете, которая была чуть больше его самого, и ему очень не хватало друга.
-    Однажды на его планете появилась роза, прекрасная и капризная. Маленький принц полюбил её, 
-    но её капризы заставили его отправиться в путешествие по другим планетам.
-    В ходе своих путешествий он встретил короля, который правил всем, но не имел подданных, 
-    честолюбца, который желал лишь восхищения, и пьяницу, который пил чтобы забыть о стыде.
-    """
-    
-    result = analyze_text(test_text)
-    return {
-        "test_text": test_text,
-        "analysis_result": result
-    }
-
-# Дополнительные эндпоинты для расширенной функциональности
-@app.post("/upload-and-analyze")
-async def upload_and_analyze(file: UploadFile = File(...)):
-    """Загрузка файла и немедленный анализ"""
     try:
-        # Загружаем файл
-        content = await file.read()
-        text_content = content.decode('utf-8')
+        test_text = """
+        Маленький принц жил на планете, которая была чуть больше его самого, и ему очень не хватало друга.
+        Однажды на его планете появилась роза, прекрасная и капризная. Маленький принц полюбил её, 
+        но её капризы заставили его отправиться в путешествие по другим планетам.
+        В ходе своих путешествий он встретил короля, который правил всем, но не имел подданных, 
+        честолюбца, который желал лишь восхищения, и пьяницу, который пил чтобы забыть о стыде.
+        """
         
-        # Анализируем текст
-        analysis_result = analyze_text(text_content)
-        
+        result = analyze_text(test_text)
         return {
-            "filename": file.filename,
-            "text_length": len(text_content),
-            "analysis": analysis_result
+            "test_text": test_text,
+            "analysis_result": result
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Тестовый анализ не удался: {str(e)}")
 
-@app.get("/stats")
-async def get_stats():
-    """Статистика сервера"""
+# Простой эндпоинт для проверки
+@app.get("/ping")
+async def ping():
+    return {"message": "pong", "status": "ok"}
+
+@app.get("/env-check")
+async def env_check():
+    """Проверка переменных окружения"""
     return {
-        "service": "Versevo Backend",
-        "status": "running",
-        "features": [
-            "Анализ текста через OpenAI",
-            "Извлечение персонажей и тем", 
-            "Анализ тональности",
-            "Создание облака слов",
-            "Загрузка файлов"
-        ]
+        "openai_key_configured": bool(settings.OPENAI_API_KEY),
+        "upload_folder": settings.UPLOAD_FOLDER,
+        "books_folder": settings.BOOKS_FOLDER
     }
-
-# Эндпоинты для Celery (пока закомментированы - будут работать когда добавим Redis)
-"""
-from celery import Celery
-
-# Celery config - будет работать когда добавим Redis
-celery = Celery(
-    "versevo_tasks",
-    broker=os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0"),
-    backend=os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1"),
-)
-
-@app.post("/analyze-job")
-def analyze_job_background(document_id: int):
-    # Будет работать когда добавим Celery
-    return {"message": "Celery tasks will be available soon", "status": "coming_soon"}
-"""
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
