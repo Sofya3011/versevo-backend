@@ -5,7 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pathlib import Path
 from pydantic import BaseModel
-
+from .services.translator import translate_text
+from .services.tts_service import synthesize_speech
 from .services.analysis import analyze_text
 from .config import settings
 
@@ -129,7 +130,22 @@ async def test_analysis():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Тестовый анализ не удался: {str(e)}")
-
+@app.post("/translate")
+async def translate_endpoint(request: AnalyzeRequest):
+    """Перевод текста"""
+    try:
+        translated = translate_text(request.text)
+        return {"original": request.text, "translated": translated}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка перевода: {str(e)}")
+@app.post("/synthesize")
+async def synthesize_endpoint(request: AnalyzeRequest):
+    """Озвучка текста"""
+    try:
+        audio_path = synthesize_speech(request.text)
+        return {"text": request.text, "audio_path": audio_path}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка озвучки: {str(e)}")
 # Простой эндпоинт для проверки
 @app.get("/ping")
 async def ping():
@@ -143,3 +159,4 @@ async def env_check():
         "upload_folder": settings.UPLOAD_FOLDER,
         "books_folder": settings.BOOKS_FOLDER
     }
+
