@@ -9,7 +9,8 @@ from .services.translator import translate_text
 from .services.tts_service import synthesize_speech
 from .services.analysis import analyze_text
 from .config import settings
-
+from fastapi import FastAPI
+from app.services.translation_nllb import translate_text_nllb
 app = FastAPI(title="Versevo Backend", version="1.0.0")
 
 app.add_middleware(
@@ -51,7 +52,10 @@ async def health():
         "service": "Versevo Backend",
         "timestamp": "2024-01-01T00:00:00Z"
     }
-
+@app.post("/translate/nllb")
+def translate_nllb_api(text: str, source: str, target: str):
+    translated = translate_text_nllb(text, source, target)
+    return {"translated": translated}
 @app.get("/stats")
 async def get_stats():
     return {
@@ -159,4 +163,5 @@ async def env_check():
         "upload_folder": settings.UPLOAD_FOLDER,
         "books_folder": settings.BOOKS_FOLDER
     }
+
 
