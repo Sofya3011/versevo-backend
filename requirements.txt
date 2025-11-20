@@ -1,48 +1,30 @@
-# Core
+# === CORE & WEB ===
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 
-# File processing
+# === FILE PROCESSING ===
 python-docx==1.1.0
 PyMuPDF==1.23.8
 
-# Database
+# === DATABASE & ASYNC ===
 sqlalchemy==2.0.23
-
-# Async
 aiofiles==23.2.1
 celery==5.3.6
 redis==5.0.1
 
-# NLP & Analysis
+# === NLP & ANALYSIS (ЛЕГКИЕ) ===
 nltk==3.8.1
-networkx>=2.5.0,<3.0.0
+networkx>=2.5.0,<3.0.0  # Важно: для совместимости с gruut
 matplotlib==3.8.0
 wordcloud==1.9.3
 scikit-learn==1.3.2
 numpy==1.26.2
-# Environment
+spacy==3.7.2
+langdetect==1.0.9
+
+# === ENVIRONMENT & UTILS ===
 python-dotenv==1.0.0
 pydantic==2.5.0
 requests==2.31.0
-
-python-docx==1.1.0
-pymupdf==1.23.7
-langdetect==1.0.9
-python-dotenv==1.0.0
 boto3==1.34.0
-
-
-# Лёгкие ML для анализа
-spacy==3.7.2
-https://github.com/explosion/spacy-models/releases/download/xx_ent_wiki_sm-3.7.0/xx_ent_wiki_sm-3.7.0-py3-none-any.whl
-nltk==3.8.1
-scikit-learn==1.3.2
-networkx==3.2.1
-matplotlib==3.8.2
-wordcloud==1.9.3
-
-
-
-
