@@ -1,7 +1,14 @@
 import requests
 import time
 from ..config import settings
-
+import spacy
+try:
+    nlp = spacy.load("xx_ent_wiki_sm")
+except OSError:
+    # Скачиваем если нет
+    from spacy.cli import download
+    download("xx_ent_wiki_sm")
+    nlp = spacy.load("xx_ent_wiki_sm")
 class HFTranslationService:
     def __init__(self):
         self.api_key = settings.HF_API_KEY
@@ -84,3 +91,4 @@ NLLB_LANGUAGES = {
     "arabic": "arb_Arab",
     "hindi": "hin_Deva"
 }
+
