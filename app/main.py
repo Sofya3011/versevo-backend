@@ -1,16 +1,14 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-import spacy
-import nltk
-from langdetect import detect
-from langdetect import LangDetectError
-import requests
-import time
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+import logging
 import asyncio
-from typing import Dict, List, Optional
 
-# Инициализация FastAPI
-app = FastAPI(title="Versevo Backend")
+# Используем langdetect но без LangDetectError
+from langdetect import detect
+
+app = FastAPI(title="Versevo Backend API")
 
 # CORS middleware
 app.add_middleware(
@@ -21,197 +19,174 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Инициализация NLP моделей
-try:
-    nlp = spacy.load("xx_ent_wiki_sm")
-except OSError:
-    from spacy.cli import download
-    download("xx_ent_wiki_sm")
-    nlp = spacy.load("xx_ent_wiki_sm")
+# Модели запросов/ответов
+class DocumentCreate(BaseModel):
+    filename: str
+    content: str
 
-# Загрузка NLTK данных
-def download_nltk_data():
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        nltk.download('punkt', quiet=True)
-    try:
-        nltk.data.find('corpora/stopwords')
-    except LookupError:
-        nltk.download('stopwords', quiet=True)
+class DocumentResponse(BaseModel):
+    id: int
+    filename: str
+    content: str
+    language: str
+    file_type: str
 
-download_nltk_data()
+class TranslationRequest(BaseModel):
+    text: str
+    source_language: str
+    target_language: str
+    style: str = "artistic"
 
-# Языковые коды NLLB
-NLLB_LANGUAGES = {
-    "russian": "rus_Cyrl",
-    "english": "eng_Latn", 
-    "french": "fra_Latn",
-    "german": "deu_Latn",
-    "spanish": "spa_Latn",
-    "chinese": "zho_Hans",
-    "japanese": "jpn_Jpan",
-    "korean": "kor_Hang",
-    "arabic": "arb_Arab",
-    "hindi": "hin_Deva"
-}
+class AnalyzeRequest(BaseModel):
+    document_id: int
 
-class HFTranslationService:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.model = "facebook/nllb-200-3.3B"
+# Простая база данных в памяти (замените на реальную БД)
+documents_db = []
+current_id = 1
+
+def detect_language_safe(text: str) -> str:
+    """Безопасное определение языка с обработкой ошибок"""
+    if not text or len(text.strip()) < 10:
+        return "en"
     
-    async def translate(self, text: str, target_lang: str = "rus_Cyrl", source_lang: str = "eng_Latn") -> str:
-        """Перевод через HF NLLB"""
+    try:
+        # Пробуем определить язык
+        detected_lang = detect(text)
+        return detected_lang
+    except Exception as e:
+        # Если langdetect не работает, используем простую эвристику
+        logging.warning(f"Language detection failed: {e}, using fallback")
         
-        payload = {
-            "inputs": text,
-            "parameters": {
-                "src_lang": source_lang,
-                "tgt_lang": target_lang
-            }
-        }
+        # Простая эвристика по символам
+        cyrillic_chars = sum(1 for char in text if '\u0400' <= char <= '\u04FF')
+        latin_chars = sum(1 for char in text if char.isalpha() and char.isascii())
         
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        
-        try:
-            response = requests.post(
-                f"https://api-inference.huggingface.co/models/{self.model}",
-                headers=headers,
-                json=payload,
-                timeout=60
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                return result[0]['translation_text']
-            elif response.status_code == 503:
-                return await self._translate_with_retry(text, target_lang, source_lang)
-            else:
-                raise Exception(f"Translation API error: {response.status_code}")
-                
-        except Exception as e:
-            raise Exception(f"Translation failed: {str(e)}")
-    
-    async def _translate_with_retry(self, text: str, target_lang: str, source_lang: str, max_retries: int = 3) -> str:
-        """Повторные попытки перевода"""
-        for attempt in range(max_retries):
-            try:
-                await asyncio.sleep(5 * (attempt + 1))  # Используем asyncio.sleep вместо time.sleep
-                
-                payload = {
-                    "inputs": text,
-                    "parameters": {
-                        "src_lang": source_lang,
-                        "tgt_lang": target_lang
-                    }
-                }
-                
-                headers = {"Authorization": f"Bearer {self.api_key}"}
-                response = requests.post(
-                    f"https://api-inference.huggingface.co/models/{self.model}",
-                    headers=headers,
-                    json=payload,
-                    timeout=60
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    return result[0]['translation_text']
-                    
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise Exception(f"Translation failed after {max_retries} retries: {str(e)}")
-        
-        raise Exception("Max retries exceeded for translation")
-
-# Инициализация сервиса перевода (нужно будет добавить API key в настройки)
-# translator = HFTranslationService(api_key="your_hf_api_key_here")
+        if cyrillic_chars > latin_chars and cyrillic_chars > 10:
+            return "ru"
+        else:
+            return "en"
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Versevo Backend is running"}
-
-@app.post("/analyze/{document_id}")
-async def analyze_document(document_id: int, text: str):
-    """Анализ документа"""
-    try:
-        # Определяем язык
-        try:
-            language = detect(text)
-        except LangDetectError:
-            language = "unknown"
-        
-        # Извлекаем сущности (персонажи)
-        doc = nlp(text)
-        persons = [ent.text for ent in doc.ents if ent.label_ == "PER"]
-        
-        # Считаем частотность персонажей
-        person_counts = {}
-        for person in persons:
-            person_counts[person] = person_counts.get(person, 0) + 1
-        
-        # Простой суммаризатор
-        sentences = nltk.sent_tokenize(text)
-        summary = " ".join(sentences[:3]) if len(sentences) >= 3 else " ".join(sentences)
-        
-        return {
-            "document_id": document_id,
-            "language": language,
-            "persons": [{"name": name, "count": count} for name, count in person_counts.items()],
-            "summary": summary,
-            "wordcloud": f"/static/wordcloud_{document_id}.png",
-            "graph": f"/static/graph_{document_id}.png"
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-@app.post("/translate/nllb")
-async def translate_text(text: str, source: str = "en", target: str = "ru"):
-    """Перевод текста через NLLB"""
-    try:
-        # Конвертируем языковые коды в формат NLLB
-        source_nllb = NLLB_LANGUAGES.get(source, "eng_Latn")
-        target_nllb = NLLB_LANGUAGES.get(target, "rus_Cyrl")
-        
-        # Здесь нужно инициализировать translator с реальным API key
-        # translated = await translator.translate(text, target_nllb, source_nllb)
-        
-        # Временный заглушка
-        translated = f"[Перевод] {text}"
-        
-        return {"translated": translated, "source": source, "target": target}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
+    return {"message": "Versevo Backend API"}
 
 @app.get("/documents")
 async def get_documents():
-    """Получение списка документов"""
-    # Заглушка - нужно подключить базу данных
-    return [
-        {
-            "id": 1,
-            "filename": "Пример документа.txt",
-            "content": "Это тестовый документ для проверки работы приложения.",
-            "language": "ru"
-        }
-    ]
+    return documents_db
 
-@app.get("/document/{document_id}")
+@app.get("/documents/{document_id}")
 async def get_document(document_id: int):
-    """Получение конкретного документа"""
-    # Заглушка - нужно подключить базу данных
+    for doc in documents_db:
+        if doc["id"] == document_id:
+            return doc
+    raise HTTPException(status_code=404, detail="Document not found")
+
+@app.post("/documents/upload")
+async def upload_document(file: UploadFile = File(...), filename: str = None):
+    global current_id
+    
+    try:
+        content = await file.read()
+        content_str = content.decode('utf-8')
+        
+        # Определяем язык
+        language = detect_language_safe(content_str)
+        
+        # Определяем тип файла
+        file_type = file.filename.split('.')[-1].lower() if file.filename else "txt"
+        
+        document = {
+            "id": current_id,
+            "filename": filename or file.filename,
+            "content": content_str,
+            "language": language,
+            "file_type": file_type
+        }
+        
+        documents_db.append(document)
+        current_id += 1
+        
+        return document
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.delete("/documents/{document_id}")
+async def delete_document(document_id: int):
+    global documents_db
+    initial_length = len(documents_db)
+    documents_db = [doc for doc in documents_db if doc["id"] != document_id]
+    
+    if len(documents_db) == initial_length:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    return {"message": "Document deleted"}
+
+@app.post("/analyze")
+async def analyze_document(request: AnalyzeRequest):
+    # Имитация анализа документа
+    document = next((doc for doc in documents_db if doc["id"] == request.document_id), None)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Генерируем фиктивные результаты анализа
+    analysis_result = {
+        "summary": f"Анализ документа '{document['filename']}'. Содержит {len(document['content'])} символов.",
+        "language": document["language"],
+        "char_count": len(document["content"]),
+        "word_count": len(document["content"].split()),
+        "persons": [
+            {"name": "Персонаж 1", "count": 5},
+            {"name": "Персонаж 2", "count": 3}
+        ],
+        "visuals": {
+            "wordcloud": "/static/wordcloud.png",
+            "topwords": "/static/topwords.png",
+            "graph": "/static/graph.png"
+        }
+    }
+    
+    return analysis_result
+
+@app.post("/translate")
+async def translate_text(request: TranslationRequest):
+    # Имитация перевода
+    translated_text = f"[{request.style} перевод с {request.source_language} на {request.target_language}]: {request.text}"
+    
     return {
-        "id": document_id,
-        "filename": f"Документ {document_id}.txt",
-        "content": "Содержимое документа...",
-        "language": "ru"
+        "original_text": request.text,
+        "translated_text": translated_text,
+        "source_language": request.source_language,
+        "target_language": request.target_language,
+        "style": request.style
     }
 
-# Запуск приложения
+@app.post("/translate/nllb")
+async def translate_nllb(request: dict):
+    # Специфичный endpoint для NLLB перевода
+    text = request.get("text", "")
+    source = request.get("source", "en")
+    target = request.get("target", "ru")
+    
+    translated_text = f"[NLLB перевод с {source} на {target}]: {text}"
+    
+    return {"translated": translated_text}
+
+@app.post("/audio/generate")
+async def generate_audio(request: dict):
+    # Имитация генерации аудио
+    document_id = request.get("document_id")
+    voice = request.get("voice", "default")
+    style = request.get("style", "neutral")
+    
+    return {
+        "id": 1,
+        "voice": voice,
+        "style": style,
+        "audio_url": f"/audio/generated_{document_id}.mp3",
+        "duration": 300.0
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
