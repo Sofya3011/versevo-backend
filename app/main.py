@@ -2,7 +2,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import spacy
 import nltk
-from langdetect import detect, LangDetectError
+from langdetect import detect
+from langdetect import LangDetectError
 import requests
 import time
 import asyncio
@@ -213,3 +214,4 @@ async def get_document(document_id: int):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
