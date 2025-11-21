@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import logging
 import asyncio
-
+import base64
 # Используем langdetect но без LangDetectError
 from langdetect import detect
 
@@ -70,6 +70,40 @@ def detect_language_safe(text: str) -> str:
 async def root():
     return {"message": "Versevo Backend API"}
 
+@app.post("/documents/upload-base64")
+async def upload_document_base64(request: dict):
+    global current_id
+    
+    try:
+        filename = request.get("filename", "unknown")
+        file_data = request.get("file_data", "")
+        file_size = request.get("file_size", 0)
+        
+        # Декодируем base64
+        content_bytes = base64.b64decode(file_data)
+        content_str = content_bytes.decode('utf-8', errors='ignore')
+        
+        # Определяем язык
+        language = detect_language_safe(content_str)
+        
+        # Определяем тип файла
+        file_type = filename.split('.')[-1].lower() if '.' in filename else "txt"
+        
+        document = {
+            "id": current_id,
+            "filename": filename,
+            "content": content_str,
+            "language": language,
+            "file_type": file_type
+        }
+        
+        documents_db.append(document)
+        current_id += 1
+        
+        return document
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 @app.get("/documents")
 async def get_documents():
     return documents_db
@@ -190,3 +224,4 @@ async def generate_audio(request: dict):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
