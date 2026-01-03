@@ -16,15 +16,32 @@ from datetime import datetime
 import fitz  # PyMuPDF
 import docx
 
-# Локальные импорты
-from .db import Base, engine, get_db
-from .flutter_endpoints import router as flutter_router
-from .utils import detect_language_safe
-from .config import settings
+# Настройка пути для импортов
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Локальные импорты (теперь используем абсолютные пути)
+from db import Base, engine, get_db
+from flutter_endpoints import router as flutter_router
+from utils import detect_language_safe
+from config import settings
 from sqlalchemy.orm import Session
 
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
 # Создаем таблицы в БД
-Base.metadata.create_all(bind=engine)
+try:
+    Base.metadata.create_all(bind=engine)
+    logger.info("✅ Database tables created successfully")
+except Exception as e:
+    logger.error(f"❌ Error creating database tables: {e}")
 
 app = FastAPI(
     title="Versevo Backend API",
@@ -44,11 +61,17 @@ app.add_middleware(
 # Подключаем Flutter роутер
 app.include_router(flutter_router)
 
-# Монтирование статических файлов
+# Создаем директории для файлов
 os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(settings.BOOKS_FOLDER, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_FOLDER), name="uploads")
-app.mount("/books", StaticFiles(directory=settings.BOOKS_FOLDER), name="books")
+
+# Монтирование статических файлов
+try:
+    app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_FOLDER), name="uploads")
+    app.mount("/books", StaticFiles(directory=settings.BOOKS_FOLDER), name="books")
+    logger.info(f"✅ Static files mounted: uploads={settings.UPLOAD_FOLDER}, books={settings.BOOKS_FOLDER}")
+except Exception as e:
+    logger.error(f"❌ Error mounting static files: {e}")
 
 # Модели запросов/ответов
 class DocumentCreate(BaseModel):
@@ -98,6 +121,7 @@ def extract_text_from_file(file_path: str, file_type: str) -> str:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read()
     except Exception as e:
+        logger.error(f"Error extracting text from file: {e}")
         return f"Ошибка извлечения текста: {str(e)}"
 
 def _extract_pdf(path: str) -> str:
@@ -109,6 +133,7 @@ def _extract_pdf(path: str) -> str:
             text.append(page.get_text())
         doc.close()
     except Exception as e:
+        logger.error(f"Error reading PDF: {e}")
         return f"Ошибка чтения PDF: {str(e)}"
     return "\n\n".join(text)
 
@@ -119,6 +144,7 @@ def _extract_docx(path: str) -> str:
         paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
         return "\n\n".join(paragraphs)
     except Exception as e:
+        logger.error(f"Error reading DOCX: {e}")
         return f"Ошибка чтения DOCX: {str(e)}"
 
 def detect_chapters(text: str) -> List[Dict]:
@@ -181,14 +207,44 @@ def detect_chapters(text: str) -> List[Dict]:
     
     return chapters
 
+@app.on_event("startup")
+async def startup_event():
+    """Логирование при запуске"""
+    port = os.getenv("PORT", "8000")
+    logger.info(f"🚀 Starting Versevo Backend on port {port}")
+    logger.info(f"📁 Current working directory: {os.getcwd()}")
+    logger.info(f"📂 Files in services directory: {os.listdir('services') if os.path.exists('services') else 'Directory not found'}")
+    logger.info(f"🔧 Database URL: {settings.DATABASE_URL[:50]}..." if settings.DATABASE_URL else "❌ DATABASE_URL not set")
+
 @app.get("/")
 async def root():
+    logger.info("📍 Root endpoint accessed")
     return {"message": "Versevo Backend API", "version": "2.0.0"}
 
-@app.get("/api/health")
+@app.get("/api/flutter/health")
 async def health_check():
     """Health check endpoint for Railway"""
+    logger.info("❤️ Health check endpoint accessed")
+    return {"status": "healthy", "service": "versevo-backend", "timestamp": datetime.now().isoformat()}
+
+@app.get("/api/health")
+async def health_check_alt():
+    """Alternative health check endpoint"""
     return {"status": "healthy", "service": "versevo-backend"}
+
+@app.get("/api/test")
+async def test_endpoint():
+    """Test endpoint"""
+    return {
+        "message": "API is working", 
+        "port": os.getenv("PORT", "8000"),
+        "host": "0.0.0.0",
+        "env": {
+            "PORT": os.getenv("PORT"),
+            "PYTHONPATH": os.getenv("PYTHONPATH", "Not set"),
+            "RAILWAY_ENVIRONMENT": os.getenv("RAILWAY_ENVIRONMENT", "Not set")
+        }
+    }
 
 @app.post("/documents/upload-base64")
 async def upload_document_base64(request: dict):
@@ -243,6 +299,7 @@ async def upload_document_base64(request: dict):
         return document
 
     except Exception as e:
+        logger.error(f"Error uploading document: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.get("/documents")
@@ -337,4 +394,6 @@ async def get_document_chapters(document_id: int):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    logger.info(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
