@@ -14,11 +14,12 @@ from datetime import datetime
 # main.py - В НАЧАЛЕ ФАЙЛА ДОБАВЬ:
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
 # ПОСЛЕ ИМПОРТОВ ДОБАВЬ:
 from db import Base, engine
 from flutter_endpoints import router as flutter_router
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 
 
 # Импорты для работы с файлами
@@ -346,5 +347,6 @@ async def get_document_chapters(document_id: int):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
