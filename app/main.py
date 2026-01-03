@@ -1,5 +1,4 @@
-# main.py
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -9,18 +8,21 @@ import logging
 import asyncio
 import base64
 import uuid
-from datetime import datetime
 import sys
 import os
-from db import Base, engine
-from flutter_endpoints import router as flutter_router
+from datetime import datetime
 
-# Добавляем текущую директорию в путь для импортов
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Импорты для работы с файлами
 import fitz  # PyMuPDF
 import docx
-from langdetect import detect
+
+# Локальные импорты
+from .db import Base, engine, get_db
+from .flutter_endpoints import router as flutter_router
+from .utils import detect_language_safe
+from .config import settings
+from sqlalchemy.orm import Session
+
 # Создаем таблицы в БД
 Base.metadata.create_all(bind=engine)
 
@@ -38,14 +40,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ПОСЛЕ app.add_middleware ДОБАВЬ:
+
 # Подключаем Flutter роутер
 app.include_router(flutter_router)
+
 # Монтирование статических файлов
-os.makedirs("uploads", exist_ok=True)
-os.makedirs("books", exist_ok=True)
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-app.mount("/books", StaticFiles(directory="books"), name="books")
+os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(settings.BOOKS_FOLDER, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_FOLDER), name="uploads")
+app.mount("/books", StaticFiles(directory=settings.BOOKS_FOLDER), name="books")
 
 # Модели запросов/ответов
 class DocumentCreate(BaseModel):
@@ -76,21 +79,9 @@ class TranslationRequest(BaseModel):
     target_language: str
     style: str = "artistic"
 
-# База данных в памяти (в продакшене заменить на реальную БД)
+# Временное хранилище (для демо)
 documents_db = []
 current_id = 1
-
-def detect_language_safe(text: str) -> str:
-    """Безопасное определение языка"""
-    if not text or len(text.strip()) < 10:
-        return "en"
-    try:
-        return detect(text)
-    except Exception:
-        # Эвристика по символам
-        cyrillic_chars = sum(1 for char in text if '\u0400' <= char <= '\u04FF')
-        latin_chars = sum(1 for char in text if char.isalpha() and char.isascii())
-        return "ru" if cyrillic_chars > latin_chars and cyrillic_chars > 10 else "en"
 
 def extract_text_from_file(file_path: str, file_type: str) -> str:
     """Извлечение текста из различных форматов файлов"""
@@ -194,6 +185,11 @@ def detect_chapters(text: str) -> List[Dict]:
 async def root():
     return {"message": "Versevo Backend API", "version": "2.0.0"}
 
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint for Railway"""
+    return {"status": "healthy", "service": "versevo-backend"}
+
 @app.post("/documents/upload-base64")
 async def upload_document_base64(request: dict):
     global current_id
@@ -208,7 +204,7 @@ async def upload_document_base64(request: dict):
         # Сохраняем файл
         file_id = str(uuid.uuid4())
         file_extension = filename.split('.')[-1].lower() if '.' in filename else 'txt'
-        file_path = f"uploads/{file_id}.{file_extension}"
+        file_path = f"{settings.UPLOAD_FOLDER}/{file_id}.{file_extension}"
         
         with open(file_path, "wb") as f:
             f.write(content_bytes)
@@ -342,7 +338,3 @@ async def get_document_chapters(document_id: int):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
