@@ -1,39 +1,24 @@
-# === CORE & WEB ===
+# === CORE ===
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 
 # === DATABASE ===
 sqlalchemy==2.0.23
-psycopg2==2.9.9
-alembic==1.12.1
-redis==5.0.1
-celery==5.3.6
+psycopg2-binary==2.9.9  # ← Используй BINARY версию!
+python-dotenv==1.0.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
 
 # === FILE PROCESSING ===
 python-docx==1.1.0
 PyMuPDF==1.23.8
 
-# === NLP & ANALYSIS ===
-nltk==3.8.1
-networkx==2.8.8  # Фиксированная версия для совместимости
-langdetect==1.0.9
-spacy==3.7.2
-scikit-learn==1.3.2
-numpy==1.26.2
-matplotlib==3.8.0
-wordcloud==1.9.3
-
-# === ENVIRONMENT & UTILS ===
-python-dotenv==1.0.0
-pydantic==2.5.0
-pydantic-settings==2.1.0
+# === UTILS ===
 requests==2.31.0
-boto3==1.34.0
-httpx==0.25.2
 aiofiles==23.2.1
+langdetect==1.0.9
 
 # === AUTH ===
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-
