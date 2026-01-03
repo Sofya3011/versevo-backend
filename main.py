@@ -11,7 +11,12 @@ import uuid
 import sys
 import os
 from datetime import datetime
-
+from services.db import engine
+try:
+    with engine.connect() as conn:
+        print("✅ Database connection successful")
+except Exception as e:
+    print(f"❌ Database error: {e}")
 # Импорты для работы с файлами
 import fitz  # PyMuPDF
 import docx
