@@ -42,7 +42,7 @@ signal.signal(signal.SIGTERM, handle_exit)
 signal.signal(signal.SIGINT, handle_exit)
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 8080))
     print(f"🚀 Starting on port {port} at {time.time()}", flush=True)
     import uvicorn
     
