@@ -1,39 +1,58 @@
-# main.py - СУПЕР МИНИМАЛЬНЫЙ, БЕЗ ОШИБОК
+# main.py - ДОБАВЬ ЭТО!
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 import os
-import sys
+import time
 
-print("🚀 STARTING APP...", file=sys.stderr)
-
-# СОЗДАЕМ APP СРАЗУ - БЕЗ ИМПОРТОВ!
 app = FastAPI()
 
-print("✅ App created", file=sys.stderr)
+# Добавь favicon чтобы избежать 499 ошибок
+@app.get("/favicon.ico")
+async def favicon():
+    return FileResponse("favicon.ico") if os.path.exists("favicon.ico") else {"status": "no icon"}
 
 @app.get("/")
-async def root():
-    print("📍 Root endpoint called", file=sys.stderr)
-    return {
-        "status": "running",
-        "message": "Versevo API",
-        "version": "1.0"
-    }
+def root():
+    print(f"📍 Root at {time.time()}", flush=True)
+    return {"status": "alive", "app": "versevo", "timestamp": time.time()}
 
 @app.get("/api/flutter/health")
-async def health():
-    print("❤️ Health check", file=sys.stderr)
-    return {"status": "healthy"}
+def health():
+    print(f"❤️ Health check at {time.time()}", flush=True)
+    return {
+        "status": "healthy", 
+        "service": "versevo-backend",
+        "timestamp": time.time(),
+        "memory": "ok"
+    }
 
-@app.get("/test")
-async def test():
-    return {"test": "ok", "timestamp": "now"}
+@app.get("/api/health")
+def health2():
+    return {"status": "healthy", "check": "alternative"}
 
-# НИКАКИХ СЛОЖНЫХ ИМПОРТОВ!
-# НИКАКОЙ БД!
-# НИКАКИХ СЕРВИСОВ!
+# ДОБАВЬ ОБРАБОТКУ СИГНАЛОВ
+import signal
+import sys
+
+def handle_exit(signum, frame):
+    print(f"🚨 Received signal {signum}, exiting gracefully", flush=True)
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_exit)
+signal.signal(signal.SIGINT, handle_exit)
 
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.getenv("PORT", 8000))
-    print(f"🚀 Starting server on port {port}", file=sys.stderr)
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    print(f"🚀 Starting on port {port} at {time.time()}", flush=True)
+    import uvicorn
+    
+    # Запускаем с максимальными настройками стабильности
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        access_log=True,
+        log_level="info",
+        timeout_keep_alive=30,
+        limit_concurrency=100
+    )
