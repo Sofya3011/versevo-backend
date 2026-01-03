@@ -6,9 +6,14 @@
   "deploy": {
     "startCommand": "python -m uvicorn main:app --host 0.0.0.0 --port $PORT",
     "healthcheckPath": "/api/flutter/health",
-    "healthcheckTimeout": 60,
-    "healthcheckInterval": 30,
-    "restartPolicyType": "NEVER",
-    "restartPolicyMaxRetries": 3
+    "healthcheckTimeout": 30,
+    "healthcheckInterval": 60,
+    "restartPolicyType": "ALWAYS",
+    "ports": [
+      {
+        "port": 8080,
+        "protocol": "TCP"
+      }
+    ]
   }
 }
