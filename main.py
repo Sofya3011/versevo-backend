@@ -11,12 +11,7 @@ import uuid
 import sys
 import os
 from datetime import datetime
-from services.db import engine
-try:
-    with engine.connect() as conn:
-        print("✅ Database connection successful")
-except Exception as e:
-    print(f"❌ Database error: {e}")
+
 # Импорты для работы с файлами
 import fitz  # PyMuPDF
 import docx
@@ -31,16 +26,15 @@ try:
     from services.utils import detect_language_safe
     from services.config import settings
     
-    # Создаем таблицы в БД
-    try:
-        Base.metadata.create_all(bind=engine)
-        print("✅ Database tables created successfully")
-    except Exception as e:
-        print(f"❌ Error creating database tables: {e}")
+    # try:
+     #   Base.metadata.create_all(bind=engine)
+      #  print("✅ Database tables created successfully")
+    #except Exception as e:
+     #   print(f"❌ Error creating database tables: {e}")
         
-except ImportError:
+#except ImportError:
     # Если services не существует, создаем заглушки
-    print("⚠️  services module not found, using dummy implementations")
+ #   print("⚠️  services module not found, using dummy implementations")
     
     class DummySettings:
         UPLOAD_FOLDER = "uploads"
