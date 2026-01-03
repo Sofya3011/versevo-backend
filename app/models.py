@@ -1,44 +1,12 @@
-import sqlalchemy as sa
-from .db import Base
-from datetime import datetime
 from sqlalchemy import Column, Integer, String, Text, DateTime, JSON, Boolean, Float, ForeignKey
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-
-class Book(Base):
-    __tablename__ = "books"
-    id = sa.Column(sa.Integer, primary_key=True, index=True)
-    filename = sa.Column(sa.String, nullable=False)
-    file_path = sa.Column(sa.String, nullable=False)
-    file_type = sa.Column(sa.String, nullable=False)
-    language = sa.Column(sa.String, nullable=True)
-    needs_translation = sa.Column(sa.Boolean, default=False)
-    created_at = sa.Column(sa.DateTime, default=datetime.utcnow)
-
-class TranslationJob(Base):
-    __tablename__ = "translation_jobs"
-    id = sa.Column(sa.Integer, primary_key=True, index=True)
-    book_id = sa.Column(sa.Integer, nullable=False)
-    mode = sa.Column(sa.String, nullable=False)  # 'artistic' or 'official'
-    status = sa.Column(sa.String, default="pending")
-    result_path = sa.Column(sa.String, nullable=True)
-    created_at = sa.Column(sa.DateTime, default=datetime.utcnow)
-
-class AudioJob(Base):
-    __tablename__ = "audio_jobs"
-    id = sa.Column(sa.Integer, primary_key=True, index=True)
-    book_id = sa.Column(sa.Integer, nullable=False)
-    voice = sa.Column(sa.String, nullable=True)
-    style = sa.Column(sa.String, nullable=True)
-    status = sa.Column(sa.String, default="pending")
-    audio_path = sa.Column(sa.String, nullable=True)
-
-    created_at = sa.Column(sa.DateTime, default=datetime.utcnow)
-
-
+from datetime import datetime
+from .db import Base
 
 class User(Base):
     __tablename__ = "users"
+    
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(100), unique=True, nullable=False)
     email = Column(String(255), unique=True, nullable=False)
@@ -46,6 +14,9 @@ class User(Base):
     avatar_path = Column(String(500))
     auth_token = Column(String(500))
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+    is_verified = Column(Boolean, default=False)
 
 class Document(Base):
     __tablename__ = "documents"
@@ -64,6 +35,7 @@ class Document(Base):
     chapter_count = Column(Integer, default=0)
     reading_time_minutes = Column(Integer, default=0)
     metadata = Column(JSON, default=lambda: {})
+    is_public = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -71,6 +43,9 @@ class Document(Base):
     chapters = relationship("Chapter", back_populates="document", cascade="all, delete-orphan")
     notes = relationship("DocumentNote", back_populates="document", cascade="all, delete-orphan")
     progress = relationship("ReadingProgress", back_populates="document", uselist=False)
+    analyses = relationship("AnalysisResult", back_populates="document", cascade="all, delete-orphan")
+    
+    user = relationship("User")
 
 class Chapter(Base):
     __tablename__ = "chapters"
@@ -135,6 +110,7 @@ class AnalysisResult(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     document_id = Column(Integer, ForeignKey('documents.id', ondelete='CASCADE'), nullable=False)
+    analysis_type = Column(String(50), default="general")
     summary = Column(Text)
     themes = Column(Text)
     sentiment = Column(String(50))
@@ -144,7 +120,7 @@ class AnalysisResult(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    document = relationship("Document")
+    document = relationship("Document", back_populates="analyses")
 
 class FavoriteQuote(Base):
     __tablename__ = "favorite_quotes"
