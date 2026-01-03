@@ -5,7 +5,7 @@ python-multipart==0.0.6
 
 # === DATABASE ===
 sqlalchemy==2.0.23
-psycopg2-binary==2.9.9
+psycopg2==2.9.9
 alembic==1.12.1
 redis==5.0.1
 celery==5.3.6
@@ -36,3 +36,4 @@ aiofiles==23.2.1
 # === AUTH ===
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+
