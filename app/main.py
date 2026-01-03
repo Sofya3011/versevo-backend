@@ -8,20 +8,15 @@ from typing import List, Optional, Dict, Any
 import logging
 import asyncio
 import base64
-import os
 import uuid
 from datetime import datetime
-# main.py - В НАЧАЛЕ ФАЙЛА ДОБАВЬ:
 import sys
 import os
-# ПОСЛЕ ИМПОРТОВ ДОБАВЬ:
 from db import Base, engine
 from flutter_endpoints import router as flutter_router
 
+# Добавляем текущую директорию в путь для импортов
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-
-
 # Импорты для работы с файлами
 import fitz  # PyMuPDF
 import docx
@@ -347,6 +342,7 @@ async def get_document_chapters(document_id: int):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
