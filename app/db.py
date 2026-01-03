@@ -19,7 +19,7 @@ engine = create_engine(
     pool_size=20,
     max_overflow=0,
     pool_pre_ping=True,
-    echo=False  # Поставь True для отладки SQL запросов
+    echo=True  # Поставь True для отладки SQL запросов
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -33,3 +33,4 @@ def get_db():
         yield db
     finally:
         db.close()
+
