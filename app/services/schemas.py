@@ -1,16 +1,16 @@
 # schemas.py
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 # Аутентификация
 class UserCreate(BaseModel):
     username: str
-    email: str
+    email: EmailStr
     password: str
 
 class UserLogin(BaseModel):
-    email: str
+    email: EmailStr
     password: str
 
 class UserResponse(BaseModel):
@@ -30,10 +30,6 @@ class DocumentCreate(BaseModel):
     content: Optional[str] = None
     language: str = "en"
 
-class DocumentUpdate(BaseModel):
-    translated_content: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-
 class DocumentResponse(BaseModel):
     id: int
     user_id: int
@@ -51,6 +47,7 @@ class DocumentResponse(BaseModel):
     metadata: Dict[str, Any]
     created_at: datetime
     updated_at: datetime
+    chapters: List[Dict[str, Any]] = []
     
     class Config:
         from_attributes = True
@@ -89,24 +86,19 @@ class ProgressCreate(BaseModel):
     chapter_index: int = 0
     scroll_position: float = 0.0
 
-# Анализ
-class AnalysisRequest(BaseModel):
-    document_id: int
-    analysis_type: str = "full"
+class ProgressResponse(BaseModel):
+    chapter_index: int
+    scroll_position: float
+    last_read_at: datetime
 
-class AnalysisResponse(BaseModel):
-    summary: str
-    themes: str
-    sentiment: str
-    writing_style: str
-    key_points: List[str]
-    characters: List[Dict[str, Any]]
+# Перевод
+class TranslateRequest(BaseModel):
+    text: str
+    target_language: str = "ru"
+    source_language: Optional[str] = None
 
-# Цитаты
-class QuoteCreate(BaseModel):
-    user_id: int
-    document_id: Optional[int] = None
-    quote: str
-    start_position: Optional[int] = None
-    end_position: Optional[int] = None
-    chapter: int = 0
+class TranslateResponse(BaseModel):
+    original_text: str
+    translated_text: str
+    source_language: str
+    target_language: str
