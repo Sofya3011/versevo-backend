@@ -34,7 +34,7 @@ class Document(Base):
     char_count = Column(Integer, default=0)
     chapter_count = Column(Integer, default=0)
     reading_time_minutes = Column(Integer, default=0)
-    metadata = Column(JSON, default=lambda: {})
+    document_metadata = Column(JSON, default=lambda: {})  # ← ИЗМЕНИ НА document_metadata
     is_public = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
