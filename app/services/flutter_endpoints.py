@@ -1,339 +1,245 @@
-# flutter_endpoints.py
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import base64
-from datetime import datetime
-import hashlib
 import uuid
 import os
+from datetime import datetime
 
-from db import get_db
-from models import User, Document, Chapter, DocumentNote, ReadingProgress, TranslationCache
-import schemas
+from .db import get_db
+from .models import Document
+from .utils import detect_language_safe
+from .config import settings
 
-router = APIRouter(prefix="/api", tags=["flutter"])
+router = APIRouter(prefix="/api/flutter", tags=["flutter"])
 
-# ==================== АВТОРИЗАЦИЯ ====================
-@router.post("/auth/register", response_model=schemas.UserResponse)
-async def register(user_data: schemas.UserCreate, db: Session = Depends(get_db)):
-    """Регистрация пользователя"""
-    # Проверяем, существует ли пользователь
-    existing_user = db.query(User).filter(
-        (User.email == user_data.email) | (User.username == user_data.username)
-    ).first()
-    
-    if existing_user:
-        raise HTTPException(status_code=400, detail="Email или username уже занят")
-    
-    # Создаем пользователя
-    user = User(
-        username=user_data.username,
-        email=user_data.email,
-        auth_token=f"token_{datetime.utcnow().timestamp()}_{uuid.uuid4().hex[:8]}"
-    )
-    
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    
-    return user
-
-@router.post("/auth/login", response_model=schemas.UserResponse)
-async def login(login_data: schemas.UserLogin, db: Session = Depends(get_db)):
-    """Логин пользователя"""
-    user = db.query(User).filter(
-        (User.email == login_data.email) | (User.username == login_data.email)
-    ).first()
-    
-    if not user:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
-    
-    # Обновляем токен
-    user.auth_token = f"token_{datetime.utcnow().timestamp()}_{uuid.uuid4().hex[:8]}"
-    db.commit()
-    db.refresh(user)
-    
-    return user
-
-# ==================== ДОКУМЕНТЫ ====================
-@router.get("/documents", response_model=List[schemas.DocumentResponse])
-async def get_documents(
-    user_id: int,
-    skip: int = 0, 
-    limit: int = 100,
-    db: Session = Depends(get_db)
-):
-    """Получить документы пользователя"""
-    documents = db.query(Document).filter(
-        Document.user_id == user_id
-    ).order_by(Document.created_at.desc()).offset(skip).limit(limit).all()
-    
-    return documents
-
-@router.post("/documents/upload-base64", response_model=schemas.DocumentResponse)
-async def upload_document_base64(
-    filename: str = Form(...),
-    file_data: str = Form(...),
-    file_size: int = Form(...),
-    user_id: int = Form(...),
-    db: Session = Depends(get_db)
-):
-    """Загрузить документ в формате base64"""
+def extract_text_from_file(file_path: str, file_type: str) -> str:
+    """Извлечение текста из различных форматов файлов"""
     try:
-        # Проверяем пользователя
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        import fitz  # PyMuPDF
+        import docx
         
-        # Декодируем base64
-        content_bytes = base64.b64decode(file_data)
-        content = content_bytes.decode('utf-8', errors='ignore')
-        
-        # Определяем язык (используем твою функцию из main.py)
-        from main import detect_language_safe
-        language = detect_language_safe(content)
-        
-        # Определяем главы (используем твою функцию из main.py)
-        from main import detect_chapters
-        chapters_data = detect_chapters(content)
-        
+        if file_type == 'pdf':
+            text = []
+            try:
+                doc = fitz.open(file_path)
+                for page in doc:
+                    text.append(page.get_text())
+                doc.close()
+            except Exception as e:
+                return f"Ошибка чтения PDF: {str(e)}"
+            return "\n\n".join(text)
+        elif file_type in ['docx', 'doc']:
+            try:
+                doc = docx.Document(file_path)
+                paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+                return "\n\n".join(paragraphs)
+            except Exception as e:
+                return f"Ошибка чтения DOCX: {str(e)}"
+        elif file_type == 'txt':
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        else:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+    except Exception as e:
+        return f"Ошибка извлечения текста: {str(e)}"
+
+def detect_chapters(text: str) -> List[Dict]:
+    """Автоматическое определение глав в тексте"""
+    import re
+    chapters = []
+    
+    patterns = [
+        r'^(Глава\s+\d+[.:]\s*.+)$',
+        r'^(CHAPTER\s+\d+[.:]\s*.+)$',
+        r'^(Часть\s+\d+[.:]\s*.+)$',
+        r'^(Part\s+\d+[.:]\s*.+)$',
+        r'^(\d+[.:]\s*.+)$',
+        r'^([IVXLCDM]+[.:]\s*.+)$'
+    ]
+    
+    lines = text.split('\n')
+    current_chapter = None
+    
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+            
+        is_chapter = False
+        for pattern in patterns:
+            if re.match(pattern, line, re.IGNORECASE):
+                is_chapter = True
+                break
+                
+        if is_chapter:
+            if current_chapter:
+                current_chapter['content'] = current_chapter['content'].strip()
+                chapters.append(current_chapter)
+            
+            current_chapter = {
+                'title': line,
+                'start_position': sum(len(lines[j]) + 1 for j in range(i)),
+                'content': ''
+            }
+        elif current_chapter:
+            current_chapter['content'] += line + '\n'
+    
+    if current_chapter:
+        current_chapter['content'] = current_chapter['content'].strip()
+        chapters.append(current_chapter)
+    
+    if not chapters:
+        chapters.append({
+            'title': 'Основной текст',
+            'start_position': 0,
+            'content': text
+        })
+    
+    return chapters
+
+@router.get("/health")
+async def health_check():
+    """Эндпоинт для проверки здоровья приложения"""
+    return {"status": "healthy", "service": "versevo-backend"}
+
+@router.post("/upload")
+async def flutter_upload(
+    file: UploadFile = File(...),
+    user_id: Optional[int] = Form(None),
+    db: Session = Depends(get_db)
+):
+    """Загрузка файла из Flutter приложения"""
+    try:
         # Сохраняем файл
-        os.makedirs("uploads", exist_ok=True)
-        file_extension = filename.split('.')[-1] if '.' in filename else 'txt'
         file_id = str(uuid.uuid4())
-        file_path = f"uploads/{file_id}.{file_extension}"
+        file_extension = file.filename.split('.')[-1].lower() if '.' in file.filename else 'txt'
+        file_path = f"{settings.UPLOAD_FOLDER}/{file_id}.{file_extension}"
+        
+        os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
         
         with open(file_path, "wb") as f:
-            f.write(content_bytes)
+            content = await file.read()
+            f.write(content)
         
-        # Создаем документ
-        document = Document(
-            user_id=user_id,
-            filename=filename,
-            content=content,
+        # Извлекаем текст
+        content_str = extract_text_from_file(file_path, file_extension)
+        
+        # Определяем язык
+        language = detect_language_safe(content_str)
+        
+        # Определяем главы
+        chapters = detect_chapters(content_str)
+        
+        # Создаем документ в БД
+        db_document = Document(
+            filename=file.filename,
+            content=content_str,
             language=language,
             file_type=file_extension,
-            file_size=file_size,
+            file_size=len(content),
             file_path=file_path,
-            word_count=len(content.split()),
-            char_count=len(content),
-            chapter_count=len(chapters_data),
-            reading_time_minutes=max(1, len(content.split()) // 200),
+            user_id=user_id if user_id else 1,  # TODO: заменить на реальный ID пользователя
+            word_count=len(content_str.split()),
+            char_count=len(content_str),
+            chapter_count=len(chapters),
+            reading_time_minutes=max(1, len(content_str.split()) // 200),
             metadata={
-                "uploaded_at": datetime.utcnow().isoformat(),
-                "original_filename": filename,
-                "user_username": user.username
+                "chapters": chapters,
+                "original_filename": file.filename
             }
         )
         
-        db.add(document)
+        db.add(db_document)
         db.commit()
-        db.refresh(document)
+        db.refresh(db_document)
         
-        # Создаем главы
-        for idx, chapter_data in enumerate(chapters_data):
-            chapter = Chapter(
-                document_id=document.id,
-                chapter_index=idx,
-                title=chapter_data['title'],
-                content=chapter_data['content'],
-                word_count=len(chapter_data['content'].split())
-            )
-            db.add(chapter)
-        
-        db.commit()
-        
-        return document
+        return {
+            "success": True,
+            "document_id": db_document.id,
+            "filename": db_document.filename,
+            "language": db_document.language,
+            "chapter_count": len(chapters),
+            "word_count": db_document.word_count,
+            "reading_time": db_document.reading_time_minutes
+        }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка загрузки: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-@router.get("/documents/{document_id}", response_model=schemas.DocumentResponse)
-async def get_document(document_id: int, db: Session = Depends(get_db)):
-    """Получить документ по ID"""
-    document = db.query(Document).filter(Document.id == document_id).first()
-    if not document:
-        raise HTTPException(status_code=404, detail="Документ не найден")
-    
-    return document
-
-@router.delete("/documents/{document_id}")
-async def delete_document(document_id: int, db: Session = Depends(get_db)):
-    """Удалить документ"""
-    document = db.query(Document).filter(Document.id == document_id).first()
-    if not document:
-        raise HTTPException(status_code=404, detail="Документ не найден")
-    
-    # Удаляем файл
-    if document.file_path and os.path.exists(document.file_path):
-        os.remove(document.file_path)
-    
-    db.delete(document)
-    db.commit()
-    
-    return {"status": "deleted"}
-
-# ==================== ЗАМЕТКИ ====================
-@router.post("/notes", response_model=schemas.NoteResponse)
-async def create_note(note_data: schemas.NoteCreate, db: Session = Depends(get_db)):
-    """Создать заметку или выделение"""
-    note = DocumentNote(**note_data.dict())
-    db.add(note)
-    db.commit()
-    db.refresh(note)
-    return note
-
-@router.get("/documents/{document_id}/notes", response_model=List[schemas.NoteResponse])
-async def get_document_notes(document_id: int, db: Session = Depends(get_db)):
-    """Получить заметки документа"""
-    notes = db.query(DocumentNote).filter(
-        DocumentNote.document_id == document_id
-    ).order_by(DocumentNote.created_at.desc()).all()
-    
-    return notes
-
-@router.delete("/notes/{note_id}")
-async def delete_note(note_id: int, db: Session = Depends(get_db)):
-    """Удалить заметку"""
-    note = db.query(DocumentNote).filter(DocumentNote.id == note_id).first()
-    if not note:
-        raise HTTPException(status_code=404, detail="Заметка не найдена")
-    
-    db.delete(note)
-    db.commit()
-    
-    return {"status": "deleted"}
-
-# ==================== ПРОГРЕСС ====================
-@router.post("/progress")
-async def save_progress(progress_data: schemas.ProgressCreate, db: Session = Depends(get_db)):
-    """Сохранить прогресс чтения"""
-    # Ищем существующий прогресс
-    progress = db.query(ReadingProgress).filter(
-        ReadingProgress.document_id == progress_data.document_id,
-        ReadingProgress.user_id == progress_data.user_id
-    ).first()
-    
-    if progress:
-        progress.chapter_index = progress_data.chapter_index
-        progress.scroll_position = progress_data.scroll_position
-        progress.last_read_at = datetime.utcnow()
-    else:
-        progress = ReadingProgress(**progress_data.dict())
-        db.add(progress)
-    
-    db.commit()
-    return {"status": "success"}
-
-@router.get("/documents/{document_id}/progress/{user_id}", response_model=schemas.ProgressResponse)
-async def get_progress(document_id: int, user_id: int, db: Session = Depends(get_db)):
-    """Получить прогресс чтения"""
-    progress = db.query(ReadingProgress).filter(
-        ReadingProgress.document_id == document_id,
-        ReadingProgress.user_id == user_id
-    ).first()
-    
-    if not progress:
-        raise HTTPException(status_code=404, detail="Прогресс не найден")
-    
-    return progress
-
-# ==================== ПЕРЕВОД ====================
-@router.post("/translate/text")
-async def translate_text(
-    request: schemas.TranslateRequest,
+@router.get("/documents")
+async def get_user_documents(
+    user_id: Optional[int] = None,
     db: Session = Depends(get_db)
 ):
-    """Перевести текст (с кэшированием)"""
-    if not request.text:
-        raise HTTPException(status_code=400, detail="Текст не может быть пустым")
+    """Получение документов пользователя"""
+    query = db.query(Document)
     
-    # Определяем язык если не указан
-    source_lang = request.source_language
-    if not source_lang:
-        from main import detect_language_safe
-        source_lang = detect_language_safe(request.text) or "en"
+    if user_id:
+        query = query.filter(Document.user_id == user_id)
     
-    # Проверяем кэш
-    text_hash = hashlib.sha256(
-        f"{request.text}|{source_lang}|{request.target_language}".encode()
-    ).hexdigest()
+    documents = query.order_by(Document.created_at.desc()).all()
     
-    cached = db.query(TranslationCache).filter(
-        TranslationCache.original_text_hash == text_hash
-    ).first()
-    
-    if cached:
-        cached.hit_count += 1
-        cached.last_used_at = datetime.utcnow()
-        db.commit()
-        return {
-            "original_text": request.text,
-            "translated_text": cached.translated_text,
-            "source_language": source_lang,
-            "target_language": request.target_language
+    return [
+        {
+            "id": doc.id,
+            "filename": doc.filename,
+            "language": doc.language,
+            "file_size": doc.file_size,
+            "word_count": doc.word_count,
+            "chapter_count": doc.chapter_count,
+            "reading_time": doc.reading_time_minutes,
+            "created_at": doc.created_at.isoformat() if doc.created_at else None,
         }
-    
-    try:
-        # Используем твой существующий переводчик из translator.py
-        from translator import translate_text as hf_translate
-        translated = await hf_translate(request.text, target_lang=request.target_language)
-        
-        # Сохраняем в кэш
-        cache_entry = TranslationCache(
-            original_text_hash=text_hash,
-            original_text=request.text[:1000],
-            translated_text=translated,
-            source_language=source_lang,
-            target_language=request.target_language,
-            model_used="huggingface"
-        )
-        db.add(cache_entry)
-        db.commit()
-        
-        return {
-            "original_text": request.text,
-            "translated_text": translated,
-            "source_language": source_lang,
-            "target_language": request.target_language
-        }
-        
-    except Exception as e:
-        # Fallback - возвращаем оригинал
-        return {
-            "original_text": request.text,
-            "translated_text": f"[Перевод временно недоступен] {request.text}",
-            "source_language": source_lang,
-            "target_language": request.target_language,
-            "error": str(e)
-        }
+        for doc in documents
+    ]
 
-# ==================== ЗДОРОВЬЕ ====================
-@router.get("/health")
-async def health_check(db: Session = Depends(get_db)):
-    """Проверка работоспособности API и БД"""
-    try:
-        # Проверяем подключение к БД
-        db.execute("SELECT 1")
-        
-        # Получаем статистику
-        users_count = db.query(User).count()
-        documents_count = db.query(Document).count()
-        
-        return {
-            "status": "healthy",
-            "database": "connected",
-            "timestamp": datetime.utcnow().isoformat(),
-            "statistics": {
-                "users": users_count,
-                "documents": documents_count
-            }
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "database": "disconnected",
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat()
-        }
+@router.get("/documents/{document_id}")
+async def get_document_details(
+    document_id: int,
+    db: Session = Depends(get_db)
+):
+    """Получение деталей документа"""
+    document = db.query(Document).filter(Document.id == document_id).first()
+    
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    return {
+        "id": document.id,
+        "filename": document.filename,
+        "content": document.content,
+        "language": document.language,
+        "file_type": document.file_type,
+        "file_size": document.file_size,
+        "chapters": document.metadata.get("chapters", []) if document.metadata else [],
+        "word_count": document.word_count,
+        "char_count": document.char_count,
+        "reading_time": document.reading_time_minutes,
+        "created_at": document.created_at.isoformat() if document.created_at else None
+    }
+
+@router.post("/analyze/{document_id}")
+async def analyze_document(
+    document_id: int,
+    db: Session = Depends(get_db)
+):
+    """Анализ документа"""
+    document = db.query(Document).filter(Document.id == document_id).first()
+    
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Простой анализ (можно расширить)
+    analysis_result = {
+        "summary": f"Документ '{document.filename}' содержит {document.word_count} слов, {document.chapter_count} глав.",
+        "language": document.language,
+        "chapter_count": document.chapter_count,
+        "reading_time": f"{document.reading_time_minutes} минут",
+        "complexity": "Сложный" if document.word_count > 5000 else "Средний" if document.word_count > 1000 else "Простой",
+        "file_size": f"{document.file_size / 1024:.1f} KB" if document.file_size < 1024*1024 else f"{document.file_size / (1024*1024):.1f} MB"
+    }
+    
+    return analysis_result
