@@ -58,35 +58,52 @@ except Exception as e:
 
 # ========== ИНИЦИАЛИЗАЦИЯ GEMINI ==========
 # ========== ИНИЦИАЛИЗАЦИЯ GEMINI ==========
+# ========== ИНИЦИАЛИЗАЦИЯ GEMINI ==========
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 gemini_model = None
 GEMINI_ENABLED = False
-GEMINI_MODEL = "gemini-1.5-pro-latest"  # Или "gemini-1.5-flash-latest"
+
+# Используйте совместимые модели
+AVAILABLE_MODELS = [
+    "gemini-pro",           # Основная модель
+    "gemini-1.0-pro",       # Версия 1.0
+    "gemini-1.5-flash",     # Более быстрая
+    "gemini-1.5-pro"        # Если доступно в вашем регионе
+]
 
 if GEMINI_API_KEY:
     try:
+        logger.info("🔧 Инициализация Gemini AI...")
         genai.configure(api_key=GEMINI_API_KEY)
-        # Инициализируем модель
-        gemini_model = genai.GenerativeModel(GEMINI_MODEL)
         
-        # Тестовый запрос для проверки
-        test_response = gemini_model.generate_content("Привет")
+        # Пробуем разные модели по порядку
+        for model_name in AVAILABLE_MODELS:
+            try:
+                logger.info(f"🔄 Пробуем модель: {model_name}")
+                gemini_model = genai.GenerativeModel(model_name)
+                
+                # Тестовый запрос
+                test_response = gemini_model.generate_content("Hello")
+                
+                GEMINI_MODEL = model_name
+                GEMINI_ENABLED = True
+                logger.info(f"✅ Gemini инициализирован! Модель: {GEMINI_MODEL}")
+                break
+                
+            except Exception as model_error:
+                logger.warning(f"⚠️ Модель {model_name} недоступна: {model_error}")
+                continue
         
-        GEMINI_ENABLED = True
-        logger.info(f"✅ Gemini инициализирован: {GEMINI_MODEL}")
-        
+        if not GEMINI_ENABLED:
+            logger.error("❌ Все модели Gemini недоступны")
+            gemini_model = None
+            
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации Gemini: {e}")
         gemini_model = None
         GEMINI_ENABLED = False
 else:
     logger.warning("⚠️ Gemini не настроен. Добавьте GEMINI_API_KEY в переменные окружения")
-# ========== МОДЕЛИ ==========
-class TranslateRequest(BaseModel):
-    text: str
-    target_language: str = "ru"
-    source_language: Optional[str] = None
-    style: str = "artistic"
 
 class AnalysisRequest(BaseModel):
     document_id: int
