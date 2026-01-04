@@ -463,18 +463,23 @@ async def get_documents(user_id: Optional[int] = None):
     if user_id:
         docs = [d for d in docs if d.get("user_id") == user_id]
     
-    return [
+     return [
         {
             "id": d["id"],
             "filename": d["filename"],
+            "content": d["content"],  # ДОБАВЬТЕ ЭТО!
             "language": d["language"],
+            "file_type": d["file_type"],  # ВАЖНО: используйте file_type вместо fileType
             "file_size": d["file_size"],
             "word_count": d["word_count"],
+            "char_count": d["char_count"],
             "chapter_count": d["chapter_count"],
-            "reading_time": d["reading_time_minutes"],
+            "reading_time_minutes": d["reading_time_minutes"],
             "created_at": d["created_at"],
             "updated_at": d["updated_at"],
-            "content_preview": d["content"][:200] + "..." if len(d["content"]) > 200 else d["content"]
+            "content_preview": d["content"][:200] + "..." if len(d["content"]) > 200 else d["content"],
+            "chapters": d["chapters"],  # ДОБАВЬТЕ ЭТО
+            "metadata": d.get("metadata", {})  # ДОБАВЬТЕ ЭТО
         }
         for d in sorted(docs, key=lambda x: x["created_at"], reverse=True)
     ]
