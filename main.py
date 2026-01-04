@@ -1,4 +1,4 @@
-# main.py - Бэкенд Versevo с поддержкой документов и перевода
+# main.py - Бэкенд Versevo для Railway
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -259,7 +259,7 @@ def translate_with_huggingface(text: str, source_lang: str, target_lang: str) ->
         logger.error(f"Translation error: {e}")
         return text
 
-# ========== ENDPOINTS ==========
+# ========== HEALTH CHECK ENDPOINTS ==========
 @app.get("/")
 async def root():
     """Корневой эндпоинт"""
@@ -267,21 +267,41 @@ async def root():
         "message": "Versevo Backend API",
         "version": "2.0.0",
         "status": "running",
+        "timestamp": datetime.now().isoformat(),
         "endpoints": {
             "health": "/api/health",
+            "health_flutter": "/api/flutter/health",
             "upload": "/api/documents/upload",
             "upload_base64": "/api/documents/upload-base64",
-            "translate": "/api/translate/text",
             "documents": "/api/documents",
-            "document": "/api/documents/{id}",
-            "analyze": "/api/analyze"
+            "translate": "/api/translate/text"
         }
     }
 
 @app.get("/api/health")
 async def health_check():
-    """Health check"""
-    return {"status": "healthy", "service": "versevo-backend", "timestamp": datetime.now().isoformat()}
+    """Health check endpoint"""
+    return {
+        "status": "healthy", 
+        "service": "versevo-backend", 
+        "timestamp": datetime.now().isoformat(),
+        "version": "2.0.0"
+    }
+
+@app.get("/api/flutter/health")
+async def health_check_flutter():
+    """Health check для Flutter/Railway"""
+    return {
+        "status": "healthy", 
+        "service": "versevo-backend", 
+        "timestamp": datetime.now().isoformat(),
+        "endpoint": "flutter-health"
+    }
+
+@app.get("/health")
+async def health_check_simple():
+    """Простой health check"""
+    return {"status": "ok"}
 
 # ========== ДОКУМЕНТЫ ==========
 @app.post("/api/documents/upload")
