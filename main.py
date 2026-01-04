@@ -81,28 +81,51 @@ def extract_text_from_file(file_path: str, file_type: str) -> str:
     """Извлечение текста из файлов"""
     try:
         if file_type == 'pdf':
-            import fitz  # PyMuPDF
-            text = []
-            doc = fitz.open(file_path)
-            for page in doc:
-                text.append(page.get_text())
-            doc.close()
-            return "\n\n".join(text)
+            try:
+                import fitz  # PyMuPDF
+                text = []
+                doc = fitz.open(file_path)
+                for page in doc:
+                    text.append(page.get_text())
+                doc.close()
+                return "\n\n".join(text)
+            except Exception as e:
+                logger.error(f"PDF extraction error: {e}")
+                return f"PDF текст не извлечен: {str(e)}"
+                
         elif file_type in ['docx', 'doc']:
-            import docx
-            doc = docx.Document(file_path)
-            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-            return "\n\n".join(paragraphs)
+            try:
+                import docx
+                doc = docx.Document(file_path)
+                paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+                return "\n\n".join(paragraphs)
+            except Exception as e:
+                logger.error(f"DOCX extraction error: {e}")
+                return f"DOCX текст не извлечен: {str(e)}"
+                
         elif file_type == 'txt':
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
+            try:
+                # Пробуем разные кодировки
+                encodings = ['utf-8', 'cp1251', 'koi8-r', 'iso-8859-5']
+                for encoding in encodings:
+                    try:
+                        with open(file_path, "r", encoding=encoding) as f:
+                            return f.read()
+                    except UnicodeDecodeError:
+                        continue
+                # Если все кодировки не подошли
+                with open(file_path, "r", encoding='utf-8', errors='ignore') as f:
+                    return f.read()
+            except Exception as e:
+                logger.error(f"TXT extraction error: {e}")
+                return f"Текст не прочитан: {str(e)}"
+                
         else:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
+            return f"Неподдерживаемый формат файла: {file_type}"
+            
     except Exception as e:
-        logger.error(f"Error extracting text: {e}")
+        logger.error(f"General extraction error: {e}")
         return f"Ошибка извлечения текста: {str(e)}"
-
 def detect_language_safe(text: str) -> str:
     """Определение языка"""
     if not text or len(text.strip()) < 10:
