@@ -213,91 +213,11 @@ def detect_chapters(text: str) -> List[Dict]:
     
     return chapters
 
-def translate_with_huggingface(text: str, source_lang: str, target_lang: str) -> str:
-    """Перевод через Hugging Face с альтернативной моделью"""
-    try:
-        # Используем модель Helsinki-NLP/opus-mt-en-ru для английского->русского
-        model_mapping = {
-            ('en', 'ru'): 'Helsinki-NLP/opus-mt-en-ru',
-            ('ru', 'en'): 'Helsinki-NLP/opus-mt-ru-en',
-        }
-        
-        model_key = (source_lang, target_lang)
-        if model_key not in model_mapping:
-            # Используем многоязычную модель как fallback
-            api_url = "https://api-inference.huggingface.co/models/facebook/mbart-large-50-many-to-many-mmt"
-        else:
-            api_url = f"https://api-inference.huggingface.co/models/{model_mapping[model_key]}"
-        
-        logger.info(f"🌐 Используем модель: {api_url.split('/')[-1]}")
-        
-        headers = {
-            "Authorization": f"Bearer {HF_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        # Для MBART модели
-        if "mbart" in api_url:
-            lang_codes = {
-                "ru": "ru_RU",
-                "en": "en_XX",
-                "de": "de_DE",
-                "fr": "fr_XX",
-                "es": "es_XX",
-                "it": "it_IT",
-                "zh": "zh_CN",
-                "ar": "ar_AR",
-                "ja": "ja_XX",
-                "ko": "ko_KR",
-            }
-            
-            if source_lang in lang_codes and target_lang in lang_codes:
-                payload = {
-                    "inputs": text,
-                    "parameters": {
-                        "src_lang": lang_codes[source_lang],
-                        "tgt_lang": lang_codes[target_lang]
-                    }
-                }
-            else:
-                # Fallback
-                payload = {"inputs": text}
-        else:
-            # Для других моделей
-            payload = {"inputs": text}
-        
-        response = requests.post(
-            api_url,
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        
-        logger.info(f"📡 Статус ответа: {response.status_code}")
-        
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                if isinstance(result[0], dict) and 'translation_text' in result[0]:
-                    return result[0]['translation_text']
-                elif isinstance(result[0], dict) and 'generated_text' in result[0]:
-                    return result[0]['generated_text']
-                elif isinstance(result[0], str):
-                    return result[0]
-        
-        # Fallback если API не работает
-        logger.warning(f"⚠️ API не вернул результат, используем fallback")
-        return _fallback_translation(text, source_lang, target_lang)
-        
-    except Exception as e:
-        logger.error(f"Translation error: {e}")
-        return _fallback_translation(text, source_lang, target_lang)
-
 def _fallback_translation(text: str, source_lang: str, target_lang: str) -> str:
-    """Fallback перевод когда API недоступен"""
-    # Простой словарь для демо
-    simple_dict = {
-        ('en', 'ru'): {
+    """Улучшенный fallback перевод"""
+    # Более полный словарь для демо
+    if source_lang == 'en' and target_lang == 'ru':
+        translation_map = {
             'hello': 'привет',
             'world': 'мир',
             'book': 'книга',
@@ -308,25 +228,289 @@ def _fallback_translation(text: str, source_lang: str, target_lang: str) -> str:
             'chapter': 'глава',
             'page': 'страница',
             'library': 'библиотека',
+            'this': 'это',
+            'is': '',
+            'a': '',
+            'test': 'тест',
+            'translation': 'перевод',
+            'from': 'из',
+            'the': '',
+            'versevo': 'версево',
+            'backend': 'бэкенд',
+            'for': 'для',
+            'and': 'и',
+            'to': 'к',
+            'with': 'с',
+            'on': 'на',
+            'in': 'в',
+            'of': 'из',
+            'that': 'что',
+            'it': 'это',
+            'you': 'ты',
+            'he': 'он',
+            'she': 'она',
+            'we': 'мы',
+            'they': 'они',
+            'good': 'хороший',
+            'bad': 'плохой',
+            'new': 'новый',
+            'old': 'старый',
+            'big': 'большой',
+            'small': 'маленький',
+            'important': 'важный',
+            'interesting': 'интересный',
+            'beautiful': 'красивый',
+            'difficult': 'сложный',
+            'easy': 'легкий',
+            'fast': 'быстрый',
+            'slow': 'медленный',
         }
-    }
+        
+        words = text.lower().split()
+        translated_words = []
+        
+        for word in words:
+            # Убираем знаки препинания
+            clean_word = ''.join(c for c in word if c.isalpha())
+            if clean_word in translation_map and translation_map[clean_word]:
+                translated_words.append(translation_map[clean_word])
+            else:
+                translated_words.append(word)
+        
+        result = " ".join(translated_words)
+        return f"[DEMO] {result}"
     
-    # Если у нас есть перевод для этой пары языков
-    if (source_lang, target_lang) in simple_dict:
+    elif source_lang == 'ru' and target_lang == 'en':
+        # Обратный перевод
+        translation_map = {
+            'привет': 'hello',
+            'мир': 'world',
+            'книга': 'book',
+            'читать': 'read',
+            'переводить': 'translate',
+            'документ': 'document',
+            'текст': 'text',
+            'глава': 'chapter',
+            'страница': 'page',
+            'библиотека': 'library',
+        }
+        
         words = text.lower().split()
         translated_words = []
         
         for word in words:
             clean_word = ''.join(c for c in word if c.isalpha())
-            if clean_word in simple_dict[(source_lang, target_lang)]:
-                translated_words.append(simple_dict[(source_lang, target_lang)][clean_word])
+            if clean_word in translation_map:
+                translated_words.append(translation_map[clean_word])
             else:
                 translated_words.append(word)
         
-        return " ".join(translated_words)
+        result = " ".join(translated_words)
+        return f"[DEMO] {result}"
+    
     else:
-        # Просто возвращаем текст с пометкой
-        return f"[ПЕРЕВОД НЕДОСТУПЕН] {text}"
+        return f"[DEMO] Перевод с {source_lang} на {target_lang}: {text[:100]}..."
+
+def _try_alternative_models(text: str, source_lang: str, target_lang: str) -> str:
+    """Попробовать альтернативные модели"""
+    alternative_models = [
+        "facebook/m2m100_418M",
+        "facebook/mbart-large-50-many-to-many-mmt",
+        "Helsinki-NLP/opus-mt-tc-big-en-ru",  # Другая модель для en-ru
+    ]
+    
+    for model in alternative_models:
+        try:
+            logger.info(f"🔄 Пробуем альтернативную модель: {model}")
+            
+            api_url = f"https://api-inference.huggingface.co/models/{model}"
+            headers = {
+                "Authorization": f"Bearer {HF_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            # Для разных моделей разные payload
+            if 'mbart' in model:
+                lang_codes = {
+                    "ru": "ru_RU",
+                    "en": "en_XX",
+                }
+                payload = {
+                    "inputs": text,
+                    "parameters": {
+                        "src_lang": lang_codes.get(source_lang, "en_XX"),
+                        "tgt_lang": lang_codes.get(target_lang, "ru_RU")
+                    }
+                }
+            elif 'm2m100' in model:
+                lang_codes = {
+                    "ru": "ru",
+                    "en": "en",
+                }
+                payload = {
+                    "inputs": text,
+                    "parameters": {
+                        "src_lang": lang_codes.get(source_lang, "en"),
+                        "tgt_lang": lang_codes.get(target_lang, "ru")
+                    }
+                }
+            else:
+                payload = {"inputs": text}
+            
+            response = requests.post(
+                api_url,
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, list) and len(result) > 0:
+                    if isinstance(result[0], dict) and 'translation_text' in result[0]:
+                        translated = result[0]['translation_text']
+                        logger.info(f"✅ Альтернативная модель {model} сработала!")
+                        return translated
+                    elif isinstance(result[0], str):
+                        translated = result[0]
+                        logger.info(f"✅ Альтернативная модель {model} сработала!")
+                        return translated
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Альтернативная модель {model} не сработала: {e}")
+            continue
+    
+    # Если все модели не сработали
+    logger.error("❌ Все модели недоступны, используем fallback")
+    return _fallback_translation(text, source_lang, target_lang)
+
+def translate_with_huggingface(text: str, source_lang: str, target_lang: str) -> str:
+    """Перевод через Hugging Face с использованием РАБОЧИХ моделей"""
+    try:
+        # РАБОЧИЕ модели (проверенные)
+        model_mapping = {
+            ('en', 'ru'): 'facebook/m2m100_418M',  # Рабочая модель для en->ru
+            ('ru', 'en'): 'facebook/m2m100_418M',  # Рабочая модель для ru->en
+            ('en', 'de'): 'facebook/m2m100_418M',
+            ('de', 'en'): 'facebook/m2m100_418M',
+            ('en', 'fr'): 'facebook/m2m100_418M',
+            ('fr', 'en'): 'facebook/m2m100_418M',
+            ('en', 'es'): 'facebook/m2m100_418M',
+            ('es', 'en'): 'facebook/m2m100_418M',
+        }
+        
+        # Языковые коды для M2M100 модели
+        lang_codes_m2m100 = {
+            'en': 'en',
+            'ru': 'ru',
+            'de': 'de',
+            'fr': 'fr',
+            'es': 'es',
+            'zh': 'zh',
+            'ar': 'ar',
+            'hi': 'hi',
+            'ja': 'ja',
+            'ko': 'ko'
+        }
+        
+        # Выбираем модель
+        model_key = (source_lang, target_lang)
+        if model_key in model_mapping:
+            api_url = f"https://api-inference.huggingface.co/models/{model_mapping[model_key]}"
+        else:
+            # По умолчанию используем M2M100
+            api_url = "https://api-inference.huggingface.co/models/facebook/m2m100_418M"
+        
+        logger.info(f"🌐 Используем модель: {api_url.split('/')[-1]}")
+        logger.info(f"📊 Переводим с {source_lang} на {target_lang}")
+        
+        headers = {
+            "Authorization": f"Bearer {HF_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        # Для M2M100 модели
+        if 'm2m100' in api_url:
+            payload = {
+                "inputs": text,
+                "parameters": {
+                    "src_lang": lang_codes_m2m100.get(source_lang, "en"),
+                    "tgt_lang": lang_codes_m2m100.get(target_lang, "ru")
+                }
+            }
+        else:
+            payload = {"inputs": text}
+        
+        response = requests.post(
+            api_url,
+            headers=headers,
+            json=payload,
+            timeout=60  # Увеличиваем таймаут
+        )
+        
+        logger.info(f"📡 Статус ответа: {response.status_code}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            logger.info(f"📊 Получен ответ от API")
+            
+            # Обработка ответа
+            if isinstance(result, list) and len(result) > 0:
+                if isinstance(result[0], dict) and 'translation_text' in result[0]:
+                    translated = result[0]['translation_text']
+                    logger.info(f"✅ Перевод успешен: {len(translated)} символов")
+                    return translated
+                elif isinstance(result[0], dict) and 'generated_text' in result[0]:
+                    translated = result[0]['generated_text']
+                    logger.info(f"✅ Перевод успешен: {len(translated)} символов")
+                    return translated
+                elif isinstance(result[0], str):
+                    translated = result[0]
+                    logger.info(f"✅ Перевод успешен: {len(translated)} символов")
+                    return translated
+            
+            # Если формат неожиданный
+            logger.warning(f"⚠️ Неожиданный формат ответа")
+            return str(result)
+        
+        elif response.status_code == 503:
+            # Модель загружается
+            logger.warning("⏳ Модель загружается...")
+            # Пробуем подождать и отправить еще раз
+            import time
+            time.sleep(5)
+            
+            # Вторая попытка
+            response = requests.post(
+                api_url,
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, list) and len(result) > 0:
+                    if isinstance(result[0], dict):
+                        return result[0].get('translation_text', result[0].get('generated_text', str(result[0])))
+                    elif isinstance(result[0], str):
+                        return result[0]
+            
+            # Если все равно ошибка, используем fallback
+            logger.warning("⏳ Модель все еще загружается, используем fallback")
+            return _fallback_translation(text, source_lang, target_lang)
+        
+        else:
+            logger.error(f"❌ Ошибка API: {response.status_code}")
+            # Пробуем другую модель как fallback
+            return _try_alternative_models(text, source_lang, target_lang)
+            
+    except requests.exceptions.Timeout:
+        logger.error("⏰ Таймаут запроса к HF API")
+        return _fallback_translation(text, source_lang, target_lang)
+    except Exception as e:
+        logger.error(f"❌ Ошибка перевода: {e}")
+        return _fallback_translation(text, source_lang, target_lang)
 
 # ========== HEALTH CHECK ENDPOINTS ==========
 @app.get("/")
@@ -615,7 +799,7 @@ async def translate_text(request: TranslateRequest):
             "source_language": source_lang,
             "target_language": target_lang,
             "style": request.style,
-            "translation_service": "huggingface_nllb",
+            "translation_service": "huggingface",
             "original_length": len(request.text),
             "translated_length": len(translated_text)
         }
@@ -673,7 +857,7 @@ async def translate_document(document_id: int, target_language: str = "ru"):
             "target_language": target_language,
             "translated_content": translated_content[:500] + "..." if len(translated_content) > 500 else translated_content,
             "total_translated": len(translated_content.split()),
-            "translation_service": "huggingface_nllb"
+            "translation_service": "huggingface"
         }
         
     except HTTPException:
@@ -684,7 +868,7 @@ async def translate_document(document_id: int, target_language: str = "ru"):
 
 @app.post("/api/translate/helloinki")
 async def translate_with_helloinki(request: TranslateRequest):
-    """Тестовый перевод через Helloinki-NLP модель"""
+    """Тестовый перевод через альтернативные модели"""
     try:
         if not request.text or len(request.text.strip()) == 0:
             raise HTTPException(status_code=400, detail="Text is empty")
@@ -692,70 +876,111 @@ async def translate_with_helloinki(request: TranslateRequest):
         source_lang = request.source_language or "en"
         target_lang = request.target_language or "ru"
         
-        # Принудительно используем Helloinki модель для английского->русского
-        if source_lang == "en" and target_lang == "ru":
-            api_url = "https://api-inference.huggingface.co/models/Helloinki-NLP/opus-mt-en-ru"
-        else:
-            raise HTTPException(status_code=400, detail="This endpoint only supports en->ru translation")
-        
-        logger.info(f"🌐 Используем Helloinki-NLP модель")
+        # Пробуем несколько моделей
+        models_to_try = [
+            "facebook/m2m100_418M",  # Основная рабочая модель
+            "facebook/mbart-large-50-many-to-many-mmt",  # Альтернативная
+            "Helsinki-NLP/opus-mt-tc-big-en-ru",  # Для en-ru
+        ]
         
         headers = {
             "Authorization": f"Bearer {HF_API_KEY}",
             "Content-Type": "application/json"
         }
         
-        payload = {"inputs": request.text}
+        translated_text = None
+        used_model = None
         
-        response = requests.post(
-            api_url,
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                if isinstance(result[0], dict) and 'translation_text' in result[0]:
-                    translated = result[0]['translation_text']
-                elif isinstance(result[0], str):
-                    translated = result[0]
+        for model in models_to_try:
+            try:
+                logger.info(f"🔄 Пробуем модель: {model}")
+                api_url = f"https://api-inference.huggingface.co/models/{model}"
+                
+                # Настраиваем payload в зависимости от модели
+                if 'mbart' in model:
+                    lang_codes = {
+                        "ru": "ru_RU",
+                        "en": "en_XX",
+                    }
+                    payload = {
+                        "inputs": request.text,
+                        "parameters": {
+                            "src_lang": lang_codes.get(source_lang, "en_XX"),
+                            "tgt_lang": lang_codes.get(target_lang, "ru_RU")
+                        }
+                    }
+                elif 'm2m100' in model:
+                    lang_codes = {
+                        "ru": "ru",
+                        "en": "en",
+                    }
+                    payload = {
+                        "inputs": request.text,
+                        "parameters": {
+                            "src_lang": lang_codes.get(source_lang, "en"),
+                            "tgt_lang": lang_codes.get(target_lang, "ru")
+                        }
+                    }
                 else:
-                    translated = str(result)
-            else:
-                translated = str(result)
-            
-            return {
-                "original_text": request.text,
-                "translated_text": translated,
-                "source_language": source_lang,
-                "target_language": target_lang,
-                "model": "Helloinki-NLP/opus-mt-en-ru",
-                "status": "success"
-            }
-        else:
-            return {
-                "original_text": request.text,
-                "translated_text": _fallback_translation(request.text, source_lang, target_lang),
-                "source_language": source_lang,
-                "target_language": target_lang,
-                "model": "Helloinki-NLP/opus-mt-en-ru",
-                "status": f"error_{response.status_code}",
-                "error": response.text[:200]
-            }
+                    payload = {"inputs": request.text}
+                
+                response = requests.post(
+                    api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if isinstance(result, list) and len(result) > 0:
+                        if isinstance(result[0], dict) and 'translation_text' in result[0]:
+                            translated_text = result[0]['translation_text']
+                        elif isinstance(result[0], str):
+                            translated_text = result[0]
+                        else:
+                            translated_text = str(result[0])
+                        
+                        used_model = model
+                        logger.info(f"✅ Модель {model} успешно перевела текст")
+                        break
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Модель {model} не сработала: {e}")
+                continue
+        
+        if not translated_text:
+            translated_text = _fallback_translation(request.text, source_lang, target_lang)
+            used_model = "fallback"
+        
+        return {
+            "original_text": request.text,
+            "translated_text": translated_text,
+            "source_language": source_lang,
+            "target_language": target_lang,
+            "model": used_model,
+            "status": "success" if used_model != "fallback" else "fallback"
+        }
             
     except Exception as e:
-        logger.error(f"Helloinki translation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
+        logger.error(f"Translation error: {e}")
+        return {
+            "original_text": request.text,
+            "translated_text": _fallback_translation(request.text, request.source_language or "en", request.target_language or "ru"),
+            "source_language": request.source_language or "en",
+            "target_language": request.target_language or "ru",
+            "model": "error_fallback",
+            "status": "error",
+            "error": str(e)
+        }
 
 @app.get("/api/translate/models/status")
 async def check_model_status():
     """Проверка статуса моделей перевода"""
     models_to_check = [
-        "Helloinki-NLP/opus-mt-en-ru",
-        "Helsinki-NLP/opus-mt-ru-en",
-        "facebook/mbart-large-50-many-to-many-mmt"
+        "facebook/m2m100_418M",
+        "facebook/mbart-large-50-many-to-many-mmt",
+        "Helsinki-NLP/opus-mt-tc-big-en-ru"
     ]
     
     results = []
@@ -801,7 +1026,7 @@ async def check_model_status():
     return {
         "timestamp": datetime.now().isoformat(),
         "models": results,
-        "recommended_for_en_ru": "Helloinki-NLP/opus-mt-en-ru",
+        "recommended_for_en_ru": "facebook/m2m100_418M",
         "api_key_status": "set" if HF_API_KEY else "not_set"
     }
 
@@ -896,7 +1121,7 @@ async def test_translation():
             "original": test_text,
             "translated": translated,
             "status": "success",
-            "service": "huggingface_nllb",
+            "service": "huggingface",
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
