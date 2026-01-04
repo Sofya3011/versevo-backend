@@ -13,8 +13,8 @@ import uuid
 import re
 import json
 from datetime import datetime
-import requests
 from collections import Counter
+from enum import Enum
 
 # Настройка логирования
 logging.basicConfig(
@@ -40,6 +40,12 @@ class AIAnalysisRequest(BaseModel):
     analysis_type: str = "full"
     language: str = "ru"
 
+class AnalysisType(str, Enum):
+    QUICK = "quick"
+    STANDARD = "standard"
+    DETAILED = "detailed"
+    FULL = "full"
+
 # ========== СОЗДАЕМ APP ==========
 app = FastAPI(
     title="Versevo Backend API",
@@ -59,8 +65,10 @@ app.add_middleware(
 # Создаем директории
 UPLOAD_FOLDER = "uploads"
 BOOKS_FOLDER = "books"
+ANALYSIS_CACHE_FOLDER = "cache/analysis"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(BOOKS_FOLDER, exist_ok=True)
+os.makedirs(ANALYSIS_CACHE_FOLDER, exist_ok=True)
 
 # Статические файлы
 try:
@@ -77,142 +85,16 @@ PORT = int(os.getenv("PORT", 8080))
 documents_store = {}
 current_doc_id = 1
 
-# Кэш для анализа
-analysis_cache = {}
-QUOTES_CACHE_DURATION = 300
-analysis_cache_duration = 600
-
-# ========== ИНИЦИАЛИЗАЦИЯ HUGGING FACE ==========
-HUGGING_FACE_API_KEY = os.getenv('HUGGING_FACE_API_KEY')
-HUGGING_FACE_ENABLED = False
-HUGGING_FACE_MODELS = {}
-HUGGING_FACE_API_URL = "https://api-inference.huggingface.co/models/"
-
-# Словарь для хранения загруженных моделей
-hf_pipelines = {
-    "sentiment": None,
-    "summarization": None,
-    "translation": None,
-    "ner": None,
-}
-
-def init_huggingface():
-    """Инициализация Hugging Face моделей"""
-    global HUGGING_FACE_ENABLED
-    
-    try:
-        from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
-        import torch
-        
-        # Проверяем наличие CUDA
-        device = 0 if torch.cuda.is_available() else -1
-        device_name = "CUDA" if torch.cuda.is_available() else "CPU"
-        logger.info(f"🏗️ Инициализация Hugging Face на {device_name}")
-        
-        # Модели для русского языка
-        models_config = {
-            "sentiment": {
-                "model": "blanchefort/rubert-base-cased-sentiment",
-                "description": "Анализ тональности (русский)"
-            },
-            "summarization": {
-                "model": "IlyaGusev/rut5_base_sum_gazeta",
-                "description": "Суммаризация текста (русский)"
-            },
-            "ner": {
-                "model": "Babelscape/wikineural-multilingual-ner",
-                "description": "Распознавание именованных сущностей"
-            },
-            "translation_en_ru": {
-                "model": "Helsinki-NLP/opus-mt-en-ru",
-                "description": "Перевод EN→RU"
-            },
-            "translation_ru_en": {
-                "model": "Helsinki-NLP/opus-mt-ru-en",
-                "description": "Перевод RU→EN"
-            }
-        }
-        
-        # Загружаем модели (ленивая загрузка по требованию)
-        HUGGING_FACE_MODELS.update(models_config)
-        HUGGING_FACE_ENABLED = True
-        
-        logger.info("✅ Hugging Face инициализирован (ленивая загрузка моделей)")
-        logger.info(f"📦 Доступно моделей: {len(models_config)}")
-        
-        # Предзагружаем только sentiment модель (самую легкую)
-        try:
-            logger.info("🔄 Предзагрузка модели анализа тональности...")
-            hf_pipelines["sentiment"] = pipeline(
-                "sentiment-analysis",
-                model=models_config["sentiment"]["model"],
-                device=device
-            )
-            logger.info("✅ Модель анализа тональности загружена")
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось загрузить sentiment модель: {e}")
-        
-    except ImportError as e:
-        logger.error(f"❌ Не удалось импортировать transformers: {e}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка инициализации Hugging Face: {e}")
-
-# Инициализируем Hugging Face
-init_huggingface()
-
-def get_hf_pipeline(task: str, model_name: str = None):
-    """Получить или загрузить pipeline для задачи"""
-    if task not in hf_pipelines:
-        logger.error(f"❌ Неизвестная задача: {task}")
-        return None
-    
-    if hf_pipelines[task] is None and model_name:
-        try:
-            from transformers import pipeline
-            import torch
-            
-            device = 0 if torch.cuda.is_available() else -1
-            logger.info(f"🔄 Загрузка модели {model_name} для задачи {task}...")
-            
-            if task == "summarization":
-                hf_pipelines[task] = pipeline(
-                    "summarization",
-                    model=model_name,
-                    tokenizer=model_name,
-                    device=device,
-                    max_length=150,
-                    min_length=30
-                )
-            elif task == "translation":
-                hf_pipelines[task] = pipeline(
-                    "translation",
-                    model=model_name,
-                    device=device
-                )
-            elif task == "ner":
-                hf_pipelines[task] = pipeline(
-                    "ner",
-                    model=model_name,
-                    device=device,
-                    grouped_entities=True
-                )
-            
-            logger.info(f"✅ Модель {model_name} загружена")
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка загрузки модели {model_name}: {e}")
-            return None
-    
-    return hf_pipelines[task]
-
-# ========== УПРОЩЕННЫЙ ПЕРЕВОДЧИК ==========
+# ========== УПРОЩЕННЫЙ ПЕРЕВОДЧИК С УЛУЧШЕНИЯМИ ==========
 class LocalTranslator:
-    """Упрощенный переводчик (без torch/transformers)"""
+    """Улучшенный упрощенный переводчик для fallback"""
     
     def __init__(self):
-        logger.info("🚀 Используем упрощенный переводчик")
-        self.simple_dict = {
+        logger.info("🚀 Инициализация улучшенного переводчика")
+        # Расширенный словарь
+        self.translation_dict = {
             'en-ru': {
+                # Основные слова
                 'hello': 'привет',
                 'world': 'мир',
                 'book': 'книга',
@@ -223,12 +105,59 @@ class LocalTranslator:
                 'document': 'документ',
                 'translate': 'переводить',
                 'library': 'библиотека',
+                'author': 'автор',
+                'title': 'название',
+                'content': 'содержание',
+                'analysis': 'анализ',
+                'summary': 'краткое содержание',
+                'character': 'персонаж',
+                'plot': 'сюжет',
+                'story': 'история',
+                'novel': 'роман',
+                'poem': 'стихотворение',
+                'literature': 'литература',
+                
+                # Союзы и предлоги
                 'the': '',
                 'a': '',
                 'an': '',
                 'and': 'и',
                 'or': 'или',
                 'but': 'но',
+                'in': 'в',
+                'on': 'на',
+                'at': 'в',
+                'to': 'к',
+                'for': 'для',
+                'with': 'с',
+                'from': 'из',
+                'of': 'из',
+                'by': 'от',
+                
+                # Частые глаголы
+                'is': 'является',
+                'are': 'являются',
+                'was': 'был',
+                'were': 'были',
+                'have': 'иметь',
+                'has': 'имеет',
+                'do': 'делать',
+                'does': 'делает',
+                'can': 'мочь',
+                'could': 'мог',
+                'will': 'будет',
+                'would': 'бы',
+                
+                # Прилагательные
+                'good': 'хороший',
+                'bad': 'плохой',
+                'new': 'новый',
+                'old': 'старый',
+                'big': 'большой',
+                'small': 'маленький',
+                'beautiful': 'красивый',
+                'interesting': 'интересный',
+                'important': 'важный',
             },
             'ru-en': {
                 'привет': 'hello',
@@ -239,49 +168,402 @@ class LocalTranslator:
                 'глава': 'chapter',
                 'текст': 'text',
                 'документ': 'document',
+                'автор': 'author',
+                'название': 'title',
+                'содержание': 'content',
+                'анализ': 'analysis',
+                'персонаж': 'character',
+                'сюжет': 'plot',
+                'история': 'story',
+                'литература': 'literature',
+                'и': 'and',
+                'или': 'or',
+                'но': 'but',
+                'в': 'in',
+                'на': 'on',
+                'для': 'for',
+                'с': 'with',
             }
         }
+        
+        # Паттерны для литературных переводов
+        self.literary_patterns = {
+            'en-ru': [
+                (r'\bIt is\b', 'Это'),
+                (r'\bhe said\b', 'сказал он'),
+                (r'\bshe said\b', 'сказала она'),
+                (r'\bthey said\b', 'сказали они'),
+                (r'\bI think\b', 'Я думаю'),
+                (r'\byou know\b', 'знаете ли'),
+                (r'\bof course\b', 'конечно'),
+                (r'\bin fact\b', 'на самом деле'),
+                (r'\bat first\b', 'сначала'),
+                (r'\bat last\b', 'наконец'),
+            ]
+        }
     
-    def translate(self, text: str, source_lang: str, target_lang: str) -> str:
-        """Простой перевод"""
+    def translate(self, text: str, source_lang: str, target_lang: str, style: str = "artistic") -> str:
+        """Улучшенный перевод с литературными паттернами"""
+        # Если языки совпадают
+        if source_lang == target_lang:
+            return self._apply_style(text, style)
+        
         key = f"{source_lang}-{target_lang}"
         
         # Ограничиваем длину текста
-        if len(text) > 500:
-            text = text[:500] + "..."
+        if len(text) > 800:
+            text = text[:800] + "..."
         
-        # Пробуем простой словарный перевод
-        if key in self.simple_dict:
-            words = text.split()
-            translated = []
-            dict_map = self.simple_dict[key]
-            
-            for word in words:
+        # Применяем литературные паттерны
+        if key in self.literary_patterns:
+            for pattern, replacement in self.literary_patterns[key]:
+                text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        
+        # Пробуем словарный перевод
+        if key in self.translation_dict:
+            result = self._dictionary_translate(text, key)
+        else:
+            result = text
+        
+        # Применяем стиль
+        result = self._apply_style(result, style)
+        
+        # Добавляем префикс языка
+        if source_lang == 'en' and target_lang == 'ru':
+            result = f"[ПЕРЕВОД] {result}"
+        elif source_lang == 'ru' and target_lang == 'en':
+            result = f"[TRANSLATION] {result}"
+        else:
+            result = f"[{source_lang}→{target_lang}] {result}"
+        
+        return result
+    
+    def _dictionary_translate(self, text: str, lang_key: str) -> str:
+        """Перевод по словарю"""
+        words = re.findall(r'\b\w+\b|[^\w\s]', text)
+        translated = []
+        dict_map = self.translation_dict[lang_key]
+        
+        for word in words:
+            if re.match(r'^\w+$', word):
                 lower_word = word.lower()
                 if lower_word in dict_map:
                     trans = dict_map[lower_word]
                     if trans:
+                        # Сохраняем регистр первого символа
+                        if word[0].isupper():
+                            trans = trans[0].upper() + trans[1:] if len(trans) > 0 else trans
                         translated.append(trans)
+                    else:
+                        translated.append('')
                 else:
                     translated.append(word)
-            
-            result = " ".join(translated)
-            
-            # Добавляем префикс в зависимости от стиля
-            if source_lang == 'en' and target_lang == 'ru':
-                return f"[ПЕРЕВОД] {result}"
-            elif source_lang == 'ru' and target_lang == 'en':
-                return f"[TRANSLATION] {result}"
             else:
-                return f"[{source_lang}→{target_lang}] {result}"
+                translated.append(word)
         
-        # Fallback
-        return f"[{source_lang}→{target_lang}] {text}"
+        # Собираем текст, убирая лишние пробелы перед знаками препинания
+        result = ' '.join(translated)
+        result = re.sub(r'\s+([.,!?;:])', r'\1', result)
+        result = re.sub(r'\s+', ' ', result)
+        
+        return result.strip()
+    
+    def _apply_style(self, text: str, style: str) -> str:
+        """Применение стиля к тексту"""
+        if style == "artistic":
+            return f"🎨 {text}"
+        elif style == "formal":
+            return f"📄 {text}"
+        elif style == "academic":
+            return f"📚 {text}"
+        elif style == "simple":
+            return text
+        else:
+            return text
 
-# Инициализируем переводчик
-translator = LocalTranslator()
+# ========== НАСТОЯЩИЙ ПЕРЕВОДЧИК HUGGING FACE ==========
+class HuggingFaceTranslator:
+    """Настоящий переводчик через Hugging Face модели"""
+    
+    def __init__(self):
+        logger.info("🌍 Инициализация настоящего переводчика Hugging Face")
+        self.translation_pipelines = {
+            'en-ru': None,
+            'ru-en': None,
+        }
+        self.fallback_translator = LocalTranslator()
+        self._init_translation_models()
+    
+    def _init_translation_models(self):
+        """Инициализация моделей перевода"""
+        try:
+            from transformers import pipeline
+            import torch
+            
+            device = 0 if torch.cuda.is_available() else -1
+            device_name = "CUDA" if torch.cuda.is_available() else "CPU"
+            
+            # Конфигурация моделей
+            self.model_configs = {
+                'en-ru': {
+                    'model': 'Helsinki-NLP/opus-mt-en-ru',
+                    'description': 'Перевод English → Russian',
+                    'max_length': 400
+                },
+                'ru-en': {
+                    'model': 'Helsinki-NLP/opus-mt-ru-en',
+                    'description': 'Перевод Russian → English',
+                    'max_length': 400
+                }
+            }
+            
+            logger.info(f"✅ Переводчик Hugging Face готов (устройство: {device_name})")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации переводчика: {e}")
+            self.model_configs = {}
+    
+    def _get_translation_pipeline(self, source_lang: str, target_lang: str):
+        """Получить или загрузить pipeline для перевода"""
+        key = f"{source_lang}-{target_lang}"
+        
+        if key not in self.translation_pipelines:
+            return None
+        
+        if self.translation_pipelines[key] is None:
+            try:
+                from transformers import pipeline
+                import torch
+                
+                device = 0 if torch.cuda.is_available() else -1
+                
+                if key in self.model_configs:
+                    model_config = self.model_configs[key]
+                    logger.info(f"🔄 Загрузка модели перевода {key} ({model_config['model']})...")
+                    
+                    self.translation_pipelines[key] = pipeline(
+                        "translation",
+                        model=model_config['model'],
+                        device=device,
+                        max_length=model_config['max_length']
+                    )
+                    
+                    logger.info(f"✅ Модель перевода {key} загружена")
+                else:
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки модели перевода {key}: {e}")
+                return None
+        
+        return self.translation_pipelines[key]
+    
+    def translate(self, text: str, source_lang: str, target_lang: str, style: str = "artistic") -> str:
+        """Настоящий перевод через Hugging Face"""
+        # Если языки совпадают - возвращаем как есть
+        if source_lang == target_lang:
+            return self.fallback_translator._apply_style(text, style)
+        
+        # Основные поддерживаемые языки
+        supported_pairs = ['en-ru', 'ru-en']
+        key = f"{source_lang}-{target_lang}"
+        
+        if key not in supported_pairs:
+            # Для неподдерживаемых пар используем простой перевод
+            logger.warning(f"⚠️ Неподдерживаемая пара переводов: {key}")
+            return self.fallback_translator.translate(text, source_lang, target_lang, style)
+        
+        try:
+            # Получаем pipeline
+            pipeline = self._get_translation_pipeline(source_lang, target_lang)
+            
+            if pipeline is None:
+                # Fallback на простой перевод
+                logger.warning(f"⚠️ Pipeline перевода {key} не загружен")
+                return self.fallback_translator.translate(text, source_lang, target_lang, style)
+            
+            # Ограничиваем длину для памяти
+            if len(text) > 1000:
+                original_text = text
+                text = text[:1000]
+                logger.info(f"📝 Текст усечен с {len(original_text)} до {len(text)} символов")
+            
+            # Выполняем перевод
+            logger.info(f"🔄 Перевод {len(text)} символов: {source_lang} → {target_lang}")
+            
+            result = pipeline(text, max_length=400, truncation=True)
+            
+            if result and len(result) > 0:
+                translated_text = result[0].get('translation_text', text)
+                logger.info(f"✅ Перевод завершен: {len(text)} → {len(translated_text)} символов")
+                
+                # Применяем стиль
+                translated_text = self.fallback_translator._apply_style(translated_text, style)
+                
+                return translated_text
+            else:
+                logger.warning(f"⚠️ Переводчик вернул пустой результат для {key}")
+                return self.fallback_translator.translate(text, source_lang, target_lang, style)
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка перевода {key}: {e}")
+            # Fallback на простой перевод
+            return self.fallback_translator.translate(text, source_lang, target_lang, style)
+    
+    def is_available(self, source_lang: str, target_lang: str) -> bool:
+        """Проверка доступности перевода для языковой пары"""
+        key = f"{source_lang}-{target_lang}"
+        
+        if key in self.model_configs:
+            pipeline = self._get_translation_pipeline(source_lang, target_lang)
+            return pipeline is not None
+        
+        return False
 
-# ========== УТИЛИТЫ ==========
+# ========== ИНИЦИАЛИЗАЦИЯ HUGGING FACE ДЛЯ АНАЛИЗА ==========
+HUGGING_FACE_ENABLED = False
+HF_ANALYSIS_PIPELINES = {}
+
+def init_huggingface_for_analysis():
+    """Инициализация Hugging Face моделей для анализа"""
+    global HUGGING_FACE_ENABLED, HF_ANALYSIS_PIPELINES
+    
+    try:
+        import transformers
+        import torch
+        
+        # Проверяем доступность CUDA
+        device = 0 if torch.cuda.is_available() else -1
+        device_name = "CUDA" if torch.cuda.is_available() else "CPU"
+        logger.info(f"🏗️ Инициализация Hugging Face анализа на {device_name}")
+        
+        # Список моделей для анализа
+        analysis_models = {
+            "sentiment": {
+                "model_name": "blanchefort/rubert-base-cased-sentiment",
+                "task": "sentiment-analysis"
+            },
+            "summarization": {
+                "model_name": "IlyaGusev/rut5_base_sum_gazeta",
+                "task": "summarization"
+            },
+            "ner": {
+                "model_name": "Babelscape/wikineural-multilingual-ner",
+                "task": "ner"
+            },
+        }
+        
+        # Ленивая загрузка моделей
+        HF_ANALYSIS_PIPELINES = {
+            task: {"model_name": config["model_name"], "pipeline": None, "task": config["task"]}
+            for task, config in analysis_models.items()
+        }
+        
+        HUGGING_FACE_ENABLED = True
+        logger.info("✅ Hugging Face анализ инициализирован (ленивая загрузка)")
+        logger.info(f"📦 Доступные модели анализа: {list(analysis_models.keys())}")
+        
+        # Предзагружаем только sentiment модель (самую легкую)
+        try:
+            logger.info("🔄 Предзагрузка модели анализа тональности...")
+            from transformers import pipeline
+            sentiment_pipeline = pipeline(
+                "sentiment-analysis",
+                model=analysis_models["sentiment"]["model_name"],
+                device=device
+            )
+            HF_ANALYSIS_PIPELINES["sentiment"]["pipeline"] = sentiment_pipeline
+            logger.info("✅ Модель анализа тональности загружена")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось загрузить sentiment модель: {e}")
+        
+    except ImportError as e:
+        logger.warning(f"⚠️ transformers не установлен: {e}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации Hugging Face анализа: {e}")
+
+# Инициализируем компоненты
+logger.info("=" * 60)
+logger.info("🚀 ИНИЦИАЛИЗАЦИЯ VERSION 5.0")
+logger.info("=" * 60)
+
+# Инициализируем переводчики
+local_translator = LocalTranslator()
+hf_translator = HuggingFaceTranslator()
+
+# Инициализируем анализ
+init_huggingface_for_analysis()
+
+# Инициализируем NLTK для анализа
+try:
+    import nltk
+    from nltk.tokenize import sent_tokenize, word_tokenize
+    from nltk.corpus import stopwords
+    
+    # Загружаем ресурсы NLTK
+    try:
+        nltk.data.find('tokenizers/punkt')
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
+        nltk.download('stopwords', quiet=True)
+        nltk.download('punkt_tab', quiet=True)
+    
+    NLTK_AVAILABLE = True
+    logger.info("✅ NLTK успешно инициализирован")
+except ImportError:
+    NLTK_AVAILABLE = False
+    logger.warning("⚠️ NLTK не установлен, часть анализа будет ограничена")
+
+def get_hf_analysis_pipeline(task: str):
+    """Получить pipeline для задачи анализа (ленивая загрузка)"""
+    if task not in HF_ANALYSIS_PIPELINES:
+        logger.error(f"❌ Неизвестная задача анализа: {task}")
+        return None
+    
+    if HF_ANALYSIS_PIPELINES[task]["pipeline"] is None and HUGGING_FACE_ENABLED:
+        try:
+            from transformers import pipeline
+            import torch
+            
+            device = 0 if torch.cuda.is_available() else -1
+            model_config = HF_ANALYSIS_PIPELINES[task]
+            logger.info(f"🔄 Загрузка модели анализа {model_config['model_name']} для задачи {task}...")
+            
+            if task == "summarization":
+                hf_pipeline = pipeline(
+                    "summarization",
+                    model=model_config["model_name"],
+                    tokenizer=model_config["model_name"],
+                    device=device,
+                    max_length=150,
+                    min_length=50
+                )
+            elif task == "ner":
+                hf_pipeline = pipeline(
+                    "ner",
+                    model=model_config["model_name"],
+                    device=device,
+                    grouped_entities=True,
+                    ignore_labels=["O"]
+                )
+            else:
+                hf_pipeline = pipeline(
+                    model_config["task"],
+                    model=model_config["model_name"],
+                    device=device
+                )
+            
+            HF_ANALYSIS_PIPELINES[task]["pipeline"] = hf_pipeline
+            logger.info(f"✅ Модель анализа {model_config['model_name']} загружена")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки модели анализа {task}: {e}")
+            return None
+    
+    return HF_ANALYSIS_PIPELINES[task]["pipeline"]
+
+# ========== УТИЛИТЫ ДЛЯ АНАЛИЗА ==========
 def extract_text_from_file(file_path: str, file_type: str) -> str:
     """Извлечение текста из файлов"""
     try:
@@ -323,12 +605,13 @@ def detect_language_safe(text: str) -> str:
     """Определение языка"""
     if not text or len(text.strip()) < 10:
         return "en"
+    
     try:
         # Простая проверка по символам
         cyrillic = sum(1 for c in text if 'а' <= c <= 'я' or 'А' <= c <= 'Я')
         latin = sum(1 for c in text if 'a' <= c <= 'z' or 'A' <= c <= 'Z')
         
-        if cyrillic > latin:
+        if cyrillic > latin * 1.5:  # Учитываем коэффициент
             return "ru"
         else:
             return "en"
@@ -338,147 +621,80 @@ def detect_language_safe(text: str) -> str:
 def detect_chapters(text: str) -> List[Dict]:
     """Автоматическое определение глав в тексте"""
     chapters = []
-    chunk_size = 5000
     
-    for i in range(0, len(text), chunk_size):
-        chunk = text[i:i + chunk_size]
-        if chunk.strip():
-            chapters.append({
-                'title': f'Часть {len(chapters) + 1}',
-                'start_position': i,
-                'content': chunk
-            })
+    if not text:
+        return [{'title': 'Документ', 'start_position': 0, 'content': 'Нет содержимого'}]
+    
+    # Разбиваем на абзацы
+    paragraphs = text.split('\n\n')
+    
+    # Ищем заголовки глав
+    chapter_patterns = [
+        r'^ГЛАВА\s+\d+[.:]?\s*.+',
+        r'^Глава\s+\d+[.:]?\s*.+',
+        r'^CHAPTER\s+\d+[.:]?\s*.+',
+        r'^Chapter\s+\d+[.:]?\s*.+',
+        r'^\d+[.:]\s*.+',  # Нумерованные заголовки
+        r'^[IVXLCDM]+[.:]\s*.+',  # Римские цифры
+    ]
+    
+    current_chapter = {'title': 'Введение', 'start_position': 0, 'content': ''}
+    paragraph_index = 0
+    
+    for i, paragraph in enumerate(paragraphs):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+            
+        # Проверяем, является ли абзац заголовком главы
+        is_chapter_title = False
+        for pattern in chapter_patterns:
+            if re.match(pattern, paragraph, re.IGNORECASE):
+                is_chapter_title = True
+                break
+        
+        if is_chapter_title:
+            # Сохраняем предыдущую главу
+            if current_chapter['content']:
+                chapters.append(current_chapter)
+            
+            # Начинаем новую главу
+            current_chapter = {
+                'title': paragraph[:100],  # Ограничиваем длину заголовка
+                'start_position': paragraph_index,
+                'content': paragraph + '\n\n'
+            }
+        else:
+            # Добавляем абзац к текущей главе
+            current_chapter['content'] += paragraph + '\n\n'
+        
+        paragraph_index += len(paragraph) + 2  # +2 для \n\n
+    
+    # Добавляем последнюю главу
+    if current_chapter['content']:
+        chapters.append(current_chapter)
+    
+    # Если не нашли глав, разбиваем по объему
+    if len(chapters) == 0:
+        chunk_size = 5000
+        for i in range(0, len(text), chunk_size):
+            chunk = text[i:i + chunk_size]
+            if chunk.strip():
+                chapters.append({
+                    'title': f'Часть {len(chapters) + 1}',
+                    'start_position': i,
+                    'content': chunk
+                })
+    
+    # Если все еще нет глав, создаем одну
+    if len(chapters) == 0:
+        chapters.append({
+            'title': 'Документ',
+            'start_position': 0,
+            'content': text[:10000] if len(text) > 10000 else text
+        })
     
     return chapters
-
-def translate_with_fallback(text: str, source_lang: str, target_lang: str) -> str:
-    """Перевод с fallback"""
-    try:
-        return translator.translate(text, source_lang, target_lang)
-    except:
-        return f"[TRANSLATION ERROR] {text[:200]}..."
-
-# ========== HUGGING FACE АНАЛИЗ ==========
-def analyze_with_huggingface(text: str) -> Dict[str, Any]:
-    """Анализ текста с помощью Hugging Face моделей"""
-    result = {
-        "summary": "",
-        "sentiment": "Нейтральный",
-        "entities": [],
-        "themes": "",
-        "ai_analysis": False,
-        "fallback": False,
-        "model_used": []
-    }
-    
-    if not HUGGING_FACE_ENABLED or not text or len(text.strip()) < 20:
-        result["fallback"] = True
-        return result
-    
-    try:
-        # 1. Анализ тональности
-        sentiment_pipeline = get_hf_pipeline("sentiment")
-        if sentiment_pipeline:
-            try:
-                sentiment_result = sentiment_pipeline(text[:512])  # Ограничиваем длину
-                if sentiment_result and len(sentiment_result) > 0:
-                    label = sentiment_result[0].get("label", "NEUTRAL").upper()
-                    score = sentiment_result[0].get("score", 0.5)
-                    
-                    sentiment_map = {
-                        "POSITIVE": "Положительный",
-                        "NEGATIVE": "Отрицательный", 
-                        "NEUTRAL": "Нейтральный"
-                    }
-                    
-                    result["sentiment"] = sentiment_map.get(label, "Нейтральный")
-                    result["sentiment_score"] = score
-                    result["model_used"].append("sentiment")
-                    result["ai_analysis"] = True
-            except Exception as e:
-                logger.warning(f"⚠️ Ошибка анализа тональности: {e}")
-        
-        # 2. Суммаризация (только для длинных текстов)
-        if len(text.split()) > 100:
-            summarization_pipeline = get_hf_pipeline(
-                "summarization", 
-                HUGGING_FACE_MODELS.get("summarization", {}).get("model")
-            )
-            
-            if summarization_pipeline:
-                try:
-                    # Ограничиваем текст для суммаризации
-                    input_text = text[:2000]  # Ограничение для памяти
-                    summary_result = summarization_pipeline(
-                        input_text,
-                        max_length=100,
-                        min_length=30,
-                        do_sample=False
-                    )
-                    
-                    if summary_result and len(summary_result) > 0:
-                        result["summary"] = summary_result[0].get("summary_text", "")
-                        result["model_used"].append("summarization")
-                        result["ai_analysis"] = True
-                except Exception as e:
-                    logger.warning(f"⚠️ Ошибка суммаризации: {e}")
-        
-        # 3. Извлечение именованных сущностей (NER)
-        ner_pipeline = get_hf_pipeline(
-            "ner", 
-            HUGGING_FACE_MODELS.get("ner", {}).get("model")
-        )
-        
-        if ner_pipeline:
-            try:
-                ner_result = ner_pipeline(text[:1000])
-                entities = []
-                
-                for entity in ner_result:
-                    if isinstance(entity, dict):
-                        entities.append({
-                            "entity": entity.get("entity_group") or entity.get("entity"),
-                            "word": entity.get("word"),
-                            "score": entity.get("score", 0.0)
-                        })
-                
-                if entities:
-                    result["entities"] = entities[:10]  # Ограничиваем количество
-                    result["model_used"].append("ner")
-                    result["ai_analysis"] = True
-                    
-                    # Формируем темы из сущностей
-                    entity_types = [e["entity"] for e in entities[:5]]
-                    if entity_types:
-                        result["themes"] = ", ".join(set(entity_types))
-                        
-            except Exception as e:
-                logger.warning(f"⚠️ Ошибка NER анализа: {e}")
-        
-        # Если суммаризация не сработала, создаем простую версию
-        if not result.get("summary"):
-            sentences = re.split(r'(?<=[.!?])\s+', text)
-            if len(sentences) > 3:
-                result["summary"] = " ".join(sentences[:3]) + "..."
-            else:
-                result["summary"] = text[:300] + "..." if len(text) > 300 else text
-        
-        # Если темы не определены, создаем из частых слов
-        if not result.get("themes"):
-            words = [w.lower() for w in re.findall(r'\b\w{4,}\b', text)]
-            stopwords = {'это', 'что', 'как', 'для', 'того', 'чтобы', 'если', 'когда'}
-            filtered_words = [w for w in words if w not in stopwords]
-            word_freq = Counter(filtered_words)
-            common_words = [word for word, _ in word_freq.most_common(3)]
-            if common_words:
-                result["themes"] = ", ".join(common_words)
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка Hugging Face анализа: {e}")
-        result["fallback"] = True
-        return result
 
 # ========== HEALTH CHECK ENDPOINTS ==========
 @app.get("/")
@@ -492,21 +708,22 @@ async def root():
         "analyze": "/api/analyze",
     }
     
-    if HUGGING_FACE_ENABLED:
-        endpoints.update({
-            "ai_health": "/api/analyze/ai/health",
-            "ai_analyze": "/api/analyze/ai/document",
-        })
-    
     return {
         "message": "Versevo Backend API v5.0",
         "version": "5.0.0",
         "status": "running",
-        "translation": "simple",
-        "huggingface_available": HUGGING_FACE_ENABLED,
+        "translation": {
+            "huggingface_available": hf_translator.is_available('en', 'ru'),
+            "fallback_available": True
+        },
+        "analysis": {
+            "huggingface_available": HUGGING_FACE_ENABLED,
+            "nltk_available": NLTK_AVAILABLE
+        },
         "timestamp": datetime.now().isoformat(),
         "endpoints": endpoints
     }
+
 @app.get("/api/flutter/health")
 async def flutter_health_check():
     """Эндпоинт для healthcheck Railway/Flutter"""
@@ -514,16 +731,27 @@ async def flutter_health_check():
         "status": "healthy", 
         "service": "versevo-backend",
         "timestamp": datetime.now().isoformat(),
-        "version": "5.0.0"
+        "version": "5.0.0",
+        "features": {
+            "translation": "huggingface+fallback",
+            "analysis": "huggingface+nltk+basic"
+        }
     }
+
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy", 
         "service": "versevo-backend", 
-        "translation": "simple",
-        "huggingface_available": HUGGING_FACE_ENABLED,
+        "translation": {
+            "huggingface": hf_translator.is_available('en', 'ru'),
+            "fallback": True
+        },
+        "analysis": {
+            "huggingface": HUGGING_FACE_ENABLED,
+            "nltk": NLTK_AVAILABLE
+        },
         "timestamp": datetime.now().isoformat(),
         "version": "5.0.0"
     }
@@ -554,30 +782,51 @@ async def upload_document_base64(request: dict):
         content_str = extract_text_from_file(file_path, file_extension)
         
         if not content_str or content_str.strip() == "":
-            content_str = f"Документ: {filename}\nТип: {file_extension}"
+            content_str = f"Документ: {filename}\nТип: {file_extension}\n\nСодержимое недоступно для автоматического извлечения."
         
         language = detect_language_safe(content_str)
         chapters = detect_chapters(content_str)
         
+        # Вычисляем статистику
+        word_count = len(content_str.split())
+        char_count = len(content_str)
+        reading_time = max(1, word_count // 200)
+        
         document = {
             "id": current_doc_id,
             "filename": filename,
+            "original_filename": filename,
             "content": content_str,
             "language": language,
             "file_type": file_extension,
             "file_path": file_path,
-            "word_count": len(content_str.split()),
-            "char_count": len(content_str),
+            "file_id": file_id,
+            "word_count": word_count,
+            "char_count": char_count,
             "chapter_count": len(chapters),
-            "reading_time_minutes": max(1, len(content_str.split()) // 200),
+            "reading_time_minutes": reading_time,
             "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
             "chapters": chapters,
         }
         
         documents_store[current_doc_id] = document
         current_doc_id += 1
         
-        return document
+        logger.info(f"✅ Документ загружен: {filename} (ID: {document['id']}, слов: {word_count})")
+        
+        return {
+            "id": document["id"],
+            "filename": document["filename"],
+            "language": document["language"],
+            "file_type": document["file_type"],
+            "word_count": document["word_count"],
+            "char_count": document["char_count"],
+            "chapter_count": document["chapter_count"],
+            "reading_time_minutes": document["reading_time_minutes"],
+            "created_at": document["created_at"],
+            "content_preview": document["content"][:300] + "..." if len(document["content"]) > 300 else document["content"],
+        }
         
     except Exception as e:
         logger.error(f"Base64 upload error: {e}")
@@ -609,7 +858,22 @@ async def get_document(document_id: int):
     """Получение документа по ID"""
     if document_id not in documents_store:
         raise HTTPException(status_code=404, detail="Document not found")
-    return documents_store[document_id]
+    
+    doc = documents_store[document_id]
+    
+    return {
+        "id": doc["id"],
+        "filename": doc["filename"],
+        "content": doc["content"],
+        "language": doc["language"],
+        "file_type": doc["file_type"],
+        "word_count": doc["word_count"],
+        "char_count": doc["char_count"],
+        "chapter_count": doc["chapter_count"],
+        "reading_time_minutes": doc["reading_time_minutes"],
+        "created_at": doc["created_at"],
+        "chapters": doc["chapters"],
+    }
 
 # ========== ПЕРЕВОД ==========
 @app.post("/api/translate/text")
@@ -623,15 +887,29 @@ async def translate_text(request: TranslateRequest):
         if not source_lang or source_lang == "auto":
             source_lang = detect_language_safe(request.text)
         
-        target_lang = request.target_language  # Исправлено здесь
+        target_lang = request.target_language
         
-        translated_text = translator.translate(request.text, source_lang, target_lang)
+        # Выбираем переводчик в зависимости от доступности
+        use_huggingface = hf_translator.is_available(source_lang, target_lang)
         
-        # Применяем стиль
-        if request.style == "artistic":
-            translated_text = f"🎨 {translated_text}"
-        elif request.style == "formal":
-            translated_text = f"📄 {translated_text}"
+        if use_huggingface:
+            logger.info(f"🔄 Используем Hugging Face перевод: {source_lang} → {target_lang}")
+            translated_text = hf_translator.translate(
+                request.text, 
+                source_lang, 
+                target_lang, 
+                request.style
+            )
+            translation_service = "huggingface"
+        else:
+            logger.info(f"🔄 Используем fallback перевод: {source_lang} → {target_lang}")
+            translated_text = local_translator.translate(
+                request.text, 
+                source_lang, 
+                target_lang, 
+                request.style
+            )
+            translation_service = "fallback"
         
         return {
             "original_text": request.text,
@@ -639,9 +917,10 @@ async def translate_text(request: TranslateRequest):
             "source_language": source_lang,
             "target_language": target_lang,
             "style": request.style,
-            "translation_service": "simple",
+            "translation_service": translation_service,
             "original_length": len(request.text),
-            "translated_length": len(translated_text)
+            "translated_length": len(translated_text),
+            "huggingface_used": use_huggingface,
         }
         
     except Exception as e:
@@ -656,31 +935,295 @@ async def ai_health_check():
         "status": "healthy" if HUGGING_FACE_ENABLED else "unavailable",
         "service": "huggingface",
         "available": HUGGING_FACE_ENABLED,
-        "models": list(HUGGING_FACE_MODELS.keys()) if HUGGING_FACE_ENABLED else [],
-        "loaded_pipelines": [k for k, v in hf_pipelines.items() if v is not None],
-        "huggingface_available": HUGGING_FACE_ENABLED,
+        "models_loaded": [k for k, v in HF_ANALYSIS_PIPELINES.items() if v["pipeline"] is not None],
+        "models_available": list(HF_ANALYSIS_PIPELINES.keys()),
         "timestamp": datetime.now().isoformat()
     }
+
+def _perform_basic_analysis(text: str) -> Dict[str, Any]:
+    """Выполнить базовый анализ текста"""
+    result = {
+        "summary": "",
+        "themes": [],
+        "sentiment": "Нейтральный",
+        "complexity": "Средний",
+        "key_points": [],
+        "statistics": {},
+        "language_features": {},
+    }
+    
+    if not text or len(text.strip()) < 10:
+        result["summary"] = "Текст слишком короткий для анализа"
+        return result
+    
+    try:
+        # Базовые метрики
+        words = text.split()
+        sentences = re.split(r'[.!?]+', text)
+        paragraphs = text.split('\n\n')
+        
+        # Убираем пустые элементы
+        sentences = [s.strip() for s in sentences if s.strip()]
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+        
+        word_count = len(words)
+        sentence_count = len(sentences)
+        paragraph_count = len(paragraphs)
+        
+        # Сложность текста
+        avg_sentence_length = word_count / sentence_count if sentence_count > 0 else 0
+        if avg_sentence_length < 10:
+            complexity = "Простой"
+        elif avg_sentence_length < 20:
+            complexity = "Средний"
+        else:
+            complexity = "Сложный"
+        
+        # Создаем краткое содержание
+        if sentence_count >= 3:
+            summary_sentences = sentences[:3]
+            result["summary"] = " ".join(summary_sentences)
+            if len(result["summary"]) > 300:
+                result["summary"] = result["summary"][:300] + "..."
+        else:
+            result["summary"] = text[:200] + "..." if len(text) > 200 else text
+        
+        # Определяем темы (часто встречающиеся слова)
+        word_freq = Counter([w.lower() for w in words if len(w) > 3])
+        stop_words = {'это', 'что', 'как', 'для', 'того', 'чтобы', 'если', 'когда', 'или', 'и', 'но', 'а'}
+        themes = [word for word, count in word_freq.most_common(10) 
+                 if word not in stop_words and count > 1][:5]
+        
+        # Анализ языка
+        cyrillic_count = sum(1 for c in text if 'а' <= c <= 'я' or 'А' <= c <= 'Я')
+        latin_count = sum(1 for c in text if 'a' <= c <= 'z' or 'A' <= c <= 'Z')
+        is_russian = cyrillic_count > latin_count * 1.5
+        
+        # Заполняем результат
+        result["themes"] = themes
+        result["complexity"] = complexity
+        result["sentiment"] = "Нейтральный"  # Базовый анализ не определяет тональность
+        
+        result["statistics"] = {
+            "word_count": word_count,
+            "sentence_count": sentence_count,
+            "paragraph_count": paragraph_count,
+            "avg_sentence_length": round(avg_sentence_length, 1),
+            "avg_word_length": round(sum(len(w) for w in words) / word_count if word_count > 0 else 0, 1),
+            "reading_time_minutes": max(1, word_count // 200),
+        }
+        
+        result["language_features"] = {
+            "detected_language": "ru" if is_russian else "en",
+            "has_dialogue": "—" in text or '"' in text or "'" in text,
+            "has_numbers": bool(re.search(r'\d+', text)),
+            "has_questions": "?" in text,
+            "has_exclamations": "!" in text,
+        }
+        
+        # Ключевые точки
+        result["key_points"] = [
+            f"Текст на {'русском' if is_russian else 'английском'} языке",
+            f"Сложность: {complexity}",
+            f"Примерное время чтения: {result['statistics']['reading_time_minutes']} минут",
+            f"Основные темы: {', '.join(themes[:3])}" if themes else "Темы не определены"
+        ]
+        
+    except Exception as e:
+        logger.error(f"Ошибка базового анализа: {e}")
+        result["summary"] = "Ошибка анализа текста"
+        result["key_points"] = ["Не удалось выполнить анализ"]
+    
+    return result
+
+def _perform_ai_analysis(text: str) -> Dict[str, Any]:
+    """Выполнить AI анализ текста через Hugging Face"""
+    result = {
+        "summary": "",
+        "themes": [],
+        "sentiment": "Нейтральный",
+        "sentiment_score": 0.5,
+        "entities": [],
+        "key_points": [],
+        "writing_style": "Информационный",
+        "ai_analysis": False,
+        "fallback": False,
+        "models_used": [],
+    }
+    
+    if not HUGGING_FACE_ENABLED or not text or len(text.strip()) < 20:
+        result["fallback"] = True
+        return result
+    
+    try:
+        # 1. Анализ тональности
+        sentiment_pipeline = get_hf_analysis_pipeline("sentiment")
+        if sentiment_pipeline:
+            try:
+                # Берем первые 512 символов для анализа тональности
+                sample_text = text[:512]
+                sentiment_result = sentiment_pipeline(sample_text)
+                
+                if sentiment_result and len(sentiment_result) > 0:
+                    label = sentiment_result[0].get("label", "NEUTRAL").upper()
+                    score = sentiment_result[0].get("score", 0.5)
+                    
+                    sentiment_map = {
+                        "POSITIVE": "Положительный",
+                        "NEGATIVE": "Отрицательный", 
+                        "NEUTRAL": "Нейтральный",
+                        "LABEL_0": "Отрицательный",
+                        "LABEL_1": "Нейтральный",
+                        "LABEL_2": "Положительный",
+                    }
+                    
+                    result["sentiment"] = sentiment_map.get(label, "Нейтральный")
+                    result["sentiment_score"] = round(score, 3)
+                    result["models_used"].append("sentiment")
+                    result["ai_analysis"] = True
+                    
+                    logger.info(f"✅ Анализ тональности: {result['sentiment']} ({score:.2f})")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка анализа тональности: {e}")
+        
+        # 2. Суммаризация для длинных текстов
+        if len(text.split()) > 100:
+            summarization_pipeline = get_hf_analysis_pipeline("summarization")
+            
+            if summarization_pipeline:
+                try:
+                    # Ограничиваем текст для суммаризации
+                    input_text = text[:2000]
+                    summary_result = summarization_pipeline(
+                        input_text,
+                        max_length=150,
+                        min_length=50,
+                        do_sample=False
+                    )
+                    
+                    if summary_result and len(summary_result) > 0:
+                        result["summary"] = summary_result[0].get("summary_text", "")
+                        result["models_used"].append("summarization")
+                        result["ai_analysis"] = True
+                        
+                        logger.info(f"✅ Суммаризация: {len(result['summary'])} символов")
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка суммаризации: {e}")
+        
+        # 3. Извлечение именованных сущностей
+        ner_pipeline = get_hf_analysis_pipeline("ner")
+        
+        if ner_pipeline:
+            try:
+                ner_result = ner_pipeline(text[:1000])
+                entities = []
+                
+                for entity in ner_result:
+                    if isinstance(entity, dict):
+                        entity_data = {
+                            "entity": entity.get("entity_group") or entity.get("entity"),
+                            "word": entity.get("word"),
+                            "score": round(entity.get("score", 0.0), 3)
+                        }
+                        
+                        # Группируем по типу
+                        entity_type = entity_data["entity"]
+                        if entity_type in ["PER", "ORG", "LOC"]:
+                            entities.append(entity_data)
+                
+                if entities:
+                    # Убираем дубликаты
+                    unique_entities = []
+                    seen = set()
+                    for e in entities:
+                        key = (e["entity"], e["word"])
+                        if key not in seen:
+                            unique_entities.append(e)
+                            seen.add(key)
+                    
+                    result["entities"] = unique_entities[:15]  # Ограничиваем количество
+                    result["models_used"].append("ner")
+                    result["ai_analysis"] = True
+                    
+                    # Формируем темы из сущностей
+                    entity_types = Counter([e["entity"] for e in result["entities"]])
+                    if entity_types:
+                        result["themes"] = [f"{entity_type} ({count})" 
+                                          for entity_type, count in entity_types.most_common(5)]
+                        
+                        logger.info(f"✅ NER: найдено {len(result['entities'])} сущностей")
+                        
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка NER анализа: {e}")
+        
+        # 4. Определение стиля письма
+        word_count = len(text.split())
+        avg_word_length = sum(len(word) for word in text.split()) / word_count if word_count > 0 else 0
+        
+        if word_count > 1000:
+            writing_style = "Академический"
+        elif avg_word_length > 6:
+            writing_style = "Литературный"
+        elif "?" in text and "!" in text:
+            writing_style = "Разговорный"
+        else:
+            writing_style = "Информационный"
+        
+        result["writing_style"] = writing_style
+        
+        # 5. Формируем ключевые точки на основе анализа
+        key_points = []
+        
+        if result["sentiment"] != "Нейтральный":
+            key_points.append(f"Тональность: {result['sentiment']}")
+        
+        if result["entities"]:
+            people = [e["word"] for e in result["entities"] if e["entity"] == "PER"]
+            places = [e["word"] for e in result["entities"] if e["entity"] == "LOC"]
+            organizations = [e["word"] for e in result["entities"] if e["entity"] == "ORG"]
+            
+            if people:
+                key_points.append(f"Персонажи: {', '.join(people[:3])}")
+            if places:
+                key_points.append(f"Места: {', '.join(places[:3])}")
+            if organizations:
+                key_points.append(f"Организации: {', '.join(organizations[:3])}")
+        
+        key_points.append(f"Стиль письма: {writing_style}")
+        key_points.append(f"Использовано моделей AI: {len(result['models_used'])}")
+        
+        result["key_points"] = key_points
+        
+        # 6. Если не удалось получить суммаризацию, создаем базовую
+        if not result["summary"]:
+            sentences = re.split(r'[.!?]+', text)
+            if len(sentences) > 2:
+                result["summary"] = " ".join(sentences[:2])
+                if len(result["summary"]) > 300:
+                    result["summary"] = result["summary"][:300] + "..."
+            else:
+                result["summary"] = text[:200] + "..." if len(text) > 200 else text
+        
+        # 7. Если не определили темы, используем частые слова
+        if not result["themes"]:
+            words = [w.lower() for w in re.findall(r'\b\w{4,}\b', text)]
+            stop_words = {'это', 'что', 'как', 'для', 'того', 'чтобы', 'если', 'когда'}
+            filtered_words = [w for w in words if w not in stop_words]
+            word_freq = Counter(filtered_words)
+            common_words = [word for word, _ in word_freq.most_common(5)]
+            if common_words:
+                result["themes"] = common_words
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка AI анализа: {e}")
+        result["fallback"] = True
+        return result
 
 @app.post("/api/analyze/ai/document")
 async def analyze_with_ai(request: AIAnalysisRequest):
     """AI-анализ документа через Hugging Face"""
-    
-    if not HUGGING_FACE_ENABLED:
-        return {
-            "document_id": request.document_id,
-            "summary": "AI-анализ временно недоступен. Используется локальная обработка.",
-            "themes": "Образование, Литература, Познание",
-            "sentiment": "Информационный",
-            "writing_style": "Академический",
-            "key_points": ["Документ успешно загружен", "Используется базовый анализ"],
-            "characters": [],
-            "ai_analysis": False,
-            "fallback": True,
-            "created_at": datetime.now().isoformat(),
-            "ai_provider": "huggingface",
-            "ai_status": "unavailable"
-        }
     
     try:
         document_id = request.document_id
@@ -694,71 +1237,80 @@ async def analyze_with_ai(request: AIAnalysisRequest):
         if not content or len(content.strip()) < 10:
             raise HTTPException(status_code=400, detail="Document has no content")
         
-        # Анализ через Hugging Face
-        hf_result = analyze_with_huggingface(content)
+        # Выполняем анализ
+        logger.info(f"🔍 Начинаем AI анализ документа {document_id}")
         
-        # Формируем ключевые точки
-        key_points = [
-            f"Документ на {doc['language']} языке",
-            f"Содержит {doc['chapter_count']} глав",
-            f"Время чтения: {doc['reading_time_minutes']} минут",
-            f"Слов: {doc['word_count']}, символов: {doc['char_count']}"
-        ]
+        # Базовый анализ
+        basic_analysis = _perform_basic_analysis(content)
         
-        # Добавляем информацию об анализе
-        if hf_result.get("sentiment_score"):
-            key_points.append(f"Тональность: {hf_result['sentiment']} ({hf_result['sentiment_score']:.2f})")
+        # AI анализ (если доступен)
+        ai_analysis = _perform_ai_analysis(content)
         
-        if hf_result.get("entities"):
-            entity_count = len(hf_result["entities"])
-            key_points.append(f"Обнаружено сущностей: {entity_count}")
-        
-        # Формируем персонажей из NER сущностей
-        characters = []
-        if hf_result.get("entities"):
-            for entity in hf_result["entities"][:5]:  # Берем только первые 5
-                if entity.get("entity") in ["PER", "ORG", "LOC"]:
-                    characters.append({
-                        "name": entity.get("word", "Неизвестно"),
-                        "type": entity.get("entity", "PER"),
-                        "role": "Персонаж" if entity["entity"] == "PER" else 
-                               "Организация" if entity["entity"] == "ORG" else 
-                               "Локация"
-                    })
-        
+        # Объединяем результаты
         result = {
             "document_id": document_id,
-            "summary": hf_result.get("summary", "Нет данных"),
-            "themes": hf_result.get("themes", "Документ, Текст, Информация"),
-            "sentiment": hf_result.get("sentiment", "Нейтральный"),
-            "writing_style": "Академический" if doc['word_count'] > 1000 else "Информационный",
-            "key_points": key_points,
-            "characters": characters if characters else [],
-            "ai_analysis": hf_result.get("ai_analysis", False),
-            "fallback": hf_result.get("fallback", True),
-            "model_used": hf_result.get("model_used", []),
-            "ai_provider": "huggingface",
-            "ai_status": "available" if hf_result.get("ai_analysis") else "fallback",
-            "created_at": datetime.now().isoformat()
+            "filename": doc["filename"],
+            "language": doc["language"],
+            
+            # Основные результаты
+            "summary": ai_analysis.get("summary") or basic_analysis.get("summary"),
+            "themes": ai_analysis.get("themes") or basic_analysis.get("themes", []),
+            "sentiment": ai_analysis.get("sentiment") or basic_analysis.get("sentiment"),
+            "writing_style": ai_analysis.get("writing_style") or "Информационный",
+            
+            # Детали анализа
+            "key_points": ai_analysis.get("key_points") or basic_analysis.get("key_points", []),
+            "entities": ai_analysis.get("entities", []),
+            "statistics": basic_analysis.get("statistics", {}),
+            "language_features": basic_analysis.get("language_features", {}),
+            
+            # Метрики
+            "ai_analysis": ai_analysis.get("ai_analysis", False),
+            "fallback": ai_analysis.get("fallback", True),
+            "models_used": ai_analysis.get("models_used", []),
+            "analysis_type": request.analysis_type,
+            
+            # Время
+            "analysis_timestamp": datetime.now().isoformat(),
+            "analysis_duration_ms": 0,  # Можно добавить реальное время
         }
+        
+        # Добавляем дополнительную информацию из документа
+        result["document_metadata"] = {
+            "word_count": doc["word_count"],
+            "chapter_count": doc["chapter_count"],
+            "reading_time": doc["reading_time_minutes"],
+            "created_at": doc["created_at"],
+        }
+        
+        # Если AI анализ не удался, добавляем информацию о fallback
+        if ai_analysis.get("fallback"):
+            result["analysis_notes"] = ["Использован базовый анализ из-за недоступности AI"]
+        
+        logger.info(f"✅ AI анализ завершен для документа {document_id}")
         
         return result
         
     except Exception as e:
-        logger.error(f"AI analysis error: {e}")
+        logger.error(f"❌ Ошибка AI анализа документа: {e}")
+        
+        # Fallback ответ
         return {
             "document_id": request.document_id,
-            "summary": f"Ошибка анализа: {str(e)[:100]}",
-            "themes": "Ошибка",
+            "summary": "Произошла ошибка при AI-анализе. Используется упрощенный анализ.",
+            "themes": ["Ошибка анализа"],
             "sentiment": "Не определена",
             "writing_style": "Не определен",
-            "key_points": ["Произошла ошибка при анализе"],
-            "characters": [],
+            "key_points": [
+                "Не удалось выполнить полный AI-анализ",
+                "Попробуйте использовать базовый анализ",
+                "Ошибка: " + str(e)[:100]
+            ],
+            "entities": [],
             "ai_analysis": False,
             "fallback": True,
-            "ai_provider": "huggingface",
-            "ai_status": "error",
-            "created_at": datetime.now().isoformat()
+            "analysis_timestamp": datetime.now().isoformat(),
+            "error": str(e)[:200],
         }
 
 # ========== БАЗОВЫЙ АНАЛИЗ ==========
@@ -776,50 +1328,57 @@ async def analyze_document(request: AnalysisRequest):
         if not content or len(content.strip()) < 10:
             raise HTTPException(status_code=400, detail="Document has no content")
         
-        word_count = len(content.split())
-        char_count = len(content)
+        logger.info(f"🔍 Базовый анализ документа {document_id}")
         
-        # Простой анализ
-        complexity = "Сложный" if word_count > 5000 else "Средний" if word_count > 2000 else "Простой"
+        # Выполняем базовый анализ
+        analysis_result = _perform_basic_analysis(content)
         
-        # Берем первые предложения как summary
-        sentences = re.split(r'(?<=[.!?])\s+', content)
-        summary_sentences = []
-        for sentence in sentences[:3]:
-            if len(sentence.strip()) > 20:
-                summary_sentences.append(sentence.strip())
-        
-        summary = " ".join(summary_sentences) if summary_sentences else f"Документ '{doc['filename']}' содержит {word_count} слов."
-        
-        return {
+        # Формируем полный ответ
+        result = {
             "document_id": document_id,
             "filename": doc["filename"],
-            "summary": summary,
             "language": doc["language"],
-            "word_count": word_count,
-            "char_count": char_count,
-            "chapter_count": doc["chapter_count"],
-            "reading_time_minutes": doc["reading_time_minutes"],
-            "complexity": complexity,
-            "themes": "Документ, Текст, Информация",
-            "sentiment": "Нейтральный",
+            
+            # Результаты анализа
+            "summary": analysis_result["summary"],
+            "themes": analysis_result["themes"],
+            "sentiment": analysis_result["sentiment"],
+            "complexity": analysis_result["complexity"],
             "writing_style": "Информационный",
-            "key_points": [
-                f"Документ на {doc['language']} языке",
-                f"Содержит {doc['chapter_count']} глав",
-                f"Время чтения: {doc['reading_time_minutes']} минут",
-                f"Слов: {word_count}, символов: {char_count}"
-            ],
+            
+            # Ключевые точки
+            "key_points": analysis_result["key_points"],
+            
+            # Статистика
+            "statistics": analysis_result["statistics"],
+            "language_features": analysis_result["language_features"],
+            
+            # Метрики документа
+            "document_statistics": {
+                "word_count": doc["word_count"],
+                "char_count": doc["char_count"],
+                "chapter_count": doc["chapter_count"],
+                "reading_time_minutes": doc["reading_time_minutes"],
+                "file_type": doc["file_type"],
+            },
+            
+            # Персонажи (пустой для базового анализа)
             "characters": [],
-            "analysis_date": datetime.now().isoformat(),
+            "entities": [],
+            
+            # Метрики анализа
             "ai_analysis": False,
             "fallback": False,
-            "ai_provider": "basic",
-            "ai_status": "not_used"
+            "analysis_type": request.analysis_type,
+            "analysis_timestamp": datetime.now().isoformat(),
         }
         
+        logger.info(f"✅ Базовый анализ завершен для документа {document_id}")
+        
+        return result
+        
     except Exception as e:
-        logger.error(f"Analysis error: {e}")
+        logger.error(f"❌ Ошибка базового анализа: {e}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 # ========== ЦИТАТЫ ИЗ ДОКУМЕНТА ==========
@@ -835,61 +1394,116 @@ async def get_document_quotes(document_id: int, limit: int = 5):
         
         if not content or len(content.strip()) < 10:
             return {
-                "quotes": ["Текст документа пустой"],
+                "document_id": document_id,
+                "quotes": ["Текст документа пустой или слишком короткий"],
                 "count": 1,
                 "ai_analysis": False,
                 "fallback": True
             }
         
         # Извлекаем предложения
-        import re
         sentences = re.split(r'(?<=[.!?])\s+', content)
         quotes = []
         
         for sentence in sentences:
             sentence = sentence.strip()
-            if 20 < len(sentence) < 150:
+            # Берем только содержательные предложения
+            if 30 < len(sentence) < 250:
                 quotes.append(sentence)
-                if len(quotes) >= limit:
+                if len(quotes) >= limit * 2:  # Берем больше для фильтрации
                     break
         
-        if not quotes:
-            quotes = [
-                "Этот документ содержит ценную информацию.",
-                "Автор раскрывает тему с разных сторон.",
-                "Текст требует внимательного прочтения.",
-                "Ключевые идеи заслуживают внимания.",
-                "Материал подходит для изучения."
+        # Фильтруем похожие цитаты
+        unique_quotes = []
+        seen_content = set()
+        
+        for quote in quotes:
+            # Нормализуем цитату (убираем лишние пробелы, приводим к нижнему регистру)
+            normalized = ' '.join(quote.lower().split())
+            
+            # Проверяем, нет ли похожей цитаты
+            is_similar = False
+            for seen in seen_content:
+                # Если цитаты похожи более чем на 70%, пропускаем
+                if self._similarity(normalized, seen) > 0.7:
+                    is_similar = True
+                    break
+            
+            if not is_similar and len(unique_quotes) < limit:
+                unique_quotes.append(quote)
+                seen_content.add(normalized)
+        
+        # Если не нашли достаточно цитат, добавляем запасные
+        if len(unique_quotes) < limit:
+            fallback_quotes = [
+                "Каждая книга открывает новые горизонты.",
+                "Чтение — это диалог с автором через время и пространство.",
+                "Слова имеют силу менять восприятие мира.",
+                "Литература хранит мудрость поколений.",
+                "Текст — это мост между мыслью и её воплощением.",
             ]
+            
+            # Добавляем недостающие цитаты
+            for i in range(limit - len(unique_quotes)):
+                if i < len(fallback_quotes):
+                    unique_quotes.append(fallback_quotes[i])
         
         return {
             "document_id": document_id,
-            "quotes": quotes[:limit],
-            "count": len(quotes),
+            "quotes": unique_quotes[:limit],
+            "count": len(unique_quotes[:limit]),
             "ai_analysis": False,
-            "fallback": False
+            "fallback": False,
+            "extracted_from": f"{len(sentences)} предложений"
         }
         
     except Exception as e:
+        logger.error(f"❌ Ошибка получения цитат: {e}")
         return {
-            "quotes": ["Цитаты временно недоступны", "Ошибка обработки"],
-            "count": 2,
+            "document_id": document_id,
+            "quotes": [
+                "Цитаты временно недоступны",
+                "Попробуйте обновить страницу",
+                "Ошибка обработки текста"
+            ],
+            "count": 3,
             "ai_analysis": False,
-            "fallback": True
+            "fallback": True,
+            "error": str(e)[:100]
         }
+
+def _similarity(self, s1: str, s2: str) -> float:
+    """Вычисление схожести строк (упрощенное)"""
+    # Используем последовательности слов для сравнения
+    words1 = set(s1.split())
+    words2 = set(s2.split())
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    intersection = words1.intersection(words2)
+    union = words1.union(words2)
+    
+    return len(intersection) / len(union)
 
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
     import uvicorn
     
-    logger.info(f"🚀 Starting Versevo Backend v5.0 on port {PORT}")
-    logger.info(f"📁 Upload folder: {os.path.abspath(UPLOAD_FOLDER)}")
-    logger.info(f"🔤 Translation: Simple Dictionary")
-    logger.info(f"🤖 Hugging Face AI Analysis: {'ENABLED' if HUGGING_FACE_ENABLED else 'DISABLED'}")
+    logger.info(f"{'='*60}")
+    logger.info(f"🚀 ЗАПУСК VERSION 5.0 НА ПОРТУ {PORT}")
+    logger.info(f"{'='*60}")
+    logger.info(f"📁 Папка загрузок: {os.path.abspath(UPLOAD_FOLDER)}")
+    logger.info(f"🔤 Перевод: Hugging Face + Fallback")
+    logger.info(f"🤖 Hugging Face перевод: {'ДОСТУПЕН' if hf_translator.is_available('en', 'ru') else 'НЕ ДОСТУПЕН'}")
+    logger.info(f"📊 Hugging Face анализ: {'ДОСТУПЕН' if HUGGING_FACE_ENABLED else 'НЕ ДОСТУПЕН'}")
+    logger.info(f"📈 NLTK анализ: {'ДОСТУПЕН' if NLTK_AVAILABLE else 'НЕ ДОСТУПЕН'}")
+    logger.info(f"{'='*60}")
     
     uvicorn.run(
         app, 
         host="0.0.0.0", 
         port=PORT,
-        log_level="info"
+        log_level="info",
+        access_log=True
     )
