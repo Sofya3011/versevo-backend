@@ -1,4 +1,4 @@
-# main.py - Бэкенд Versevo с локальным переводчиком
+# main.py - Бэкенд Versevo с локальным переводчиком и OpenAI анализом
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -11,10 +11,14 @@ import sys
 import base64
 import uuid
 import re
+import json
 from datetime import datetime
 import requests
 from collections import Counter
 import torch
+
+# OpenAI импорт
+from openai import OpenAI
 
 # Настройка логирования
 logging.basicConfig(
@@ -28,7 +32,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Versevo Backend API",
     description="Modern document reader with translation and AI features",
-    version="3.0.0"
+    version="4.0.0"
 )
 
 # CORS
@@ -54,6 +58,22 @@ try:
 except Exception as e:
     logger.error(f"❌ Error mounting static files: {e}")
 
+# ========== ИНИЦИАЛИЗАЦИЯ OPENAI ==========
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if openai_api_key:
+    try:
+        openai_client = OpenAI(api_key=openai_api_key)
+        OPENAI_ENABLED = True
+        logger.info(f"✅ OpenAI инициализирован. Модель: gpt-3.5-turbo")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации OpenAI: {e}")
+        openai_client = None
+        OPENAI_ENABLED = False
+else:
+    openai_client = None
+    OPENAI_ENABLED = False
+    logger.warning(f"⚠️ OpenAI не настроен. Добавь OPENAI_API_KEY в переменные окружения")
+
 # ========== МОДЕЛИ ==========
 class TranslateRequest(BaseModel):
     text: str
@@ -64,6 +84,12 @@ class TranslateRequest(BaseModel):
 class AnalysisRequest(BaseModel):
     document_id: int
     analysis_type: str = "general"
+
+# Модель для OpenAI анализа
+class OpenAIAnalysisRequest(BaseModel):
+    document_id: int
+    analysis_type: str = "full"
+    language: str = "ru"
 
 # ========== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ==========
 PORT = int(os.getenv("PORT", 8080))
@@ -194,6 +220,7 @@ class LocalTranslator:
             
             return " ".join(translated)
         return text
+    
     def _split_text(self, text: str, max_length: int = 1000) -> List[str]:
         """Разбить текст на части для перевода"""
         sentences = text.split('. ')
@@ -420,22 +447,50 @@ def translate_with_fallback(text: str, source_lang: str, target_lang: str) -> st
         logger.error(f"Fallback translation error: {e}")
         return f"[TRANSLATION ERROR] {text[:200]}..."
 
+# ========== OPENAI УТИЛИТЫ ==========
+def _get_openai_fallback_response(document_id: int, content: str = ""):
+    """Fallback ответ если OpenAI не работает"""
+    return {
+        "document_id": document_id,
+        "summary": "AI-анализ временно недоступен. Используется локальная обработка.",
+        "themes": "Тематика не определена (OpenAI недоступен)",
+        "sentiment": "Нейтральная",
+        "writing_style": "Не определен",
+        "key_points": ["AI-анализ в процессе разработки", "Попробуйте позже"],
+        "characters": [],
+        "model_used": "fallback",
+        "ai_analysis": False,
+        "fallback": True,
+        "created_at": datetime.now().isoformat()
+    }
+
 # ========== HEALTH CHECK ENDPOINTS ==========
 @app.get("/")
 async def root():
     """Корневой эндпоинт"""
+    endpoints = {
+        "health": "/api/health",
+        "upload": "/api/documents/upload-base64",
+        "documents": "/api/documents",
+        "translate": "/api/translate/text",
+        "analyze": "/api/analyze",
+    }
+    
+    if OPENAI_ENABLED:
+        endpoints.update({
+            "openai_health": "/api/analyze/openai/health",
+            "openai_analyze": "/api/analyze/openai/document",
+            "openai_quotes": "/api/analyze/openai/quotes"
+        })
+    
     return {
-        "message": "Versevo Backend API v3.0",
-        "version": "3.0.0",
+        "message": "Versevo Backend API v4.0",
+        "version": "4.0.0",
         "status": "running",
         "translation": "local_models",
+        "openai_available": OPENAI_ENABLED,
         "timestamp": datetime.now().isoformat(),
-        "endpoints": {
-            "health": "/api/health",
-            "upload": "/api/documents/upload-base64",
-            "documents": "/api/documents",
-            "translate": "/api/translate/text"
-        }
+        "endpoints": endpoints
     }
 
 @app.get("/api/health")
@@ -445,8 +500,9 @@ async def health_check():
         "status": "healthy", 
         "service": "versevo-backend", 
         "translation": "local_models",
+        "openai_available": OPENAI_ENABLED,
         "timestamp": datetime.now().isoformat(),
-        "version": "3.0.0"
+        "version": "4.0.0"
     }
 
 @app.get("/api/flutter/health")
@@ -457,13 +513,14 @@ async def health_check_flutter():
         "service": "versevo-backend", 
         "timestamp": datetime.now().isoformat(),
         "translation": "local_transformers",
-        "version": "3.0.0"
+        "openai_available": OPENAI_ENABLED,
+        "version": "4.0.0"
     }
 
 @app.get("/health")
 async def health_check_simple():
     """Простой health check"""
-    return {"status": "ok", "translation": "local"}
+    return {"status": "ok", "translation": "local", "openai": OPENAI_ENABLED}
 
 # ========== ДОКУМЕНТЫ ==========
 @app.post("/api/documents/upload-base64")
@@ -751,10 +808,240 @@ async def translation_status():
         "timestamp": datetime.now().isoformat()
     }
 
-# ========== АНАЛИЗ ==========
+# ========== OPENAI АНАЛИЗ ==========
+@app.get("/api/analyze/openai/health")
+async def openai_health_check():
+    """Проверка доступности OpenAI"""
+    if not OPENAI_ENABLED:
+        return {
+            "status": "unavailable",
+            "reason": "OPENAI_API_KEY not set in environment",
+            "available": False,
+            "openai_available": False,
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    try:
+        # Тестовый запрос к OpenAI
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=5
+        )
+        
+        return {
+            "status": "healthy",
+            "service": "openai",
+            "model": "gpt-3.5-turbo",
+            "available": True,
+            "openai_available": True,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "status": "unavailable",
+            "service": "openai",
+            "error": str(e),
+            "available": False,
+            "openai_available": False,
+            "timestamp": datetime.now().isoformat()
+        }
+
+@app.post("/api/analyze/openai/document")
+async def analyze_with_openai(request: OpenAIAnalysisRequest):
+    """AI-анализ документа через OpenAI"""
+    
+    if not OPENAI_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenAI service is not configured. Please set OPENAI_API_KEY environment variable."
+        )
+    
+    try:
+        document_id = request.document_id
+        
+        # Получаем документ из хранилища
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        doc = documents_store[document_id]
+        content = doc["content"]
+        
+        if not content or len(content.strip()) < 10:
+            raise HTTPException(status_code=400, detail="Document has no content")
+        
+        # Ограничиваем размер текста для экономии токенов
+        MAX_CONTENT_LENGTH = 4000
+        if len(content) > MAX_CONTENT_LENGTH:
+            logger.info(f"📝 Ограничиваем текст для анализа: {len(content)} -> {MAX_CONTENT_LENGTH} символов")
+            content = content[:2000] + "\n...\n" + content[-2000:]
+        
+        # Создаем промпт для анализа
+        prompt = f"""
+ПРОАНАЛИЗИРУЙ ЭТОТ ТЕКСТ И ВЕРНИ ОТВЕТ ТОЛЬКО В ФОРМАТЕ JSON:
+
+ТЕКСТ ДЛЯ АНАЛИЗА:
+{content}
+
+ТРЕБУЕМЫЙ ФОРМАТ JSON:
+{{
+  "summary": "Краткое содержание текста (3-4 предложения)",
+  "themes": "Основные темы текста через запятую",
+  "sentiment": "Общая тональность текста (позитивная, негативная, нейтральная, смешанная)",
+  "writing_style": "Стиль письма (формальный, разговорный, академический, художественный и т.д.)",
+  "key_points": ["Ключевой момент 1", "Ключевой момент 2", "Ключевой момент 3"],
+  "characters": [
+    {{"name": "Имя персонажа 1", "role": "Роль в тексте", "importance": "высокая/средняя/низкая"}},
+    {{"name": "Имя персонажа 2", "role": "Роль в тексте", "importance": "высокая/средняя/низкая"}}
+  ]
+}}
+
+ПРАВИЛА:
+1. ВСЕ ответы должны быть НА РУССКОМ языке
+2. Если персонажей нет - верни пустой массив
+3. Будь точным и объективным
+4. Не добавляй никакого текста кроме JSON
+"""
+        
+        logger.info(f"🤖 Отправляем запрос к OpenAI для документа {document_id}")
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo-1106",
+            messages=[
+                {"role": "system", "content": "Ты эксперт по анализу текстов. Ты говоришь на русском языке."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+            max_tokens=1500
+        )
+        
+        result_text = response.choices[0].message.content
+        
+        # Парсим JSON результат
+        analysis_result = json.loads(result_text)
+        
+        # Добавляем метаданные
+        analysis_result.update({
+            "document_id": document_id,
+            "analysis_type": request.analysis_type,
+            "model_used": response.model,
+            "processing_time": "openai_gpt3.5",
+            "ai_analysis": True,
+            "created_at": datetime.now().isoformat()
+        })
+        
+        logger.info(f"✅ AI-анализ завершен для документа {document_id}")
+        
+        return analysis_result
+        
+    except HTTPException:
+        raise
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Ошибка парсинга JSON от OpenAI: {e}")
+        logger.error(f"Полученный текст: {result_text[:500]}...")
+        # Возвращаем fallback ответ
+        return _get_openai_fallback_response(document_id, content)
+    except Exception as e:
+        logger.error(f"❌ Ошибка OpenAI анализа: {e}")
+        raise HTTPException(status_code=500, detail=f"OpenAI analysis failed: {str(e)}")
+
+@app.post("/api/analyze/openai/quotes")
+async def extract_quotes_with_openai(request: dict):
+    """Извлечение цитат через OpenAI"""
+    
+    if not OPENAI_ENABLED:
+        return {
+            "quotes": [
+                "Цитаты временно недоступны",
+                "AI-сервис настройте позже"
+            ],
+            "count": 2,
+            "ai_analysis": False,
+            "fallback": True
+        }
+    
+    try:
+        document_id = request.get("document_id")
+        limit = request.get("limit", 5)
+        
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        doc = documents_store[document_id]
+        content = doc["content"]
+        
+        if not content or len(content.strip()) < 10:
+            return {
+                "quotes": ["Текст документа пустой"],
+                "count": 1,
+                "ai_analysis": False,
+                "fallback": True
+            }
+        
+        # Ограничиваем размер текста
+        MAX_CONTENT_LENGTH = 3000
+        if len(content) > MAX_CONTENT_LENGTH:
+            content = content[:MAX_CONTENT_LENGTH]
+        
+        prompt = f"""
+ИЗВЛЕКИ {limit} САМЫХ ЗНАЧИМЫХ ЦИТАТ ИЗ ТЕКСТА:
+
+ТЕКСТ:
+{content}
+
+ВЕРНИ ТОЛЬКО JSON В ФОРМАТЕ:
+{{
+  "quotes": ["Цитата 1", "Цитата 2", "Цитата 3"]
+}}
+
+ПРАВИЛА:
+1. Цитаты должны быть точными фразами из текста
+2. Не изменяй оригинальный текст
+3. Выбирай цитаты, которые лучше всего отражают суть
+4. Максимум {limit} цитат
+5. Все на русском языке
+"""
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            max_tokens=800
+        )
+        
+        result_text = response.choices[0].message.content
+        result = json.loads(result_text)
+        
+        quotes = result.get("quotes", [])
+        
+        return {
+            "document_id": document_id,
+            "quotes": quotes,
+            "count": len(quotes),
+            "ai_analysis": True,
+            "model_used": response.model,
+            "fallback": False
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка извлечения цитат: {e}")
+        return {
+            "quotes": [
+                "Цитаты временно недоступны",
+                "Произошла ошибка при обработке"
+            ],
+            "count": 2,
+            "ai_analysis": False,
+            "error": str(e),
+            "fallback": True
+        }
+
+# ========== БАЗОВЫЙ АНАЛИЗ ==========
 @app.post("/api/analyze")
 async def analyze_document(request: AnalysisRequest):
-    """Анализ документа"""
+    """Базовый анализ документа"""
     try:
         document_id = request.document_id
         if document_id not in documents_store:
@@ -796,8 +1083,7 @@ async def analyze_document(request: AnalysisRequest):
             "chapter_count": doc["chapter_count"],
             "reading_time_minutes": doc["reading_time_minutes"],
             "complexity": complexity,
-            "key_themes": [word for word, _ in top_keywords],
-            "estimated_topics": ["Литература", "Образование", "Технологии"],
+            "themes": ", ".join([word for word, _ in top_keywords]),
             "sentiment": "Нейтральный",
             "writing_style": "Информационный",
             "key_points": [
@@ -805,7 +1091,10 @@ async def analyze_document(request: AnalysisRequest):
                 f"Содержит {doc['chapter_count']} глав",
                 f"Время чтения: {doc['reading_time_minutes']} минут"
             ],
-            "analysis_date": datetime.now().isoformat()
+            "characters": [],
+            "analysis_date": datetime.now().isoformat(),
+            "ai_analysis": False,
+            "fallback": False
         }
         
     except HTTPException:
@@ -834,9 +1123,10 @@ async def get_document_chapters(document_id: int):
 if __name__ == "__main__":
     import uvicorn
     
-    logger.info(f"🚀 Starting Versevo Backend v3.0 on port {PORT}")
+    logger.info(f"🚀 Starting Versevo Backend v4.0 on port {PORT}")
     logger.info(f"📁 Upload folder: {os.path.abspath(UPLOAD_FOLDER)}")
     logger.info(f"🔤 Translation: Local Transformers Models")
+    logger.info(f"🤖 OpenAI Analysis: {'ENABLED' if OPENAI_ENABLED else 'DISABLED'}")
     
     uvicorn.run(
         app, 
