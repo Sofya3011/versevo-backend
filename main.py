@@ -59,27 +59,16 @@ except Exception as e:
     logger.error(f"❌ Error mounting static files: {e}")
 
 # ========== ИНИЦИАЛИЗАЦИЯ GEMINI ==========
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-
-if gemini_api_key:
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+if GEMINI_API_KEY:
     try:
-        genai.configure(api_key=gemini_api_key)
-        
-        # Выбираем модель
-        GEMINI_MODEL = "gemini-pro"  # или "gemini-1.5-pro" для больших контекстов
-        GEMINI_ENABLED = True
-        
-        # Инициализируем модель
-        gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-        
-        # Тестовый запрос для проверки
-        try:
-            response = gemini_model.generate_content("Привет")
-            logger.info(f"✅ Gemini инициализирован. Модель: {GEMINI_MODEL}")
-            logger.info(f"📊 Gemini статус: Работает (бесплатный тариф)")
-        except Exception as e:
-            logger.error(f"❌ Ошибка тестирования Gemini: {e}")
-            GEMINI_ENABLED = False
+        genai.configure(api_key=GEMINI_API_KEY)
+        # Используйте актуальную версию API и модель
+        model = genai.GenerativeModel('gemini-1.5-pro-latest')
+        # Или 'gemini-1.5-flash-latest' для более быстрого ответа
+    except Exception as e:
+        print(f"❌ Ошибка настройки Gemini: {e}")
+        GEMINI_API_KEY = None
             
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации Gemini: {e}")
