@@ -382,7 +382,24 @@ async def upload_document(
     except Exception as e:
         logger.error(f"Upload error: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-
+@app.get("/api/debug/info")
+async def debug_info():
+    """Информация для диагностики"""
+    import sys
+    import pkg_resources
+    
+    installed_packages = {}
+    for pkg in pkg_resources.working_set:
+        installed_packages[pkg.key] = pkg.version
+    
+    return {
+        "python_version": sys.version,
+        "installed_packages": installed_packages,
+        "upload_folder_exists": os.path.exists(UPLOAD_FOLDER),
+        "documents_count": len(documents_store),
+        "current_doc_id": current_doc_id,
+        "extraction_test": "Please use /api/debug/file-extraction"
+    }
 @app.post("/api/documents/upload-base64")
 async def upload_document_base64(request: dict):
     """Загрузка документа в формате base64"""
