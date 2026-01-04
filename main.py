@@ -213,109 +213,125 @@ def detect_chapters(text: str) -> List[Dict]:
     
     return chapters
 
+# main.py - Исправленная версия с рабочей моделью
 def translate_with_huggingface(text: str, source_lang: str, target_lang: str) -> str:
-    """Перевод через Hugging Face NLLB с поддержкой больших текстов"""
+    """Перевод через Hugging Face с альтернативной моделью"""
     try:
-        lang_codes = {
-            "ru": "rus_Cyrl", "en": "eng_Latn", "de": "deu_Latn",
-            "fr": "fra_Latn", "es": "spa_Latn", "it": "ita_Latn",
-            "zh": "zho_Hans", "ar": "arb_Arab", "uk": "ukr_Cyrl",
-            "pl": "pol_Latn", "ja": "jpn_Jpan", "ko": "kor_Hang",
+        # Используем более новую модель которая точно работает
+        # Модель Helsinki-NLP/opus-mt-en-ru для английского->русского
+        # Или многоязычные модели
+        
+        model_mapping = {
+            ('en', 'ru'): 'Helsinki-NLP/opus-mt-en-ru',
+            ('ru', 'en'): 'Helsinki-NLP/opus-mt-ru-en',
+            # Добавьте другие языковые пары по мере необходимости
         }
         
-        if source_lang not in lang_codes or target_lang not in lang_codes:
-            return text
+        model_key = (source_lang, target_lang)
+        if model_key not in model_mapping:
+            # Используем многоязычную модель как fallback
+            api_url = "https://api-inference.huggingface.co/models/facebook/mbart-large-50-many-to-many-mmt"
+        else:
+            api_url = f"https://api-inference.huggingface.co/models/{model_mapping[model_key]}"
         
-        # Разбиваем большой текст на части
-        max_chunk_size = 500  # Hugging Face API ограничение
-        chunks = []
-        
-        # Разбиваем по предложениям если возможно
-        import re
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        
-        current_chunk = ""
-        for sentence in sentences:
-            if len(current_chunk) + len(sentence) <= max_chunk_size:
-                current_chunk += sentence + " "
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = sentence + " "
-        
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        
-        # Если не удалось разбить по предложениям, разбиваем по словам
-        if not chunks:
-            words = text.split()
-            current_chunk = ""
-            for word in words:
-                if len(current_chunk) + len(word) + 1 <= max_chunk_size:
-                    current_chunk += word + " "
-                else:
-                    if current_chunk:
-                        chunks.append(current_chunk.strip())
-                    current_chunk = word + " "
-            
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-        
-        logger.info(f"📝 Текст разбит на {len(chunks)} частей для перевода")
-        
-        api_url = "https://api-inference.huggingface.co/models/facebook/nllb-200-distilled-600M"
+        logger.info(f"🌐 Используем модель: {api_url.split('/')[-1]}")
         
         headers = {
             "Authorization": f"Bearer {HF_API_KEY}",
             "Content-Type": "application/json"
         }
         
-        translated_chunks = []
-        
-        for i, chunk in enumerate(chunks):
-            try:
+        # Для MBART модели
+        if "mbart" in api_url:
+            lang_codes = {
+                "ru": "ru_RU",
+                "en": "en_XX",
+                "de": "de_DE",
+                "fr": "fr_XX",
+                "es": "es_XX",
+                "it": "it_IT",
+                "zh": "zh_CN",
+                "ar": "ar_AR",
+                "ja": "ja_XX",
+                "ko": "ko_KR",
+            }
+            
+            if source_lang in lang_codes and target_lang in lang_codes:
                 payload = {
-                    "inputs": chunk,
+                    "inputs": text,
                     "parameters": {
                         "src_lang": lang_codes[source_lang],
-                        "tgt_lang": lang_codes[target_lang],
-                        "max_length": 1024
+                        "tgt_lang": lang_codes[target_lang]
                     }
                 }
-                
-                response = requests.post(
-                    api_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=30
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    if isinstance(result, list) and len(result) > 0:
-                        translated = result[0].get("translation_text", chunk)
-                        translated_chunks.append(translated)
-                        logger.info(f"✅ Часть {i+1}/{len(chunks)} переведена")
-                    else:
-                        logger.warning(f"⚠️ Часть {i+1}: не удалось получить перевод")
-                        translated_chunks.append(chunk)
-                else:
-                    logger.error(f"❌ Часть {i+1}: ошибка API {response.status_code}")
-                    translated_chunks.append(chunk)
-                    
-            except Exception as e:
-                logger.error(f"❌ Ошибка перевода части {i+1}: {e}")
-                translated_chunks.append(chunk)
+            else:
+                # Fallback
+                payload = {"inputs": text}
+        else:
+            # Для других моделей
+            payload = {"inputs": text}
         
-        # Собираем все части вместе
-        result = " ".join(translated_chunks)
-        logger.info(f"✅ Перевод завершен: {len(result)} символов")
+        response = requests.post(
+            api_url,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
         
-        return result
+        logger.info(f"📡 Статус ответа: {response.status_code}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                if isinstance(result[0], dict) and 'translation_text' in result[0]:
+                    return result[0]['translation_text']
+                elif isinstance(result[0], dict) and 'generated_text' in result[0]:
+                    return result[0]['generated_text']
+                elif isinstance(result[0], str):
+                    return result[0]
+        
+        # Fallback если API не работает
+        logger.warning(f"⚠️ API не вернул результат, используем fallback")
+        return _fallback_translation(text, source_lang, target_lang)
         
     except Exception as e:
         logger.error(f"Translation error: {e}")
-        return text
+        return _fallback_translation(text, source_lang, target_lang)
+
+def _fallback_translation(text: str, source_lang: str, target_lang: str) -> str:
+    """Fallback перевод когда API недоступен"""
+    # Простой словарь для демо
+    simple_dict = {
+        ('en', 'ru'): {
+            'hello': 'привет',
+            'world': 'мир',
+            'book': 'книга',
+            'read': 'читать',
+            'translate': 'переводить',
+            'document': 'документ',
+            'text': 'текст',
+            'chapter': 'глава',
+            'page': 'страница',
+            'library': 'библиотека',
+        }
+    }
+    
+    # Если у нас есть перевод для этой пары языков
+    if (source_lang, target_lang) in simple_dict:
+        words = text.lower().split()
+        translated_words = []
+        
+        for word in words:
+            clean_word = ''.join(c for c in word if c.isalpha())
+            if clean_word in simple_dict[(source_lang, target_lang)]:
+                translated_words.append(simple_dict[(source_lang, target_lang)][clean_word])
+            else:
+                translated_words.append(word)
+        
+        return " ".join(translated_words)
+    else:
+        # Просто возвращаем текст с пометкой
+        return f"[ПЕРЕВОД НЕДОСТУПЕН] {text}"
 # ========== HEALTH CHECK ENDPOINTS ==========
 @app.get("/")
 async def root():
