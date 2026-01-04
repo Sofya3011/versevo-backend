@@ -88,20 +88,41 @@ def extract_text_from_file(file_path: str, file_type: str) -> str:
                 for page in doc:
                     text.append(page.get_text())
                 doc.close()
-                return "\n\n".join(text)
+                extracted_text = "\n\n".join(text)
+                
+                # Проверяем, что текст действительно извлечен
+                if extracted_text and len(extracted_text.strip()) > 10:
+                    return extracted_text
+                else:
+                    logger.warning(f"PDF extraction returned empty or too short text")
+                    return ""
+                    
+            except ImportError:
+                logger.error("PyMuPDF not installed. Please install: pip install PyMuPDF")
+                return ""
             except Exception as e:
                 logger.error(f"PDF extraction error: {e}")
-                return f"PDF текст не извлечен: {str(e)}"
+                return ""
                 
         elif file_type in ['docx', 'doc']:
             try:
                 import docx
                 doc = docx.Document(file_path)
                 paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-                return "\n\n".join(paragraphs)
+                extracted_text = "\n\n".join(paragraphs)
+                
+                if extracted_text and len(extracted_text.strip()) > 10:
+                    return extracted_text
+                else:
+                    logger.warning(f"DOCX extraction returned empty text")
+                    return ""
+                    
+            except ImportError:
+                logger.error("python-docx not installed. Please install: pip install python-docx")
+                return ""
             except Exception as e:
                 logger.error(f"DOCX extraction error: {e}")
-                return f"DOCX текст не извлечен: {str(e)}"
+                return ""
                 
         elif file_type == 'txt':
             try:
@@ -110,22 +131,29 @@ def extract_text_from_file(file_path: str, file_type: str) -> str:
                 for encoding in encodings:
                     try:
                         with open(file_path, "r", encoding=encoding) as f:
-                            return f.read()
+                            text = f.read()
+                            if text and len(text.strip()) > 10:
+                                return text
                     except UnicodeDecodeError:
                         continue
-                # Если все кодировки не подошли
+                
+                # Последняя попытка с игнорированием ошибок
                 with open(file_path, "r", encoding='utf-8', errors='ignore') as f:
-                    return f.read()
+                    text = f.read()
+                    return text if text else ""
+                    
             except Exception as e:
-                logger.error(f"TXT extraction error: {e}")
-                return f"Текст не прочитан: {str(e)}"
+                logger.error(f"TXT reading error: {e}")
+                return ""
                 
         else:
-            return f"Неподдерживаемый формат файла: {file_type}"
+            logger.error(f"Unsupported file type: {file_type}")
+            return ""
             
     except Exception as e:
         logger.error(f"General extraction error: {e}")
-        return f"Ошибка извлечения текста: {str(e)}"
+        return ""
+        
 def detect_language_safe(text: str) -> str:
     """Определение языка"""
     if not text or len(text.strip()) < 10:
