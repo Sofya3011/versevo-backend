@@ -1051,7 +1051,36 @@ def _perform_basic_analysis(text: str) -> Dict[str, Any]:
         result["key_points"] = ["Не удалось выполнить анализ"]
     
     return result
-
+# В main.py добавь:
+@app.delete("/api/documents/{document_id}")
+async def delete_document(document_id: int):
+    """Удаление документа"""
+    try:
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        # Удаляем файл с диска
+        doc = documents_store[document_id]
+        if os.path.exists(doc["file_path"]):
+            try:
+                os.remove(doc["file_path"])
+            except:
+                pass
+        
+        # Удаляем из хранилища
+        del documents_store[document_id]
+        
+        logger.info(f"🗑️ Документ удален: ID {document_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Document {document_id} deleted",
+            "deleted_id": document_id
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка удаления документа: {e}")
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
 # ========== УЛУЧШЕННЫЙ AI АНАЛИЗ ==========
 def _perform_ai_analysis(text: str) -> Dict[str, Any]:
     """Улучшенный AI анализ текста через Hugging Face"""
