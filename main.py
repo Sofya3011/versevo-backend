@@ -12,6 +12,7 @@ import uuid
 import re
 from datetime import datetime
 import requests
+from collections import Counter
 
 # Настройка логирования
 logging.basicConfig(
@@ -463,7 +464,7 @@ async def get_documents(user_id: Optional[int] = None):
     if user_id:
         docs = [d for d in docs if d.get("user_id") == user_id]
     
-     return [
+    return [
         {
             "id": d["id"],
             "filename": d["filename"],
@@ -643,7 +644,6 @@ async def analyze_document(request: AnalysisRequest):
             complexity = "Простой"
         
         common_words = content.lower().split()
-        from collections import Counter
         word_freq = Counter(common_words)
         
         stop_words = {"и", "в", "на", "с", "по", "для", "не", "что", "это", "как", "так", "а", "но", "или"}
