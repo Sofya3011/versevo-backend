@@ -78,28 +78,11 @@ class LocalTranslator:
     
     def __init__(self):
         self.translators = {}
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cpu")  # Всегда используем CPU на Railway
         logger.info(f"🚀 Используем устройство: {self.device}")
         
-        # Предзагружаем основные модели
-        self._preload_models()
-    
-    def _preload_models(self):
-        """Предварительная загрузка моделей в фоновом режиме"""
-        import threading
-        
-        def load_model():
-            try:
-                logger.info("🔄 Фоновая загрузка моделей переводчика...")
-                # Предзагружаем самую частую модель
-                self.get_translator("en", "ru")
-                logger.info("✅ Модели предзагружены")
-            except Exception as e:
-                logger.error(f"❌ Ошибка предзагрузки моделей: {e}")
-        
-        # Запускаем в отдельном потоке чтобы не блокировать старт приложения
-        thread = threading.Thread(target=load_model, daemon=True)
-        thread.start()
+        # НЕ предзагружаем модели - загружаем по требованию
+        logger.info("⚡ Модели будут загружаться по требованию (lazy loading)")
     
     def get_translator(self, source_lang: str, target_lang: str):
         """Получить или создать переводчик для языковой пары"""
@@ -107,40 +90,32 @@ class LocalTranslator:
         
         if key not in self.translators:
             try:
-                if source_lang == "en" and target_lang == "ru":
-                    logger.info(f"📥 Загружаем модель Helsinki-NLP/opus-mt-en-ru...")
-                    
-                    # Импортируем здесь чтобы не грузить если не используется
-                    from transformers import pipeline
-                    
-                    translator = pipeline(
-                        "translation",
-                        model="Helsinki-NLP/opus-mt-en-ru",
-                        device=0 if torch.cuda.is_available() else -1,
-                        max_length=512
-                    )
-                    
-                    self.translators[key] = translator
-                    logger.info(f"✅ Модель загружена: {key}")
-                    
-                elif source_lang == "ru" and target_lang == "en":
-                    logger.info(f"📥 Загружаем модель Helsinki-NLP/opus-mt-ru-en...")
-                    
-                    from transformers import pipeline
-                    
-                    translator = pipeline(
-                        "translation",
-                        model="Helsinki-NLP/opus-mt-ru-en",
-                        device=0 if torch.cuda.is_available() else -1,
-                        max_length=512
-                    )
-                    
-                    self.translators[key] = translator
-                    logger.info(f"✅ Модель загружена: {key}")
-                    
-                else:
-                    logger.warning(f"⚠️ Нет локальной модели для {key}, используем fallback")
+                logger.info(f"📥 Загружаем модель для {key}...")
+                
+                # Используем более легкие модели
+                model_mapping = {
+                    "en-ru": "Helsinki-NLP/opus-mt-en-ru",
+                    "ru-en": "Helsinki-NLP/opus-mt-ru-en",
+                }
+                
+                model_name = model_mapping.get(key)
+                if not model_name:
+                    logger.warning(f"⚠️ Нет локальной модели для {key}")
                     return None
+                
+                from transformers import pipeline
+                
+                translator = pipeline(
+                    "translation",
+                    model=model_name,
+                    device=-1,  # Всегда CPU
+                    max_length=256,  # Уменьшим максимальную длину
+                )
+                
+                self.translators[key] = translator
+                logger.info(f"✅ Модель загружена: {key}")
+                
+                return translator
                     
             except Exception as e:
                 logger.error(f"❌ Ошибка загрузки модели {key}: {e}")
@@ -151,41 +126,74 @@ class LocalTranslator:
     def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         """Перевод текста с использованием локальной модели"""
         try:
+            # Сначала пробуем быстрый fallback для коротких текстов
+            if len(text) < 100:
+                return self._quick_translation(text, source_lang, target_lang)
+            
             translator = self.get_translator(source_lang, target_lang)
             
             if translator is None:
                 logger.warning(f"⚠️ Локальный переводчик недоступен для {source_lang}->{target_lang}")
                 return self._fallback_translation(text, source_lang, target_lang)
             
-            # Разбиваем длинный текст на части
-            if len(text) > 1000:
-                chunks = self._split_text(text, max_length=1000)
-                translated_chunks = []
-                
-                for chunk in chunks:
-                    try:
-                        result = translator(chunk, max_length=512)
-                        if isinstance(result, list) and len(result) > 0:
-                            translated_chunks.append(result[0]['translation_text'])
-                        else:
-                            translated_chunks.append(chunk)
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка перевода части: {e}")
-                        translated_chunks.append(chunk)
-                
-                return " ".join(translated_chunks)
+            # Ограничиваем размер текста для перевода
+            MAX_TEXT_LENGTH = 500
+            if len(text) > MAX_TEXT_LENGTH:
+                logger.info(f"📝 Текст слишком длинный ({len(text)} символов), обрезаем до {MAX_TEXT_LENGTH}")
+                text = text[:MAX_TEXT_LENGTH] + "..."
+            
+            # Переводим одной частью
+            result = translator(text, max_length=256)
+            if isinstance(result, list) and len(result) > 0:
+                return result[0]['translation_text']
             else:
-                # Короткий текст переводим целиком
-                result = translator(text, max_length=512)
-                if isinstance(result, list) and len(result) > 0:
-                    return result[0]['translation_text']
-                else:
-                    return text
-                    
+                return text
+                
         except Exception as e:
             logger.error(f"❌ Ошибка перевода: {e}")
             return self._fallback_translation(text, source_lang, target_lang)
     
+    def _quick_translation(self, text: str, source_lang: str, target_lang: str) -> str:
+        """Быстрый перевод для коротких текстов"""
+        if source_lang == 'en' and target_lang == 'ru':
+            # Простой словарь для быстрого перевода
+            common_translations = {
+                'hello': 'привет',
+                'world': 'мир',
+                'book': 'книга',
+                'read': 'читать',
+                'page': 'страница',
+                'chapter': 'глава',
+                'text': 'текст',
+                'document': 'документ',
+                'translate': 'переводить',
+                'library': 'библиотека',
+                'the': '',
+                'a': '',
+                'an': '',
+                'and': 'и',
+                'or': 'или',
+                'but': 'но',
+                'is': 'является',
+                'are': 'являются',
+                'was': 'был',
+                'were': 'были',
+            }
+            
+            words = text.split()
+            translated = []
+            
+            for word in words:
+                lower_word = word.lower()
+                if lower_word in common_translations:
+                    translation = common_translations[lower_word]
+                    if translation:  # Не добавляем пустые слова (артикли)
+                        translated.append(translation)
+                else:
+                    translated.append(word)
+            
+            return " ".join(translated)
+        return text
     def _split_text(self, text: str, max_length: int = 1000) -> List[str]:
         """Разбить текст на части для перевода"""
         sentences = text.split('. ')
