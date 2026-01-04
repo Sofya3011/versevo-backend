@@ -1,4 +1,4 @@
-# main.py - Versevo Backend API (исправленный)
+# main.py — Versevo Backend API
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -225,7 +225,7 @@ async def upload_document_base64(request: dict):
         lang = detect_language_safe(text)
         chapters = detect_chapters(text)
 
-        document = {
+               document = {
             "id": current_doc_id,
             "filename": filename,
             "content": text,
@@ -241,4 +241,13 @@ async def upload_document_base64(request: dict):
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
             "chapters": chapters,
-            "content_preview": text[:200]
+            "content_preview": text[:200] + "..." if len(text) > 200 else text
+        }
+
+        documents_store[current_doc_id] = document
+        current_doc_id += 1
+
+        return document
+    except Exception as e:
+        logger.error(f"Base64 upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
