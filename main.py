@@ -2,6 +2,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import logging
@@ -99,6 +100,7 @@ class LocalTranslator:
         # Запускаем в отдельном потоке чтобы не блокировать старт приложения
         thread = threading.Thread(target=load_model, daemon=True)
         thread.start()
+    
     def get_translator(self, source_lang: str, target_lang: str):
         """Получить или создать переводчик для языковой пары"""
         key = f"{source_lang}-{target_lang}"
@@ -402,6 +404,14 @@ def detect_chapters(text: str) -> List[Dict]:
     
     return chapters
 
+def translate_with_fallback(text: str, source_lang: str, target_lang: str) -> str:
+    """Перевод с fallback на базовый вариант"""
+    try:
+        return translator.translate(text, source_lang, target_lang)
+    except Exception as e:
+        logger.error(f"Fallback translation error: {e}")
+        return f"[TRANSLATION ERROR] {text[:200]}..."
+
 # ========== HEALTH CHECK ENDPOINTS ==========
 @app.get("/")
 async def root():
@@ -430,6 +440,7 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "version": "3.0.0"
     }
+
 @app.get("/api/flutter/health")
 async def health_check_flutter():
     """Health check для Flutter/Railway"""
@@ -440,6 +451,7 @@ async def health_check_flutter():
         "translation": "local_transformers",
         "version": "3.0.0"
     }
+
 @app.get("/health")
 async def health_check_simple():
     """Простой health check"""
@@ -631,7 +643,7 @@ async def translate_text(request: TranslateRequest):
 
 @app.post("/api/translate/document/{document_id}")
 async def translate_document(document_id: int, target_language: str = "ru"):
-    """Перевод всего документа"""
+    """Перевод всего документа С ОГРАНИЧЕНИЯМИ"""
     try:
         if document_id not in documents_store:
             raise HTTPException(status_code=404, detail="Document not found")
@@ -641,6 +653,19 @@ async def translate_document(document_id: int, target_language: str = "ru"):
         
         if not content or len(content.strip()) < 10:
             raise HTTPException(status_code=400, detail="Document has no content")
+        
+        # ОГРАНИЧЕНИЕ: Максимум 10,000 символов для перевода
+        MAX_TRANSLATION_LENGTH = 10000
+        
+        if len(content) > MAX_TRANSLATION_LENGTH:
+            return {
+                "success": False,
+                "document_id": document_id,
+                "error": f"Документ слишком большой для перевода ({len(content)} символов). Максимум: {MAX_TRANSLATION_LENGTH} символов.",
+                "suggestion": "Попробуйте переводить по одной главе за раз.",
+                "available_chapters": len(doc.get("chapters", [])),
+                "translation_service": "limited"
+            }
         
         logger.info(f"🌐 Перевод документа {document_id}: {len(content)} символов")
         
@@ -655,12 +680,12 @@ async def translate_document(document_id: int, target_language: str = "ru"):
             translated_chunks = []
             for i, chunk in enumerate(chunks):
                 logger.info(f"📝 Переводим часть {i+1}/{len(chunks)}")
-                translated = translator.translate(chunk, doc["language"], target_language)
+                translated = translate_with_fallback(chunk, doc["language"], target_language)
                 translated_chunks.append(translated)
             
             translated_content = " ".join(translated_chunks)
         else:
-            translated_content = translator.translate(content, doc["language"], target_language)
+            translated_content = translate_with_fallback(content, doc["language"], target_language)
         
         doc["translated_content"] = translated_content
         doc["updated_at"] = datetime.now().isoformat()
@@ -672,7 +697,8 @@ async def translate_document(document_id: int, target_language: str = "ru"):
             "target_language": target_language,
             "translated_content": translated_content[:500] + "..." if len(translated_content) > 500 else translated_content,
             "total_translated": len(translated_content.split()),
-            "translation_service": "local_transformers"
+            "translation_service": "local_transformers",
+            "warning": "Перевод может занять некоторое время для больших документов."
         }
         
     except HTTPException:
