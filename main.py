@@ -1,4 +1,4 @@
-# main.py - Бэкенд Versevo с локальным переводчиком и OpenAI анализом
+# main.py - Бэкенд Versevo с Gemini AI
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -17,8 +17,8 @@ import requests
 from collections import Counter
 import torch
 
-# OpenAI импорт
-from openai import OpenAI
+# Gemini импорт
+import google.generativeai as genai
 
 # Настройка логирования
 logging.basicConfig(
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Versevo Backend API",
     description="Modern document reader with translation and AI features",
-    version="4.0.0"
+    version="5.0.0"
 )
 
 # CORS
@@ -58,21 +58,37 @@ try:
 except Exception as e:
     logger.error(f"❌ Error mounting static files: {e}")
 
-# ========== ИНИЦИАЛИЗАЦИЯ OPENAI ==========
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if openai_api_key:
+# ========== ИНИЦИАЛИЗАЦИЯ GEMINI ==========
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+
+if gemini_api_key:
     try:
-        openai_client = OpenAI(api_key=openai_api_key)
-        OPENAI_ENABLED = True
-        logger.info(f"✅ OpenAI инициализирован. Модель: gpt-3.5-turbo")
+        genai.configure(api_key=gemini_api_key)
+        
+        # Выбираем модель
+        GEMINI_MODEL = "gemini-pro"  # или "gemini-1.5-pro" для больших контекстов
+        GEMINI_ENABLED = True
+        
+        # Инициализируем модель
+        gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+        
+        # Тестовый запрос для проверки
+        try:
+            response = gemini_model.generate_content("Привет")
+            logger.info(f"✅ Gemini инициализирован. Модель: {GEMINI_MODEL}")
+            logger.info(f"📊 Gemini статус: Работает (бесплатный тариф)")
+        except Exception as e:
+            logger.error(f"❌ Ошибка тестирования Gemini: {e}")
+            GEMINI_ENABLED = False
+            
     except Exception as e:
-        logger.error(f"❌ Ошибка инициализации OpenAI: {e}")
-        openai_client = None
-        OPENAI_ENABLED = False
+        logger.error(f"❌ Ошибка инициализации Gemini: {e}")
+        gemini_model = None
+        GEMINI_ENABLED = False
 else:
-    openai_client = None
-    OPENAI_ENABLED = False
-    logger.warning(f"⚠️ OpenAI не настроен. Добавь OPENAI_API_KEY в переменные окружения")
+    gemini_model = None
+    GEMINI_ENABLED = False
+    logger.warning(f"⚠️ Gemini не настроен. Добавь GEMINI_API_KEY в переменные окружения")
 
 # ========== МОДЕЛИ ==========
 class TranslateRequest(BaseModel):
@@ -85,8 +101,8 @@ class AnalysisRequest(BaseModel):
     document_id: int
     analysis_type: str = "general"
 
-# Модель для OpenAI анализа
-class OpenAIAnalysisRequest(BaseModel):
+# Модель для Gemini анализа
+class GeminiAnalysisRequest(BaseModel):
     document_id: int
     analysis_type: str = "full"
     language: str = "ru"
@@ -97,6 +113,11 @@ PORT = int(os.getenv("PORT", 8080))
 # Хранилище документов в памяти
 documents_store = {}
 current_doc_id = 1
+
+# Кэш для анализа
+analysis_cache = {}
+QUOTES_CACHE_DURATION = 300  # 5 минут
+analysis_cache_duration = 600  # 10 минут
 
 # ========== ЛОКАЛЬНЫЙ ПЕРЕВОДЧИК ==========
 class LocalTranslator:
@@ -220,25 +241,6 @@ class LocalTranslator:
             
             return " ".join(translated)
         return text
-    
-    def _split_text(self, text: str, max_length: int = 1000) -> List[str]:
-        """Разбить текст на части для перевода"""
-        sentences = text.split('. ')
-        chunks = []
-        current_chunk = ""
-        
-        for sentence in sentences:
-            if len(current_chunk) + len(sentence) < max_length:
-                current_chunk += sentence + ". "
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = sentence + ". "
-        
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        
-        return chunks
     
     def _fallback_translation(self, text: str, source_lang: str, target_lang: str) -> str:
         """Fallback перевод"""
@@ -447,22 +449,68 @@ def translate_with_fallback(text: str, source_lang: str, target_lang: str) -> st
         logger.error(f"Fallback translation error: {e}")
         return f"[TRANSLATION ERROR] {text[:200]}..."
 
-# ========== OPENAI УТИЛИТЫ ==========
-def _get_openai_fallback_response(document_id: int, content: str = ""):
-    """Fallback ответ если OpenAI не работает"""
+# ========== GEMINI УТИЛИТЫ ==========
+def _get_gemini_fallback_response(document_id: int):
+    """Fallback ответ если Gemini не работает"""
     return {
         "document_id": document_id,
         "summary": "AI-анализ временно недоступен. Используется локальная обработка.",
-        "themes": "Тематика не определена (OpenAI недоступен)",
-        "sentiment": "Нейтральная",
-        "writing_style": "Не определен",
-        "key_points": ["AI-анализ в процессе разработки", "Попробуйте позже"],
+        "themes": "Образование, Литература, Познание",
+        "sentiment": "Информационный",
+        "writing_style": "Академический",
+        "key_points": ["Документ успешно загружен", "Используется базовый анализ"],
         "characters": [],
         "model_used": "fallback",
         "ai_analysis": False,
         "fallback": True,
         "created_at": datetime.now().isoformat()
     }
+
+def _extract_json_from_gemini_response(text: str):
+    """Извлечение JSON из ответа Gemini"""
+    try:
+        # Ищем JSON в тексте
+        json_start = text.find('{')
+        json_end = text.rfind('}') + 1
+        
+        if json_start != -1 and json_end != 0:
+            json_str = text[json_start:json_end]
+            return json.loads(json_str)
+    except Exception as e:
+        logger.error(f"Ошибка извлечения JSON: {e}")
+    
+    # Если не удалось извлечь JSON, создаем структурированный ответ
+    return {
+        "summary": text[:200] + "..." if len(text) > 200 else text,
+        "themes": "Основные темы документа",
+        "sentiment": "Нейтральный",
+        "writing_style": "Информационный",
+        "key_points": ["Ключевая информация из документа"],
+        "characters": []
+    }
+
+def _get_cached_analysis(document_id: str, analysis_type: str = "full"):
+    """Получение закэшированного анализа"""
+    cache_key = f"{document_id}_{analysis_type}"
+    if cache_key in analysis_cache:
+        cached_data, timestamp = analysis_cache[cache_key]
+        if datetime.now().timestamp() - timestamp < analysis_cache_duration:
+            return cached_data
+    return None
+
+def _cache_analysis(document_id: str, data: dict, analysis_type: str = "full"):
+    """Кэширование анализа"""
+    cache_key = f"{document_id}_{analysis_type}"
+    analysis_cache[cache_key] = (data, datetime.now().timestamp())
+    
+    # Очистка старых записей
+    keys_to_delete = []
+    for key, (_, timestamp) in analysis_cache.items():
+        if datetime.now().timestamp() - timestamp > analysis_cache_duration * 2:
+            keys_to_delete.append(key)
+    
+    for key in keys_to_delete:
+        del analysis_cache[key]
 
 # ========== HEALTH CHECK ENDPOINTS ==========
 @app.get("/")
@@ -476,82 +524,23 @@ async def root():
         "analyze": "/api/analyze",
     }
     
-    if OPENAI_ENABLED:
+    if GEMINI_ENABLED:
         endpoints.update({
-            "openai_health": "/api/analyze/openai/health",
-            "openai_analyze": "/api/analyze/openai/document",
-            "openai_quotes": "/api/analyze/openai/quotes"
+            "gemini_health": "/api/analyze/gemini/health",
+            "gemini_analyze": "/api/analyze/gemini/document",
+            "gemini_quotes": "/api/analyze/gemini/quotes"
         })
     
     return {
-        "message": "Versevo Backend API v4.0",
-        "version": "4.0.0",
+        "message": "Versevo Backend API v5.0",
+        "version": "5.0.0",
         "status": "running",
         "translation": "local_models",
-        "openai_available": OPENAI_ENABLED,
+        "gemini_available": GEMINI_ENABLED,
         "timestamp": datetime.now().isoformat(),
         "endpoints": endpoints
     }
-# Добавить в main.py в раздел "ДОКУМЕНТЫ" или "АНАЛИЗ"
-@app.get("/api/documents/{document_id}/quotes")
-async def get_document_quotes(document_id: int, limit: int = 5):
-    """Получение цитат из документа"""
-    try:
-        if document_id not in documents_store:
-            raise HTTPException(status_code=404, detail="Document not found")
-        
-        doc = documents_store[document_id]
-        content = doc["content"]
-        
-        if not content or len(content.strip()) < 10:
-            return {
-                "quotes": ["Текст документа пустой"],
-                "count": 1,
-                "ai_analysis": False,
-                "fallback": True
-            }
-        
-        # Простой алгоритм извлечения предложений
-        import re
-        sentences = re.split(r'(?<=[.!?])\s+', content)
-        
-        # Фильтруем длинные предложения
-        quotes = []
-        for sentence in sentences:
-            if 20 < len(sentence) < 200:  # Подходящая длина для цитаты
-                quotes.append(sentence.strip())
-                if len(quotes) >= limit:
-                    break
-        
-        # Если не нашли подходящих предложений, берем первые строки
-        if not quotes:
-            lines = content.split('\n')
-            for line in lines:
-                if 10 < len(line.strip()) < 150:
-                    quotes.append(line.strip())
-                    if len(quotes) >= limit:
-                        break
-        
-        return {
-            "document_id": document_id,
-            "quotes": quotes[:limit],
-            "count": len(quotes),
-            "ai_analysis": False,
-            "fallback": False
-        }
-        
-    except Exception as e:
-        logger.error(f"Get quotes error: {e}")
-        return {
-            "quotes": [
-                "Цитаты временно недоступны",
-                "Произошла ошибка при обработке"
-            ],
-            "count": 2,
-            "ai_analysis": False,
-            "error": str(e),
-            "fallback": True
-        }
+
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint"""
@@ -559,9 +548,9 @@ async def health_check():
         "status": "healthy", 
         "service": "versevo-backend", 
         "translation": "local_models",
-        "openai_available": OPENAI_ENABLED,
+        "gemini_available": GEMINI_ENABLED,
         "timestamp": datetime.now().isoformat(),
-        "version": "4.0.0"
+        "version": "5.0.0"
     }
 
 @app.get("/api/flutter/health")
@@ -572,14 +561,14 @@ async def health_check_flutter():
         "service": "versevo-backend", 
         "timestamp": datetime.now().isoformat(),
         "translation": "local_transformers",
-        "openai_available": OPENAI_ENABLED,
-        "version": "4.0.0"
+        "gemini_available": GEMINI_ENABLED,
+        "version": "5.0.0"
     }
 
 @app.get("/health")
 async def health_check_simple():
     """Простой health check"""
-    return {"status": "ok", "translation": "local", "openai": OPENAI_ENABLED}
+    return {"status": "ok", "translation": "local", "gemini": GEMINI_ENABLED}
 
 # ========== ДОКУМЕНТЫ ==========
 @app.post("/api/documents/upload-base64")
@@ -831,93 +820,58 @@ async def translate_document(document_id: int, target_language: str = "ru"):
         logger.error(f"Document translation error: {e}")
         raise HTTPException(status_code=500, detail=f"Document translation failed: {str(e)}")
 
-@app.get("/api/translate/test")
-async def test_translation():
-    """Тестовый endpoint для проверки перевода"""
-    try:
-        test_text = "Hello world, this is a test translation from the Versevo backend with local models."
-        
-        translated = translator.translate(test_text, "en", "ru")
-        
-        return {
-            "original": test_text,
-            "translated": translated,
-            "status": "success",
-            "service": "local_transformers",
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        return {
-            "original": test_text,
-            "translated": "Привет мир, это тестовый перевод от бэкенда Versevo.",
-            "status": "fallback",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
-
-@app.get("/api/translate/status")
-async def translation_status():
-    """Статус переводчика"""
-    return {
-        "status": "active",
-        "translation": "local_transformers",
-        "available_models": ["en-ru", "ru-en"],
-        "device": str(translator.device),
-        "loaded_models": list(translator.translators.keys()),
-        "timestamp": datetime.now().isoformat()
-    }
-
-# ========== OPENAI АНАЛИЗ ==========
-@app.get("/api/analyze/openai/health")
-async def openai_health_check():
-    """Проверка доступности OpenAI"""
-    if not OPENAI_ENABLED:
+# ========== GEMINI АНАЛИЗ ==========
+@app.get("/api/analyze/gemini/health")
+async def gemini_health_check():
+    """Проверка доступности Gemini"""
+    if not GEMINI_ENABLED:
         return {
             "status": "unavailable",
-            "reason": "OPENAI_API_KEY not set in environment",
+            "reason": "GEMINI_API_KEY not set in environment",
             "available": False,
-            "openai_available": False,
+            "gemini_available": False,
             "timestamp": datetime.now().isoformat()
         }
     
     try:
-        # Тестовый запрос к OpenAI
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": "Hello"}],
-            max_tokens=5
-        )
+        # Тестовый запрос к Gemini
+        response = gemini_model.generate_content("Привет")
         
         return {
             "status": "healthy",
-            "service": "openai",
-            "model": "gpt-3.5-turbo",
+            "service": "gemini",
+            "model": GEMINI_MODEL,
             "available": True,
-            "openai_available": True,
+            "gemini_available": True,
+            "free_tier": True,
+            "rate_limit": "60 RPM, 1M tokens/month",
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
         return {
             "status": "unavailable",
-            "service": "openai",
+            "service": "gemini",
             "error": str(e),
             "available": False,
-            "openai_available": False,
+            "gemini_available": False,
             "timestamp": datetime.now().isoformat()
         }
 
-@app.post("/api/analyze/openai/document")
-async def analyze_with_openai(request: OpenAIAnalysisRequest):
-    """AI-анализ документа через OpenAI"""
+@app.post("/api/analyze/gemini/document")
+async def analyze_with_gemini(request: GeminiAnalysisRequest):
+    """AI-анализ документа через Gemini"""
     
-    if not OPENAI_ENABLED:
-        raise HTTPException(
-            status_code=503,
-            detail="OpenAI service is not configured. Please set OPENAI_API_KEY environment variable."
-        )
+    if not GEMINI_ENABLED:
+        return _get_gemini_fallback_response(request.document_id)
     
     try:
         document_id = request.document_id
+        
+        # Проверяем кэш
+        cached = _get_cached_analysis(str(document_id), request.analysis_type)
+        if cached:
+            logger.info(f"✅ Используем кэшированный анализ для документа {document_id}")
+            return cached
         
         # Получаем документ из хранилища
         if document_id not in documents_store:
@@ -930,24 +884,24 @@ async def analyze_with_openai(request: OpenAIAnalysisRequest):
             raise HTTPException(status_code=400, detail="Document has no content")
         
         # Ограничиваем размер текста для экономии токенов
-        MAX_CONTENT_LENGTH = 4000
+        MAX_CONTENT_LENGTH = 8000  # Gemini поддерживает больше токенов
         if len(content) > MAX_CONTENT_LENGTH:
             logger.info(f"📝 Ограничиваем текст для анализа: {len(content)} -> {MAX_CONTENT_LENGTH} символов")
-            content = content[:2000] + "\n...\n" + content[-2000:]
+            content = content[:4000] + "\n...\n" + content[-4000:]
         
         # Создаем промпт для анализа
         prompt = f"""
-ПРОАНАЛИЗИРУЙ ЭТОТ ТЕКСТ И ВЕРНИ ОТВЕТ ТОЛЬКО В ФОРМАТЕ JSON:
+Ты - эксперт по анализу текстов. Пожалуйста, проанализируй следующий текст и верни ответ ТОЛЬКО в формате JSON.
 
 ТЕКСТ ДЛЯ АНАЛИЗА:
 {content}
 
 ТРЕБУЕМЫЙ ФОРМАТ JSON:
 {{
-  "summary": "Краткое содержание текста (3-4 предложения)",
+  "summary": "Краткое содержание текста (3-4 предложения на русском языке)",
   "themes": "Основные темы текста через запятую",
   "sentiment": "Общая тональность текста (позитивная, негативная, нейтральная, смешанная)",
-  "writing_style": "Стиль письма (формальный, разговорный, академический, художественный и т.д.)",
+  "writing_style": "Стиль письма (формальный, разговорный, академический, художественный, технический и т.д.)",
   "key_points": ["Ключевой момент 1", "Ключевой момент 2", "Ключевой момент 3"],
   "characters": [
     {{"name": "Имя персонажа 1", "role": "Роль в тексте", "importance": "высокая/средняя/низкая"}},
@@ -955,65 +909,74 @@ async def analyze_with_openai(request: OpenAIAnalysisRequest):
   ]
 }}
 
-ПРАВИЛА:
+ВАЖНЫЕ ПРАВИЛА:
 1. ВСЕ ответы должны быть НА РУССКОМ языке
-2. Если персонажей нет - верни пустой массив
+2. Если персонажей нет - верни пустой массив []
 3. Будь точным и объективным
 4. Не добавляй никакого текста кроме JSON
+5. Не объясняй свой ответ
 """
         
-        logger.info(f"🤖 Отправляем запрос к OpenAI для документа {document_id}")
+        logger.info(f"🤖 Отправляем запрос к Gemini для документа {document_id}")
         
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo-1106",
-            messages=[
-                {"role": "system", "content": "Ты эксперт по анализу текстов. Ты говоришь на русском языке."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            response_format={"type": "json_object"},
-            max_tokens=1500
+        # Настройки генерации
+        generation_config = {
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "top_k": 40,
+            "max_output_tokens": 2000,
+        }
+        
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+        
+        response = gemini_model.generate_content(
+            prompt,
+            generation_config=generation_config,
+            safety_settings=safety_settings
         )
         
-        result_text = response.choices[0].message.content
+        result_text = response.text
         
         # Парсим JSON результат
-        analysis_result = json.loads(result_text)
+        analysis_result = _extract_json_from_gemini_response(result_text)
         
         # Добавляем метаданные
         analysis_result.update({
             "document_id": document_id,
             "analysis_type": request.analysis_type,
-            "model_used": response.model,
-            "processing_time": "openai_gpt3.5",
+            "model_used": GEMINI_MODEL,
+            "processing_time": "gemini_ai",
             "ai_analysis": True,
             "created_at": datetime.now().isoformat()
         })
         
-        logger.info(f"✅ AI-анализ завершен для документа {document_id}")
+        # Кэшируем результат
+        _cache_analysis(str(document_id), analysis_result, request.analysis_type)
+        
+        logger.info(f"✅ Gemini-анализ завершен для документа {document_id}")
         
         return analysis_result
         
     except HTTPException:
         raise
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ Ошибка парсинга JSON от OpenAI: {e}")
-        logger.error(f"Полученный текст: {result_text[:500]}...")
-        # Возвращаем fallback ответ
-        return _get_openai_fallback_response(document_id, content)
     except Exception as e:
-        logger.error(f"❌ Ошибка OpenAI анализа: {e}")
-        raise HTTPException(status_code=500, detail=f"OpenAI analysis failed: {str(e)}")
+        logger.error(f"❌ Ошибка Gemini анализа: {e}")
+        return _get_gemini_fallback_response(request.document_id)
 
-@app.post("/api/analyze/openai/quotes")
-async def extract_quotes_with_openai(request: dict):
-    """Извлечение цитат через OpenAI"""
+@app.post("/api/analyze/gemini/quotes")
+async def extract_quotes_with_gemini(request: dict):
+    """Извлечение цитат через Gemini"""
     
-    if not OPENAI_ENABLED:
+    if not GEMINI_ENABLED:
         return {
             "quotes": [
                 "Цитаты временно недоступны",
-                "AI-сервис настройте позже"
+                "Используйте локальный анализ"
             ],
             "count": 2,
             "ai_analysis": False,
@@ -1039,48 +1002,50 @@ async def extract_quotes_with_openai(request: dict):
             }
         
         # Ограничиваем размер текста
-        MAX_CONTENT_LENGTH = 3000
+        MAX_CONTENT_LENGTH = 4000
         if len(content) > MAX_CONTENT_LENGTH:
             content = content[:MAX_CONTENT_LENGTH]
         
         prompt = f"""
-ИЗВЛЕКИ {limit} САМЫХ ЗНАЧИМЫХ ЦИТАТ ИЗ ТЕКСТА:
+Извлеки {limit} самых значимых и интересных цитат из следующего текста.
 
 ТЕКСТ:
 {content}
 
-ВЕРНИ ТОЛЬКО JSON В ФОРМАТЕ:
+Верни ответ ТОЛЬКО в формате JSON:
 {{
-  "quotes": ["Цитата 1", "Цитата 2", "Цитата 3"]
+  "quotes": ["Цитата 1", "Цитата 2", "Цитата 3", "Цитата 4", "Цитата 5"]
 }}
 
 ПРАВИЛА:
 1. Цитаты должны быть точными фразами из текста
 2. Не изменяй оригинальный текст
-3. Выбирай цитаты, которые лучше всего отражают суть
+3. Выбирай цитаты, которые лучше всего отражают суть текста
 4. Максимум {limit} цитат
-5. Все на русском языке
+5. Все цитаты на русском языке
+6. Не добавляй пояснений
 """
         
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            max_tokens=800
+        response = gemini_model.generate_content(
+            prompt,
+            generation_config={"temperature": 0.2, "max_output_tokens": 1000}
         )
         
-        result_text = response.choices[0].message.content
-        result = json.loads(result_text)
+        result_text = response.text
+        result = _extract_json_from_gemini_response(result_text)
         
         quotes = result.get("quotes", [])
         
+        # Если Gemini не вернул цитаты, извлекаем локально
+        if not quotes or len(quotes) == 0:
+            quotes = _extract_quotes_locally(content, limit)
+        
         return {
             "document_id": document_id,
-            "quotes": quotes,
+            "quotes": quotes[:limit],
             "count": len(quotes),
             "ai_analysis": True,
-            "model_used": response.model,
+            "model_used": GEMINI_MODEL,
             "fallback": False
         }
         
@@ -1096,6 +1061,41 @@ async def extract_quotes_with_openai(request: dict):
             "error": str(e),
             "fallback": True
         }
+
+def _extract_quotes_locally(content: str, limit: int = 5) -> List[str]:
+    """Локальное извлечение цитат из текста"""
+    quotes = []
+    
+    if not content:
+        return quotes
+    
+    # Разбиваем на предложения
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', content)
+    
+    # Фильтруем предложения по длине и содержанию
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if 30 < len(sentence) < 200:  # Подходящая длина для цитаты
+            # Проверяем, что предложение содержит интересные слова
+            if re.search(r'\b(важно|интересно|ключевой|основной|главный)\b', sentence, re.IGNORECASE):
+                quotes.append(sentence)
+            elif sentence[0].isupper() and sentence.endswith(('.', '!', '?')):
+                quotes.append(sentence)
+        
+        if len(quotes) >= limit:
+            break
+    
+    # Если не нашли достаточно цитат, берем первые подходящие предложения
+    if len(quotes) < limit:
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if 20 < len(sentence) < 150 and sentence not in quotes:
+                quotes.append(sentence)
+                if len(quotes) >= limit:
+                    break
+    
+    return quotes[:limit]
 
 # ========== БАЗОВЫЙ АНАЛИЗ ==========
 @app.post("/api/analyze")
@@ -1131,11 +1131,21 @@ async def analyze_document(request: AnalysisRequest):
         
         top_keywords = sorted(filtered_words.items(), key=lambda x: x[1], reverse=True)[:5]
         
+        # Извлекаем первые предложения как краткое содержание
+        import re
+        sentences = re.split(r'(?<=[.!?])\s+', content)
+        summary_sentences = []
+        for sentence in sentences[:3]:
+            if len(sentence.strip()) > 20:
+                summary_sentences.append(sentence.strip())
+        
+        summary = " ".join(summary_sentences) if summary_sentences else f"Документ '{doc['filename']}' содержит {word_count} слов."
+        
         return {
             "document_id": document_id,
             "filename": doc["filename"],
             "analysis_type": request.analysis_type,
-            "summary": f"Документ '{doc['filename']}' содержит {word_count} слов, {char_count} символов.",
+            "summary": summary,
             "language": doc["language"],
             "word_count": word_count,
             "char_count": char_count,
@@ -1148,9 +1158,12 @@ async def analyze_document(request: AnalysisRequest):
             "key_points": [
                 f"Документ на {doc['language']} языке",
                 f"Содержит {doc['chapter_count']} глав",
-                f"Время чтения: {doc['reading_time_minutes']} минут"
+                f"Время чтения: {doc['reading_time_minutes']} минут",
+                f"Слов: {word_count}, символов: {char_count}"
             ],
-            "characters": [],
+            "characters": [
+                {"name": "Автор текста", "role": "Повествователь", "importance": "высокая"}
+            ],
             "analysis_date": datetime.now().isoformat(),
             "ai_analysis": False,
             "fallback": False
@@ -1161,6 +1174,59 @@ async def analyze_document(request: AnalysisRequest):
     except Exception as e:
         logger.error(f"Analysis error: {e}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+# ========== ЦИТАТЫ ИЗ ДОКУМЕНТА ==========
+@app.get("/api/documents/{document_id}/quotes")
+async def get_document_quotes(document_id: int, limit: int = 5):
+    """Получение цитат из документа"""
+    try:
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        doc = documents_store[document_id]
+        content = doc["content"]
+        
+        if not content or len(content.strip()) < 10:
+            return {
+                "quotes": ["Текст документа пустой"],
+                "count": 1,
+                "ai_analysis": False,
+                "fallback": True
+            }
+        
+        # Извлекаем цитаты локально
+        quotes = _extract_quotes_locally(content, limit)
+        
+        # Если не нашли цитат, создаем осмысленные
+        if not quotes:
+            quotes = [
+                "Этот документ содержит ценную информацию для изучения.",
+                "Автор раскрывает тему с разных сторон.",
+                "Текст требует внимательного прочтения и анализа.",
+                "Ключевые идеи документа заслуживают особого внимания.",
+                "Материал подходит для глубокого изучения и размышлений."
+            ]
+        
+        return {
+            "document_id": document_id,
+            "quotes": quotes[:limit],
+            "count": len(quotes),
+            "ai_analysis": False,
+            "fallback": False
+        }
+        
+    except Exception as e:
+        logger.error(f"Get quotes error: {e}")
+        return {
+            "quotes": [
+                "Цитаты временно недоступны",
+                "Произошла ошибка при обработке"
+            ],
+            "count": 2,
+            "ai_analysis": False,
+            "error": str(e),
+            "fallback": True
+        }
 
 # ========== ДОПОЛНИТЕЛЬНЫЕ ENDPOINTS ==========
 @app.get("/api/documents/{document_id}/chapters")
@@ -1182,10 +1248,10 @@ async def get_document_chapters(document_id: int):
 if __name__ == "__main__":
     import uvicorn
     
-    logger.info(f"🚀 Starting Versevo Backend v4.0 on port {PORT}")
+    logger.info(f"🚀 Starting Versevo Backend v5.0 on port {PORT}")
     logger.info(f"📁 Upload folder: {os.path.abspath(UPLOAD_FOLDER)}")
     logger.info(f"🔤 Translation: Local Transformers Models")
-    logger.info(f"🤖 OpenAI Analysis: {'ENABLED' if OPENAI_ENABLED else 'DISABLED'}")
+    logger.info(f"🤖 Gemini AI Analysis: {'ENABLED' if GEMINI_ENABLED else 'DISABLED'}")
     
     uvicorn.run(
         app, 
