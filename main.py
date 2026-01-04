@@ -214,7 +214,7 @@ def detect_chapters(text: str) -> List[Dict]:
     return chapters
 
 def translate_with_huggingface(text: str, source_lang: str, target_lang: str) -> str:
-    """Перевод через Hugging Face NLLB"""
+    """Перевод через Hugging Face NLLB с поддержкой больших текстов"""
     try:
         lang_codes = {
             "ru": "rus_Cyrl", "en": "eng_Latn", "de": "deu_Latn",
@@ -226,6 +226,43 @@ def translate_with_huggingface(text: str, source_lang: str, target_lang: str) ->
         if source_lang not in lang_codes or target_lang not in lang_codes:
             return text
         
+        # Разбиваем большой текст на части
+        max_chunk_size = 500  # Hugging Face API ограничение
+        chunks = []
+        
+        # Разбиваем по предложениям если возможно
+        import re
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        current_chunk = ""
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) <= max_chunk_size:
+                current_chunk += sentence + " "
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence + " "
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        # Если не удалось разбить по предложениям, разбиваем по словам
+        if not chunks:
+            words = text.split()
+            current_chunk = ""
+            for word in words:
+                if len(current_chunk) + len(word) + 1 <= max_chunk_size:
+                    current_chunk += word + " "
+                else:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = word + " "
+            
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+        
+        logger.info(f"📝 Текст разбит на {len(chunks)} частей для перевода")
+        
         api_url = "https://api-inference.huggingface.co/models/facebook/nllb-200-distilled-600M"
         
         headers = {
@@ -233,33 +270,52 @@ def translate_with_huggingface(text: str, source_lang: str, target_lang: str) ->
             "Content-Type": "application/json"
         }
         
-        payload = {
-            "inputs": text,
-            "parameters": {
-                "src_lang": lang_codes[source_lang],
-                "tgt_lang": lang_codes[target_lang],
-                "max_length": 1024
-            }
-        }
+        translated_chunks = []
         
-        response = requests.post(
-            api_url,
-            headers=headers,
-            json=payload,
-            timeout=60
-        )
+        for i, chunk in enumerate(chunks):
+            try:
+                payload = {
+                    "inputs": chunk,
+                    "parameters": {
+                        "src_lang": lang_codes[source_lang],
+                        "tgt_lang": lang_codes[target_lang],
+                        "max_length": 1024
+                    }
+                }
+                
+                response = requests.post(
+                    api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if isinstance(result, list) and len(result) > 0:
+                        translated = result[0].get("translation_text", chunk)
+                        translated_chunks.append(translated)
+                        logger.info(f"✅ Часть {i+1}/{len(chunks)} переведена")
+                    else:
+                        logger.warning(f"⚠️ Часть {i+1}: не удалось получить перевод")
+                        translated_chunks.append(chunk)
+                else:
+                    logger.error(f"❌ Часть {i+1}: ошибка API {response.status_code}")
+                    translated_chunks.append(chunk)
+                    
+            except Exception as e:
+                logger.error(f"❌ Ошибка перевода части {i+1}: {e}")
+                translated_chunks.append(chunk)
         
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                return result[0].get("translation_text", text)
+        # Собираем все части вместе
+        result = " ".join(translated_chunks)
+        logger.info(f"✅ Перевод завершен: {len(result)} символов")
         
-        return text
+        return result
         
     except Exception as e:
         logger.error(f"Translation error: {e}")
         return text
-
 # ========== HEALTH CHECK ENDPOINTS ==========
 @app.get("/")
 async def root():
@@ -520,21 +576,14 @@ async def translate_text(request: TranslateRequest):
         if not request.text or len(request.text.strip()) == 0:
             raise HTTPException(status_code=400, detail="Text is empty")
         
-        if len(request.text) > 4000:
-            return {
-                "original_text": request.text[:100] + "...",
-                "translated_text": "[Текст слишком длинный для перевода]",
-                "source_language": request.source_language or "auto",
-                "target_language": request.target_language,
-                "style": request.style,
-                "translation_service": "fallback"
-            }
-        
+        # Убираем ограничение по длине текста
         source_lang = request.source_language
         if not source_lang or source_lang == "auto":
             source_lang = detect_language_safe(request.text)
         
         target_lang = request.target_language
+        
+        logger.info(f"🌐 Перевод текста: {len(request.text)} символов, с {source_lang} на {target_lang}")
         
         translated_text = translate_with_huggingface(
             request.text, 
@@ -542,6 +591,7 @@ async def translate_text(request: TranslateRequest):
             target_lang
         )
         
+        # Применяем стиль
         if request.style == "artistic":
             translated_text = f"🎨 {translated_text}"
         elif request.style == "formal":
@@ -553,7 +603,9 @@ async def translate_text(request: TranslateRequest):
             "source_language": source_lang,
             "target_language": target_lang,
             "style": request.style,
-            "translation_service": "huggingface_nllb"
+            "translation_service": "huggingface_nllb",
+            "original_length": len(request.text),
+            "translated_length": len(translated_text)
         }
         
     except HTTPException:
@@ -561,7 +613,6 @@ async def translate_text(request: TranslateRequest):
     except Exception as e:
         logger.error(f"Translate error: {e}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
-
 @app.post("/api/translate/document/{document_id}")
 async def translate_document(document_id: int, target_language: str = "ru"):
     """Перевод всего документа"""
