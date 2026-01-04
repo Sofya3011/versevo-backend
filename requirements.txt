@@ -2,7 +2,7 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
-
+psutil==5.9.7  # ← Добавить эту строку
 # === FILE PROCESSING ===
 python-docx==1.1.0
 PyMuPDF==1.23.8
