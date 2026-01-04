@@ -18,10 +18,7 @@ from collections import Counter
 import torch
 
 # Gemini импорт
-import google.generativeai as genai
-
-# Настройка логирования
-logging.basicConfig(
+import google.generativeai as genailogging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
@@ -59,26 +56,30 @@ except Exception as e:
     logger.error(f"❌ Error mounting static files: {e}")
 
 # ========== ИНИЦИАЛИЗАЦИЯ GEMINI ==========
+# ========== ИНИЦИАЛИЗАЦИЯ GEMINI ==========
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+gemini_model = None
+GEMINI_ENABLED = False
+GEMINI_MODEL = "gemini-1.5-pro-latest"  # Или "gemini-1.5-flash-latest"
+
 if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        # Используйте актуальную версию API и модель
-        model = genai.GenerativeModel('gemini-1.5-pro-latest')
-        # Или 'gemini-1.5-flash-latest' для более быстрого ответа
-    except Exception as e:
-        print(f"❌ Ошибка настройки Gemini: {e}")
-        GEMINI_API_KEY = None
-            
+        # Инициализируем модель
+        gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+        
+        # Тестовый запрос для проверки
+        test_response = gemini_model.generate_content("Привет")
+        
+        GEMINI_ENABLED = True
+        logger.info(f"✅ Gemini инициализирован: {GEMINI_MODEL}")
+        
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации Gemini: {e}")
         gemini_model = None
         GEMINI_ENABLED = False
 else:
-    gemini_model = None
-    GEMINI_ENABLED = False
-    logger.warning(f"⚠️ Gemini не настроен. Добавь GEMINI_API_KEY в переменные окружения")
-
+    logger.warning("⚠️ Gemini не настроен. Добавьте GEMINI_API_KEY в переменные окружения")
 # ========== МОДЕЛИ ==========
 class TranslateRequest(BaseModel):
     text: str
@@ -813,10 +814,10 @@ async def translate_document(document_id: int, target_language: str = "ru"):
 @app.get("/api/analyze/gemini/health")
 async def gemini_health_check():
     """Проверка доступности Gemini"""
-    if not GEMINI_ENABLED:
+    if not GEMINI_ENABLED or gemini_model is None:
         return {
             "status": "unavailable",
-            "reason": "GEMINI_API_KEY not set in environment",
+            "reason": "Gemini API not configured or initialized",
             "available": False,
             "gemini_available": False,
             "timestamp": datetime.now().isoformat()
@@ -845,7 +846,6 @@ async def gemini_health_check():
             "gemini_available": False,
             "timestamp": datetime.now().isoformat()
         }
-
 @app.post("/api/analyze/gemini/document")
 async def analyze_with_gemini(request: GeminiAnalysisRequest):
     """AI-анализ документа через Gemini"""
