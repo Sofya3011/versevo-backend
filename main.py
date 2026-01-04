@@ -1,4 +1,4 @@
-# main.py - Бэкенд Versevo с Gemini AI
+# main.py - Бэкенд Versevo с Hugging Face AI
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -35,7 +35,7 @@ class AnalysisRequest(BaseModel):
     document_id: int
     analysis_type: str = "general"
 
-class GeminiAnalysisRequest(BaseModel):
+class AIAnalysisRequest(BaseModel):
     document_id: int
     analysis_type: str = "full"
     language: str = "ru"
@@ -82,66 +82,128 @@ analysis_cache = {}
 QUOTES_CACHE_DURATION = 300
 analysis_cache_duration = 600
 
-# ========== ИНИЦИАЛИЗАЦИЯ GEMINI ==========
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-gemini_model = None
-GEMINI_ENABLED = False
-GEMINI_MODEL = None
+# ========== ИНИЦИАЛИЗАЦИЯ HUGGING FACE ==========
+HUGGING_FACE_API_KEY = os.getenv('HUGGING_FACE_API_KEY')
+HUGGING_FACE_ENABLED = False
+HUGGING_FACE_MODELS = {}
+HUGGING_FACE_API_URL = "https://api-inference.huggingface.co/models/"
 
-if GEMINI_API_KEY:
+# Словарь для хранения загруженных моделей
+hf_pipelines = {
+    "sentiment": None,
+    "summarization": None,
+    "translation": None,
+    "ner": None,
+}
+
+def init_huggingface():
+    """Инициализация Hugging Face моделей"""
+    global HUGGING_FACE_ENABLED
+    
     try:
-        logger.info("🔧 Инициализация Gemini AI...")
+        from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+        import torch
         
-        # Пробуем разные импорты
+        # Проверяем наличие CUDA
+        device = 0 if torch.cuda.is_available() else -1
+        device_name = "CUDA" if torch.cuda.is_available() else "CPU"
+        logger.info(f"🏗️ Инициализация Hugging Face на {device_name}")
+        
+        # Модели для русского языка
+        models_config = {
+            "sentiment": {
+                "model": "blanchefort/rubert-base-cased-sentiment",
+                "description": "Анализ тональности (русский)"
+            },
+            "summarization": {
+                "model": "IlyaGusev/rut5_base_sum_gazeta",
+                "description": "Суммаризация текста (русский)"
+            },
+            "ner": {
+                "model": "Babelscape/wikineural-multilingual-ner",
+                "description": "Распознавание именованных сущностей"
+            },
+            "translation_en_ru": {
+                "model": "Helsinki-NLP/opus-mt-en-ru",
+                "description": "Перевод EN→RU"
+            },
+            "translation_ru_en": {
+                "model": "Helsinki-NLP/opus-mt-ru-en",
+                "description": "Перевод RU→EN"
+            }
+        }
+        
+        # Загружаем модели (ленивая загрузка по требованию)
+        HUGGING_FACE_MODELS.update(models_config)
+        HUGGING_FACE_ENABLED = True
+        
+        logger.info("✅ Hugging Face инициализирован (ленивая загрузка моделей)")
+        logger.info(f"📦 Доступно моделей: {len(models_config)}")
+        
+        # Предзагружаем только sentiment модель (самую легкую)
         try:
-            # Новая версия
-            import google.genai as genai
-            from google.genai import types
-            logger.info("✅ Используется новый пакет google.genai")
-        except ImportError:
-            try:
-                # Старая версия
-                import google.generativeai as genai
-                logger.warning("⚠️ Используется устаревший пакет google.generativeai")
-            except ImportError as e:
-                logger.error(f"❌ Не удалось импортировать Gemini: {e}")
-                genai = None
+            logger.info("🔄 Предзагрузка модели анализа тональности...")
+            hf_pipelines["sentiment"] = pipeline(
+                "sentiment-analysis",
+                model=models_config["sentiment"]["model"],
+                device=device
+            )
+            logger.info("✅ Модель анализа тональности загружена")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось загрузить sentiment модель: {e}")
         
-        if genai:
-            genai.configure(api_key=GEMINI_API_KEY)
-            
-            # Пробуем разные модели
-            model_variants = [
-                "gemini-1.5-flash",
-                "gemini-1.5-pro",
-                "gemini-1.0-pro",
-                "gemini-pro",
-            ]
-            
-            for model_name in model_variants:
-                try:
-                    logger.info(f"🔄 Пробуем модель: {model_name}")
-                    gemini_model = genai.GenerativeModel(model_name)
-                    test_response = gemini_model.generate_content("Hello")
-                    
-                    GEMINI_MODEL = model_name
-                    GEMINI_ENABLED = True
-                    logger.info(f"✅ Gemini инициализирован! Модель: {GEMINI_MODEL}")
-                    break
-                except Exception as e:
-                    logger.warning(f"⚠️ Модель {model_name} недоступна: {str(e)[:100]}")
-                    continue
-            
-            if not GEMINI_ENABLED:
-                logger.error("❌ Все модели Gemini недоступны, проверьте API ключ и регион")
-                gemini_model = None
-                
+    except ImportError as e:
+        logger.error(f"❌ Не удалось импортировать transformers: {e}")
     except Exception as e:
-        logger.error(f"❌ Ошибка инициализации Gemini: {e}")
-        gemini_model = None
-        GEMINI_ENABLED = False
-else:
-    logger.warning("⚠️ Gemini не настроен. Добавьте GEMINI_API_KEY в переменные окружения")
+        logger.error(f"❌ Ошибка инициализации Hugging Face: {e}")
+
+# Инициализируем Hugging Face
+init_huggingface()
+
+def get_hf_pipeline(task: str, model_name: str = None):
+    """Получить или загрузить pipeline для задачи"""
+    if task not in hf_pipelines:
+        logger.error(f"❌ Неизвестная задача: {task}")
+        return None
+    
+    if hf_pipelines[task] is None and model_name:
+        try:
+            from transformers import pipeline
+            import torch
+            
+            device = 0 if torch.cuda.is_available() else -1
+            logger.info(f"🔄 Загрузка модели {model_name} для задачи {task}...")
+            
+            if task == "summarization":
+                hf_pipelines[task] = pipeline(
+                    "summarization",
+                    model=model_name,
+                    tokenizer=model_name,
+                    device=device,
+                    max_length=150,
+                    min_length=30
+                )
+            elif task == "translation":
+                hf_pipelines[task] = pipeline(
+                    "translation",
+                    model=model_name,
+                    device=device
+                )
+            elif task == "ner":
+                hf_pipelines[task] = pipeline(
+                    "ner",
+                    model=model_name,
+                    device=device,
+                    grouped_entities=True
+                )
+            
+            logger.info(f"✅ Модель {model_name} загружена")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки модели {model_name}: {e}")
+            return None
+    
+    return hf_pipelines[task]
 
 # ========== УПРОЩЕННЫЙ ПЕРЕВОДЧИК ==========
 class LocalTranslator:
@@ -296,6 +358,128 @@ def translate_with_fallback(text: str, source_lang: str, target_lang: str) -> st
     except:
         return f"[TRANSLATION ERROR] {text[:200]}..."
 
+# ========== HUGGING FACE АНАЛИЗ ==========
+def analyze_with_huggingface(text: str) -> Dict[str, Any]:
+    """Анализ текста с помощью Hugging Face моделей"""
+    result = {
+        "summary": "",
+        "sentiment": "Нейтральный",
+        "entities": [],
+        "themes": "",
+        "ai_analysis": False,
+        "fallback": False,
+        "model_used": []
+    }
+    
+    if not HUGGING_FACE_ENABLED or not text or len(text.strip()) < 20:
+        result["fallback"] = True
+        return result
+    
+    try:
+        # 1. Анализ тональности
+        sentiment_pipeline = get_hf_pipeline("sentiment")
+        if sentiment_pipeline:
+            try:
+                sentiment_result = sentiment_pipeline(text[:512])  # Ограничиваем длину
+                if sentiment_result and len(sentiment_result) > 0:
+                    label = sentiment_result[0].get("label", "NEUTRAL").upper()
+                    score = sentiment_result[0].get("score", 0.5)
+                    
+                    sentiment_map = {
+                        "POSITIVE": "Положительный",
+                        "NEGATIVE": "Отрицательный", 
+                        "NEUTRAL": "Нейтральный"
+                    }
+                    
+                    result["sentiment"] = sentiment_map.get(label, "Нейтральный")
+                    result["sentiment_score"] = score
+                    result["model_used"].append("sentiment")
+                    result["ai_analysis"] = True
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка анализа тональности: {e}")
+        
+        # 2. Суммаризация (только для длинных текстов)
+        if len(text.split()) > 100:
+            summarization_pipeline = get_hf_pipeline(
+                "summarization", 
+                HUGGING_FACE_MODELS.get("summarization", {}).get("model")
+            )
+            
+            if summarization_pipeline:
+                try:
+                    # Ограничиваем текст для суммаризации
+                    input_text = text[:2000]  # Ограничение для памяти
+                    summary_result = summarization_pipeline(
+                        input_text,
+                        max_length=100,
+                        min_length=30,
+                        do_sample=False
+                    )
+                    
+                    if summary_result and len(summary_result) > 0:
+                        result["summary"] = summary_result[0].get("summary_text", "")
+                        result["model_used"].append("summarization")
+                        result["ai_analysis"] = True
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка суммаризации: {e}")
+        
+        # 3. Извлечение именованных сущностей (NER)
+        ner_pipeline = get_hf_pipeline(
+            "ner", 
+            HUGGING_FACE_MODELS.get("ner", {}).get("model")
+        )
+        
+        if ner_pipeline:
+            try:
+                ner_result = ner_pipeline(text[:1000])
+                entities = []
+                
+                for entity in ner_result:
+                    if isinstance(entity, dict):
+                        entities.append({
+                            "entity": entity.get("entity_group") or entity.get("entity"),
+                            "word": entity.get("word"),
+                            "score": entity.get("score", 0.0)
+                        })
+                
+                if entities:
+                    result["entities"] = entities[:10]  # Ограничиваем количество
+                    result["model_used"].append("ner")
+                    result["ai_analysis"] = True
+                    
+                    # Формируем темы из сущностей
+                    entity_types = [e["entity"] for e in entities[:5]]
+                    if entity_types:
+                        result["themes"] = ", ".join(set(entity_types))
+                        
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка NER анализа: {e}")
+        
+        # Если суммаризация не сработала, создаем простую версию
+        if not result.get("summary"):
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+            if len(sentences) > 3:
+                result["summary"] = " ".join(sentences[:3]) + "..."
+            else:
+                result["summary"] = text[:300] + "..." if len(text) > 300 else text
+        
+        # Если темы не определены, создаем из частых слов
+        if not result.get("themes"):
+            words = [w.lower() for w in re.findall(r'\b\w{4,}\b', text)]
+            stopwords = {'это', 'что', 'как', 'для', 'того', 'чтобы', 'если', 'когда'}
+            filtered_words = [w for w in words if w not in stopwords]
+            word_freq = Counter(filtered_words)
+            common_words = [word for word, _ in word_freq.most_common(3)]
+            if common_words:
+                result["themes"] = ", ".join(common_words)
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка Hugging Face анализа: {e}")
+        result["fallback"] = True
+        return result
+
 # ========== HEALTH CHECK ENDPOINTS ==========
 @app.get("/")
 async def root():
@@ -308,10 +492,10 @@ async def root():
         "analyze": "/api/analyze",
     }
     
-    if GEMINI_ENABLED:
+    if HUGGING_FACE_ENABLED:
         endpoints.update({
-            "gemini_health": "/api/analyze/gemini/health",
-            "gemini_analyze": "/api/analyze/gemini/document",
+            "ai_health": "/api/analyze/ai/health",
+            "ai_analyze": "/api/analyze/ai/document",
         })
     
     return {
@@ -319,7 +503,7 @@ async def root():
         "version": "5.0.0",
         "status": "running",
         "translation": "simple",
-        "gemini_available": GEMINI_ENABLED,
+        "huggingface_available": HUGGING_FACE_ENABLED,
         "timestamp": datetime.now().isoformat(),
         "endpoints": endpoints
     }
@@ -331,7 +515,7 @@ async def health_check():
         "status": "healthy", 
         "service": "versevo-backend", 
         "translation": "simple",
-        "gemini_available": GEMINI_ENABLED,
+        "huggingface_available": HUGGING_FACE_ENABLED,
         "timestamp": datetime.now().isoformat(),
         "version": "5.0.0"
     }
@@ -431,7 +615,7 @@ async def translate_text(request: TranslateRequest):
         if not source_lang or source_lang == "auto":
             source_lang = detect_language_safe(request.text)
         
-        target_lang = request.target_lang
+        target_lang = request.target_language  # Исправлено здесь
         
         translated_text = translator.translate(request.text, source_lang, target_lang)
         
@@ -456,44 +640,25 @@ async def translate_text(request: TranslateRequest):
         logger.error(f"Translate error: {e}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
-# ========== GEMINI АНАЛИЗ ==========
-@app.get("/api/analyze/gemini/health")
-async def gemini_health_check():
-    """Проверка доступности Gemini"""
-    if not GEMINI_ENABLED or gemini_model is None:
-        return {
-            "status": "unavailable",
-            "reason": "Gemini API not configured or initialized",
-            "available": False,
-            "gemini_available": False,
-            "timestamp": datetime.now().isoformat()
-        }
-    
-    try:
-        response = gemini_model.generate_content("Hello")
-        return {
-            "status": "healthy",
-            "service": "gemini",
-            "model": GEMINI_MODEL,
-            "available": True,
-            "gemini_available": True,
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        return {
-            "status": "unavailable",
-            "service": "gemini",
-            "error": str(e)[:100],
-            "available": False,
-            "gemini_available": False,
-            "timestamp": datetime.now().isoformat()
-        }
+# ========== AI АНАЛИЗ ==========
+@app.get("/api/analyze/ai/health")
+async def ai_health_check():
+    """Проверка доступности AI"""
+    return {
+        "status": "healthy" if HUGGING_FACE_ENABLED else "unavailable",
+        "service": "huggingface",
+        "available": HUGGING_FACE_ENABLED,
+        "models": list(HUGGING_FACE_MODELS.keys()) if HUGGING_FACE_ENABLED else [],
+        "loaded_pipelines": [k for k, v in hf_pipelines.items() if v is not None],
+        "huggingface_available": HUGGING_FACE_ENABLED,
+        "timestamp": datetime.now().isoformat()
+    }
 
-@app.post("/api/analyze/gemini/document")
-async def analyze_with_gemini(request: GeminiAnalysisRequest):
-    """AI-анализ документа через Gemini"""
+@app.post("/api/analyze/ai/document")
+async def analyze_with_ai(request: AIAnalysisRequest):
+    """AI-анализ документа через Hugging Face"""
     
-    if not GEMINI_ENABLED or gemini_model is None:
+    if not HUGGING_FACE_ENABLED:
         return {
             "document_id": request.document_id,
             "summary": "AI-анализ временно недоступен. Используется локальная обработка.",
@@ -504,7 +669,9 @@ async def analyze_with_gemini(request: GeminiAnalysisRequest):
             "characters": [],
             "ai_analysis": False,
             "fallback": True,
-            "created_at": datetime.now().isoformat()
+            "created_at": datetime.now().isoformat(),
+            "ai_provider": "huggingface",
+            "ai_status": "unavailable"
         }
     
     try:
@@ -519,63 +686,58 @@ async def analyze_with_gemini(request: GeminiAnalysisRequest):
         if not content or len(content.strip()) < 10:
             raise HTTPException(status_code=400, detail="Document has no content")
         
-        # Ограничиваем размер текста
-        MAX_CONTENT_LENGTH = 4000
-        if len(content) > MAX_CONTENT_LENGTH:
-            content = content[:MAX_CONTENT_LENGTH] + "..."
+        # Анализ через Hugging Face
+        hf_result = analyze_with_huggingface(content)
         
-        prompt = f"""Проанализируй текст и верни JSON:
-{{
-  "summary": "краткое содержание на русском (3 предложения)",
-  "themes": "основные темы через запятую",
-  "sentiment": "тональность",
-  "writing_style": "стиль письма",
-  "key_points": ["ключевой момент 1", "ключевой момент 2", "ключевой момент 3"],
-  "characters": []
-}}
-
-Текст: {content}"""
+        # Формируем ключевые точки
+        key_points = [
+            f"Документ на {doc['language']} языке",
+            f"Содержит {doc['chapter_count']} глав",
+            f"Время чтения: {doc['reading_time_minutes']} минут",
+            f"Слов: {doc['word_count']}, символов: {doc['char_count']}"
+        ]
         
-        response = gemini_model.generate_content(prompt)
-        result_text = response.text
+        # Добавляем информацию об анализе
+        if hf_result.get("sentiment_score"):
+            key_points.append(f"Тональность: {hf_result['sentiment']} ({hf_result['sentiment_score']:.2f})")
         
-        # Пытаемся извлечь JSON
-        try:
-            json_start = result_text.find('{')
-            json_end = result_text.rfind('}') + 1
-            if json_start != -1 and json_end != 0:
-                analysis_result = json.loads(result_text[json_start:json_end])
-            else:
-                analysis_result = {
-                    "summary": result_text[:200] + "..." if len(result_text) > 200 else result_text,
-                    "themes": "Основные темы",
-                    "sentiment": "Нейтральный",
-                    "writing_style": "Информационный",
-                    "key_points": ["Ключевая информация"],
-                    "characters": []
-                }
-        except:
-            analysis_result = {
-                "summary": result_text[:200] + "..." if len(result_text) > 200 else result_text,
-                "themes": "Основные темы",
-                "sentiment": "Нейтральный",
-                "writing_style": "Информационный",
-                "key_points": ["Ключевая информация"],
-                "characters": []
-            }
+        if hf_result.get("entities"):
+            entity_count = len(hf_result["entities"])
+            key_points.append(f"Обнаружено сущностей: {entity_count}")
         
-        analysis_result.update({
+        # Формируем персонажей из NER сущностей
+        characters = []
+        if hf_result.get("entities"):
+            for entity in hf_result["entities"][:5]:  # Берем только первые 5
+                if entity.get("entity") in ["PER", "ORG", "LOC"]:
+                    characters.append({
+                        "name": entity.get("word", "Неизвестно"),
+                        "type": entity.get("entity", "PER"),
+                        "role": "Персонаж" if entity["entity"] == "PER" else 
+                               "Организация" if entity["entity"] == "ORG" else 
+                               "Локация"
+                    })
+        
+        result = {
             "document_id": document_id,
-            "model_used": GEMINI_MODEL,
-            "ai_analysis": True,
-            "fallback": False,
+            "summary": hf_result.get("summary", "Нет данных"),
+            "themes": hf_result.get("themes", "Документ, Текст, Информация"),
+            "sentiment": hf_result.get("sentiment", "Нейтральный"),
+            "writing_style": "Академический" if doc['word_count'] > 1000 else "Информационный",
+            "key_points": key_points,
+            "characters": characters if characters else [],
+            "ai_analysis": hf_result.get("ai_analysis", False),
+            "fallback": hf_result.get("fallback", True),
+            "model_used": hf_result.get("model_used", []),
+            "ai_provider": "huggingface",
+            "ai_status": "available" if hf_result.get("ai_analysis") else "fallback",
             "created_at": datetime.now().isoformat()
-        })
+        }
         
-        return analysis_result
+        return result
         
     except Exception as e:
-        logger.error(f"Gemini analysis error: {e}")
+        logger.error(f"AI analysis error: {e}")
         return {
             "document_id": request.document_id,
             "summary": f"Ошибка анализа: {str(e)[:100]}",
@@ -586,6 +748,8 @@ async def analyze_with_gemini(request: GeminiAnalysisRequest):
             "characters": [],
             "ai_analysis": False,
             "fallback": True,
+            "ai_provider": "huggingface",
+            "ai_status": "error",
             "created_at": datetime.now().isoformat()
         }
 
@@ -641,7 +805,9 @@ async def analyze_document(request: AnalysisRequest):
             "characters": [],
             "analysis_date": datetime.now().isoformat(),
             "ai_analysis": False,
-            "fallback": False
+            "fallback": False,
+            "ai_provider": "basic",
+            "ai_status": "not_used"
         }
         
     except Exception as e:
@@ -711,7 +877,7 @@ if __name__ == "__main__":
     logger.info(f"🚀 Starting Versevo Backend v5.0 on port {PORT}")
     logger.info(f"📁 Upload folder: {os.path.abspath(UPLOAD_FOLDER)}")
     logger.info(f"🔤 Translation: Simple Dictionary")
-    logger.info(f"🤖 Gemini AI Analysis: {'ENABLED' if GEMINI_ENABLED else 'DISABLED'}")
+    logger.info(f"🤖 Hugging Face AI Analysis: {'ENABLED' if HUGGING_FACE_ENABLED else 'DISABLED'}")
     
     uvicorn.run(
         app, 
