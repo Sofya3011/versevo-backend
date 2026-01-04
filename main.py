@@ -213,53 +213,13 @@ def detect_chapters(text: str) -> List[Dict]:
     
     return chapters
 
-def _fallback_translation(text: str, source_lang: str, target_lang: str) -> str:
-    """Fallback перевод когда API недоступен"""
-    # Простой словарь для демо
-    simple_dict = {
-        ('en', 'ru'): {
-            'hello': 'привет',
-            'world': 'мир',
-            'book': 'книга',
-            'read': 'читать',
-            'translate': 'переводить',
-            'document': 'документ',
-            'text': 'текст',
-            'chapter': 'глава',
-            'page': 'страница',
-            'library': 'библиотека',
-        }
-    }
-    
-    # Если у нас есть перевод для этой пары языков
-    if (source_lang, target_lang) in simple_dict:
-        words = text.lower().split()
-        translated_words = []
-        
-        for word in words:
-            clean_word = ''.join(c for c in word if c.isalpha())
-            if clean_word in simple_dict[(source_lang, target_lang)]:
-                translated_words.append(simple_dict[(source_lang, target_lang)][clean_word])
-            else:
-                translated_words.append(word)
-        
-        return " ".join(translated_words)
-    else:
-        # Просто возвращаем текст с пометкой
-        return f"[ПЕРЕВОД НЕДОСТУПЕН] {text}"
-
-# Обновленная функция перевода
 def translate_with_huggingface(text: str, source_lang: str, target_lang: str) -> str:
     """Перевод через Hugging Face с альтернативной моделью"""
     try:
-        # Используем более новую модель которая точно работает
-        # Модель Helsinki-NLP/opus-mt-en-ru для английского->русского
-        # Или многоязычные модели
-        
+        # Используем модель Helsinki-NLP/opus-mt-en-ru для английского->русского
         model_mapping = {
             ('en', 'ru'): 'Helsinki-NLP/opus-mt-en-ru',
             ('ru', 'en'): 'Helsinki-NLP/opus-mt-ru-en',
-            # Добавьте другие языковые пары по мере необходимости
         }
         
         model_key = (source_lang, target_lang)
@@ -332,6 +292,41 @@ def translate_with_huggingface(text: str, source_lang: str, target_lang: str) ->
     except Exception as e:
         logger.error(f"Translation error: {e}")
         return _fallback_translation(text, source_lang, target_lang)
+
+def _fallback_translation(text: str, source_lang: str, target_lang: str) -> str:
+    """Fallback перевод когда API недоступен"""
+    # Простой словарь для демо
+    simple_dict = {
+        ('en', 'ru'): {
+            'hello': 'привет',
+            'world': 'мир',
+            'book': 'книга',
+            'read': 'читать',
+            'translate': 'переводить',
+            'document': 'документ',
+            'text': 'текст',
+            'chapter': 'глава',
+            'page': 'страница',
+            'library': 'библиотека',
+        }
+    }
+    
+    # Если у нас есть перевод для этой пары языков
+    if (source_lang, target_lang) in simple_dict:
+        words = text.lower().split()
+        translated_words = []
+        
+        for word in words:
+            clean_word = ''.join(c for c in word if c.isalpha())
+            if clean_word in simple_dict[(source_lang, target_lang)]:
+                translated_words.append(simple_dict[(source_lang, target_lang)][clean_word])
+            else:
+                translated_words.append(word)
+        
+        return " ".join(translated_words)
+    else:
+        # Просто возвращаем текст с пометкой
+        return f"[ПЕРЕВОД НЕДОСТУПЕН] {text}"
 
 # ========== HEALTH CHECK ENDPOINTS ==========
 @app.get("/")
@@ -541,9 +536,9 @@ async def get_documents(user_id: Optional[int] = None):
         {
             "id": d["id"],
             "filename": d["filename"],
-            "content": d["content"],  # ДОБАВЬТЕ ЭТО!
+            "content": d["content"],
             "language": d["language"],
-            "file_type": d["file_type"],  # ВАЖНО: используйте file_type вместо fileType
+            "file_type": d["file_type"],
             "file_size": d["file_size"],
             "word_count": d["word_count"],
             "char_count": d["char_count"],
@@ -552,8 +547,8 @@ async def get_documents(user_id: Optional[int] = None):
             "created_at": d["created_at"],
             "updated_at": d["updated_at"],
             "content_preview": d["content"][:200] + "..." if len(d["content"]) > 200 else d["content"],
-            "chapters": d["chapters"],  # ДОБАВЬТЕ ЭТО
-            "metadata": d.get("metadata", {})  # ДОБАВЬТЕ ЭТО
+            "chapters": d["chapters"],
+            "metadata": d.get("metadata", {})
         }
         for d in sorted(docs, key=lambda x: x["created_at"], reverse=True)
     ]
@@ -687,7 +682,6 @@ async def translate_document(document_id: int, target_language: str = "ru"):
         logger.error(f"Document translation error: {e}")
         raise HTTPException(status_code=500, detail=f"Document translation failed: {str(e)}")
 
-# Тестовый endpoint для Helloinki модели
 @app.post("/api/translate/helloinki")
 async def translate_with_helloinki(request: TranslateRequest):
     """Тестовый перевод через Helloinki-NLP модель"""
@@ -755,7 +749,6 @@ async def translate_with_helloinki(request: TranslateRequest):
         logger.error(f"Helloinki translation error: {e}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
-# Проверка статуса моделей
 @app.get("/api/translate/models/status")
 async def check_model_status():
     """Проверка статуса моделей перевода"""
