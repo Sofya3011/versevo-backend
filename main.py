@@ -507,7 +507,15 @@ async def root():
         "timestamp": datetime.now().isoformat(),
         "endpoints": endpoints
     }
-
+@app.get("/api/flutter/health")
+async def flutter_health_check():
+    """Эндпоинт для healthcheck Railway/Flutter"""
+    return {
+        "status": "healthy", 
+        "service": "versevo-backend",
+        "timestamp": datetime.now().isoformat(),
+        "version": "5.0.0"
+    }
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint"""
