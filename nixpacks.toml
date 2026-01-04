@@ -1,0 +1,16 @@
+[phases.setup]
+nixPkgs = ["python311", "git", "gcc", "gfortran", "blas", "lapack"]
+
+[phases.install]
+commands = [
+    "pip install --upgrade pip setuptools wheel",
+    "pip install -r requirements.txt --no-cache-dir"
+]
+
+[phases.build]
+commands = [
+    "echo '🚀 Установка зависимостей завершена'"
+]
+
+[start]
+cmd = "python main.py"
