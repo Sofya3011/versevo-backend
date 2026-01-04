@@ -80,6 +80,25 @@ class LocalTranslator:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"🚀 Используем устройство: {self.device}")
         
+        # Предзагружаем основные модели
+        self._preload_models()
+    
+    def _preload_models(self):
+        """Предварительная загрузка моделей в фоновом режиме"""
+        import threading
+        
+        def load_model():
+            try:
+                logger.info("🔄 Фоновая загрузка моделей переводчика...")
+                # Предзагружаем самую частую модель
+                self.get_translator("en", "ru")
+                logger.info("✅ Модели предзагружены")
+            except Exception as e:
+                logger.error(f"❌ Ошибка предзагрузки моделей: {e}")
+        
+        # Запускаем в отдельном потоке чтобы не блокировать старт приложения
+        thread = threading.Thread(target=load_model, daemon=True)
+        thread.start()
     def get_translator(self, source_lang: str, target_lang: str):
         """Получить или создать переводчик для языковой пары"""
         key = f"{source_lang}-{target_lang}"
@@ -411,7 +430,16 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "version": "3.0.0"
     }
-
+@app.get("/api/flutter/health")
+async def health_check_flutter():
+    """Health check для Flutter/Railway"""
+    return {
+        "status": "healthy", 
+        "service": "versevo-backend", 
+        "timestamp": datetime.now().isoformat(),
+        "translation": "local_transformers",
+        "version": "3.0.0"
+    }
 @app.get("/health")
 async def health_check_simple():
     """Простой health check"""
