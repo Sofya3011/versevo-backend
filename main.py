@@ -18,7 +18,8 @@ from collections import Counter
 import torch
 
 # Gemini импорт
-import google.generativeai as genailogging.basicConfig(
+import google.generativeai as genai
+logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
