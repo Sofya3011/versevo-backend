@@ -492,7 +492,66 @@ async def root():
         "timestamp": datetime.now().isoformat(),
         "endpoints": endpoints
     }
-
+# Добавить в main.py в раздел "ДОКУМЕНТЫ" или "АНАЛИЗ"
+@app.get("/api/documents/{document_id}/quotes")
+async def get_document_quotes(document_id: int, limit: int = 5):
+    """Получение цитат из документа"""
+    try:
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        doc = documents_store[document_id]
+        content = doc["content"]
+        
+        if not content or len(content.strip()) < 10:
+            return {
+                "quotes": ["Текст документа пустой"],
+                "count": 1,
+                "ai_analysis": False,
+                "fallback": True
+            }
+        
+        # Простой алгоритм извлечения предложений
+        import re
+        sentences = re.split(r'(?<=[.!?])\s+', content)
+        
+        # Фильтруем длинные предложения
+        quotes = []
+        for sentence in sentences:
+            if 20 < len(sentence) < 200:  # Подходящая длина для цитаты
+                quotes.append(sentence.strip())
+                if len(quotes) >= limit:
+                    break
+        
+        # Если не нашли подходящих предложений, берем первые строки
+        if not quotes:
+            lines = content.split('\n')
+            for line in lines:
+                if 10 < len(line.strip()) < 150:
+                    quotes.append(line.strip())
+                    if len(quotes) >= limit:
+                        break
+        
+        return {
+            "document_id": document_id,
+            "quotes": quotes[:limit],
+            "count": len(quotes),
+            "ai_analysis": False,
+            "fallback": False
+        }
+        
+    except Exception as e:
+        logger.error(f"Get quotes error: {e}")
+        return {
+            "quotes": [
+                "Цитаты временно недоступны",
+                "Произошла ошибка при обработке"
+            ],
+            "count": 2,
+            "ai_analysis": False,
+            "error": str(e),
+            "fallback": True
+        }
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint"""
