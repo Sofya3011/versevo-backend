@@ -7,32 +7,32 @@ psutil==5.9.7
 # === FILE PROCESSING ===
 python-docx==1.1.0
 PyMuPDF==1.23.8
-numpy==1.26.4  # Обновлена версия для совместимости
+numpy==1.26.4
 
 # === UTILS ===
 requests==2.31.0
 aiofiles==23.2.1
 langdetect==1.0.9
-torch==2.2.1  # Обновлена версия для совместимости
-transformers==4.36.2  # Обновлена версия для совместимости
+torch==2.2.1
+transformers==4.36.2
 sentencepiece==0.1.99
 protobuf==3.20.3
 
 # === AUTH ===
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-# УДАЛЕНО ДУБЛИРОВАНИЕ: uvicorn[standard]==0.24.0
 pydantic==2.5.0
 python-dotenv==1.0.0
-google-generativeai==0.8.4  # Конкретная версия вместо >=
+google-generativeai==0.8.4
 
 # === DATABASE ===
 asyncpg==0.29.0
 sqlalchemy==2.0.23
 alembic==1.13.1
 psycopg2-binary==2.9.9
-databases[postgresql]==0.7.0  # Понижена версия для совместимости с SQLAlchemy 2.0
+# databases УДАЛЕН - несовместим с SQLAlchemy 2.x
 pydantic-settings==2.1.0
 
-# === OPTIONAL: for async SQLAlchemy ===
-# УДАЛЕНО ДУБЛИРОВАНИЕ: sqlalchemy[asyncio]==2.0.23 - это уже включено в sqlalchemy==2.0.23
+# === ФИКС ДЛЯ databases: используем новую версию или альтернативу ===
+# databases==0.8.2  # Новая версия, совместимая с SQLAlchemy 2.x
+# ИЛИ используем asyncpg напрямую без databases
