@@ -1,70 +1,63 @@
-# database.py
+# database.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
 import os
-from typing import Optional
-from sqlalchemy import create_engine, MetaData
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from contextlib import asynccontextmanager
-import databases
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.exc import SQLAlchemyError
+import logging
 
-# Получаем URL из переменных окружения Railway
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Если Railway предоставляет URL с postgres://, меняем на postgresql://
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# ВАША СТРОКА ПОДКЛЮЧЕНИЯ K Railway
+DATABASE_URL = "postgresql://postgres:BQIGEvhzTcTvyCSYqzLtcMOMjzlVjUQg@shinkansen.proxy.rlwy.net:48342/railway"
 
-# Для асинхронного подключения
-ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1) if DATABASE_URL else None
+# Также проверяем переменные окружения на Railway
+if os.getenv('DATABASE_URL'):
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    logger.info("✅ Используем DATABASE_URL из переменных окружения")
 
-# Создаем движок для асинхронной работы
-engine = create_async_engine(ASYNC_DATABASE_URL, echo=True, future=True)
+# Преобразуем для SQLAlchemy если нужно
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
 
-# Для синхронных операций (если нужно)
-sync_engine = create_engine(DATABASE_URL) if DATABASE_URL else None
+logger.info(f"🔗 Подключаемся к PostgreSQL")
 
-# Создаем фабрику сессий
-AsyncSessionLocal = sessionmaker(
-    bind=engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autocommit=False,
-    autoflush=False,
-)
+# Создаем engine с настройками для Railway
+try:
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=10,
+        max_overflow=5,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        connect_args={
+            'connect_timeout': 10,
+            'keepalives': 1,
+            'keepalives_idle': 30,
+            'keepalives_interval': 10,
+            'keepalives_count': 5,
+        },
+        echo=False
+    )
+    
+    # Тестируем подключение
+    with engine.connect() as conn:
+        result = conn.execute("SELECT version()")
+        logger.info(f"✅ PostgreSQL подключен: {result.fetchone()[0][:50]}...")
+        
+except Exception as e:
+    logger.error(f"❌ Ошибка подключения к PostgreSQL: {e}")
+    raise
 
-# Базовый класс для моделей
+# Создаем сессию
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# databases для простых запросов
-database = databases.Database(ASYNC_DATABASE_URL) if ASYNC_DATABASE_URL else None
-
-# Dependency для FastAPI
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
-
-# Менеджер контекста
-@asynccontextmanager
-async def get_db_context():
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
-
-async def init_db():
-    """Инициализация базы данных (создание таблиц)"""
-    async with engine.begin() as conn:
-        # Создаем все таблицы
-        await conn.run_sync(Base.metadata.create_all)
-    print("✅ База данных инициализирована")
-
-async def close_db():
-    """Закрытие соединений с БД"""
-    await engine.dispose()
-    if database:
-        await database.disconnect()
+# Dependency для получения сессии БД
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
