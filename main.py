@@ -1,5 +1,5 @@
-# main.py - Бэкенд Versevo с Hugging Face AI
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+# main.py - Бэкенд Versevo с PostgreSQL и Hugging Face AI
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -15,6 +15,11 @@ import json
 from datetime import datetime
 from collections import Counter
 from enum import Enum
+from sqlalchemy.orm import Session
+
+# Импортируем настройки БД
+from database import get_db, SessionLocal
+from models import User, Document, DocumentNote, ReadingProgress, DocumentAnalysis, FavoriteQuote, TranslationCache
 
 # Настройка логирования
 logging.basicConfig(
@@ -40,6 +45,22 @@ class AIAnalysisRequest(BaseModel):
     analysis_type: str = "full"
     language: str = "ru"
 
+class DocumentCreate(BaseModel):
+    title: str
+    filename: str
+    content: str
+    user_id: int
+    language: str = "en"
+    file_type: str = "txt"
+
+class NoteCreate(BaseModel):
+    document_id: int
+    user_id: int
+    text: str
+    selected_text: Optional[str] = None
+    chapter_index: int = 0
+    is_highlight: bool = False
+
 class AnalysisType(str, Enum):
     QUICK = "quick"
     STANDARD = "standard"
@@ -50,7 +71,7 @@ class AnalysisType(str, Enum):
 app = FastAPI(
     title="Versevo Backend API",
     description="Modern document reader with translation and AI features",
-    version="5.0.0"
+    version="6.0.0"
 )
 
 # CORS
@@ -81,7 +102,7 @@ except Exception as e:
 # ========== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ==========
 PORT = int(os.getenv("PORT", 8080))
 
-# Хранилище документов в памяти
+# Хранилище документов в памяти (для совместимости со старыми эндпоинтами)
 documents_store = {}
 current_doc_id = 1
 
@@ -484,7 +505,7 @@ def init_huggingface_for_analysis():
 
 # Инициализируем компоненты
 logger.info("=" * 60)
-logger.info("🚀 ИНИЦИАЛИЗАЦИЯ VERSION 5.0")
+logger.info("🚀 ИНИЦИАЛИЗАЦИЯ VERSION 6.0")
 logger.info("=" * 60)
 
 # Инициализируем переводчики
@@ -695,22 +716,250 @@ def detect_chapters(text: str) -> List[Dict]:
     
     return chapters
 
+# ========== НОВЫЕ ЭНДПОИНТЫ ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ ==========
+
+@app.get("/api/db/health")
+async def db_health(db: Session = Depends(get_db)):
+    """Проверка здоровья БД"""
+    try:
+        # Простой запрос для проверки
+        result = db.execute("SELECT 1")
+        return {
+            "status": "healthy",
+            "database": "PostgreSQL",
+            "connected": True,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+@app.post("/api/db/documents", response_model=dict)
+async def create_document(
+    document: DocumentCreate,
+    db: Session = Depends(get_db)
+):
+    """Создание документа в БД"""
+    try:
+        # Определяем главы
+        chapters = detect_chapters(document.content)
+        
+        db_document = Document(
+            title=document.title,
+            filename=document.filename,
+            content=document.content,
+            language=document.language,
+            file_type=document.file_type,
+            user_id=document.user_id,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+            word_count=len(document.content.split()),
+            char_count=len(document.content),
+            chapter_count=len(chapters),
+            reading_time_minutes=max(1, len(document.content.split()) // 200),
+            chapters=chapters,
+            metadata={"source": "web_upload"}
+        )
+        db.add(db_document)
+        db.commit()
+        db.refresh(db_document)
+        
+        return {
+            "id": db_document.id,
+            "title": db_document.title,
+            "filename": db_document.filename,
+            "message": "Document created successfully"
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Ошибка создания документа: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create document: {str(e)}")
+
+@app.get("/api/db/documents", response_model=List[dict])
+async def get_documents_db(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """Получение документов из БД"""
+    documents = db.query(Document).order_by(Document.created_at.desc()).offset(skip).limit(limit).all()
+    
+    return [
+        {
+            "id": doc.id,
+            "title": doc.title,
+            "filename": doc.filename,
+            "language": doc.language,
+            "file_type": doc.file_type,
+            "word_count": doc.word_count,
+            "char_count": doc.char_count,
+            "chapter_count": doc.chapter_count,
+            "reading_time_minutes": doc.reading_time_minutes,
+            "created_at": doc.created_at.isoformat() if doc.created_at else None,
+            "updated_at": doc.updated_at.isoformat() if doc.updated_at else None
+        }
+        for doc in documents
+    ]
+
+@app.get("/api/db/documents/{document_id}")
+async def get_document_db(document_id: int, db: Session = Depends(get_db)):
+    """Получение документа по ID из БД"""
+    document = db.query(Document).filter(Document.id == document_id).first()
+    
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    return {
+        "id": document.id,
+        "title": document.title,
+        "filename": document.filename,
+        "content": document.content,
+        "language": document.language,
+        "file_type": document.file_type,
+        "word_count": document.word_count,
+        "char_count": document.char_count,
+        "chapter_count": document.chapter_count,
+        "reading_time_minutes": document.reading_time_minutes,
+        "created_at": document.created_at.isoformat() if document.created_at else None,
+        "chapters": document.chapters if document.chapters else [],
+        "metadata": document.metadata if document.metadata else {}
+    }
+
+@app.post("/api/db/notes")
+async def create_note(
+    note: NoteCreate,
+    db: Session = Depends(get_db)
+):
+    """Создание заметки"""
+    try:
+        db_note = DocumentNote(
+            document_id=note.document_id,
+            user_id=note.user_id,
+            text=note.text,
+            selected_text=note.selected_text,
+            chapter_index=note.chapter_index,
+            is_highlight=note.is_highlight,
+            created_at=datetime.utcnow()
+        )
+        db.add(db_note)
+        db.commit()
+        db.refresh(db_note)
+        return {"id": db_note.id, "message": "Note created"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/db/documents/{document_id}/notes")
+async def get_document_notes_db(
+    document_id: int,
+    db: Session = Depends(get_db)
+):
+    """Получение заметок документа"""
+    notes = db.query(DocumentNote).filter(
+        DocumentNote.document_id == document_id
+    ).order_by(DocumentNote.created_at.desc()).all()
+    
+    return [
+        {
+            "id": note.id,
+            "text": note.text,
+            "selected_text": note.selected_text,
+            "chapter_index": note.chapter_index,
+            "is_highlight": note.is_highlight,
+            "color": note.color,
+            "created_at": note.created_at.isoformat() if note.created_at else None
+        }
+        for note in notes
+    ]
+
+@app.post("/api/db/progress")
+async def update_reading_progress(
+    progress_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Обновление прогресса чтения"""
+    try:
+        document_id = progress_data.get('document_id')
+        user_id = progress_data.get('user_id')
+        
+        # Проверяем, существует ли уже запись
+        existing = db.query(ReadingProgress).filter(
+            ReadingProgress.document_id == document_id,
+            ReadingProgress.user_id == user_id
+        ).first()
+        
+        if existing:
+            # Обновляем существующую запись
+            existing.chapter_index = progress_data.get('chapter_index', existing.chapter_index)
+            existing.scroll_position = progress_data.get('scroll_position', existing.scroll_position)
+            existing.percentage = progress_data.get('percentage', existing.percentage)
+            existing.last_read_at = datetime.utcnow()
+            existing.updated_at = datetime.utcnow()
+        else:
+            # Создаем новую запись
+            db_progress = ReadingProgress(
+                document_id=document_id,
+                user_id=user_id,
+                chapter_index=progress_data.get('chapter_index', 0),
+                scroll_position=progress_data.get('scroll_position', 0.0),
+                percentage=progress_data.get('percentage', 0.0),
+                last_read_at=datetime.utcnow(),
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            db.add(db_progress)
+        
+        db.commit()
+        return {"status": "success", "message": "Progress updated"}
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/db/users/{user_id}/progress")
+async def get_user_progress(
+    user_id: int,
+    db: Session = Depends(get_db)
+):
+    """Получение прогресса пользователя"""
+    progress_records = db.query(ReadingProgress).filter(
+        ReadingProgress.user_id == user_id
+    ).all()
+    
+    return [
+        {
+            "document_id": progress.document_id,
+            "chapter_index": progress.chapter_index,
+            "percentage": progress.percentage,
+            "last_read_at": progress.last_read_at.isoformat() if progress.last_read_at else None
+        }
+        for progress in progress_records
+    ]
+
 # ========== HEALTH CHECK ENDPOINTS ==========
 @app.get("/")
 async def root():
     """Корневой эндпоинт"""
     endpoints = {
         "health": "/api/health",
+        "db_health": "/api/db/health",
         "upload": "/api/documents/upload-base64",
         "documents": "/api/documents",
+        "db_documents": "/api/db/documents",
         "translate": "/api/translate/text",
         "analyze": "/api/analyze",
+        "notes": "/api/db/notes",
+        "progress": "/api/db/progress",
     }
     
     return {
-        "message": "Versevo Backend API v5.0",
-        "version": "5.0.0",
+        "message": "Versevo Backend API v6.0",
+        "version": "6.0.0",
         "status": "running",
+        "database": "PostgreSQL",
         "translation": {
             "huggingface_available": hf_translator.is_available('en', 'ru'),
             "fallback_available": True
@@ -729,11 +978,13 @@ async def flutter_health_check():
     return {
         "status": "healthy", 
         "service": "versevo-backend",
+        "database": "PostgreSQL",
         "timestamp": datetime.now().isoformat(),
-        "version": "5.0.0",
+        "version": "6.0.0",
         "features": {
             "translation": "huggingface+fallback",
-            "analysis": "huggingface+nltk+basic"
+            "analysis": "huggingface+nltk+basic",
+            "database": "postgresql"
         }
     }
 
@@ -743,6 +994,7 @@ async def health_check():
     return {
         "status": "healthy", 
         "service": "versevo-backend", 
+        "database": "PostgreSQL",
         "translation": {
             "huggingface": hf_translator.is_available('en', 'ru'),
             "fallback": True
@@ -752,10 +1004,10 @@ async def health_check():
             "nltk": NLTK_AVAILABLE
         },
         "timestamp": datetime.now().isoformat(),
-        "version": "5.0.0"
+        "version": "6.0.0"
     }
 
-# ========== ДОКУМЕНТЫ ==========
+# ========== ДОКУМЕНТЫ (СТАРЫЕ ЭНДПОИНТЫ ДЛЯ СОВМЕСТИМОСТИ) ==========
 @app.post("/api/documents/upload-base64")
 async def upload_document_base64(request: dict):
     """Загрузка документа в формате base64"""
@@ -1051,7 +1303,7 @@ def _perform_basic_analysis(text: str) -> Dict[str, Any]:
         result["key_points"] = ["Не удалось выполнить анализ"]
     
     return result
-# В main.py добавь:
+
 @app.delete("/api/documents/{document_id}")
 async def delete_document(document_id: int):
     """Удаление документа"""
@@ -1081,6 +1333,7 @@ async def delete_document(document_id: int):
     except Exception as e:
         logger.error(f"❌ Ошибка удаления документа: {e}")
         raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+
 # ========== УЛУЧШЕННЫЙ AI АНАЛИЗ ==========
 def _perform_ai_analysis(text: str) -> Dict[str, Any]:
     """Улучшенный AI анализ текста через Hugging Face"""
@@ -1572,10 +1825,11 @@ if __name__ == "__main__":
     import uvicorn
     
     logger.info(f"{'='*60}")
-    logger.info(f"🚀 ЗАПУСК VERSION 5.0 НА ПОРТУ {PORT}")
+    logger.info(f"🚀 ЗАПУСК VERSION 6.0 НА ПОРТУ {PORT}")
     logger.info(f"{'='*60}")
     logger.info(f"📁 Папка загрузок: {os.path.abspath(UPLOAD_FOLDER)}")
     logger.info(f"🔤 Перевод: Hugging Face + Fallback")
+    logger.info(f"🗄️  База данных: PostgreSQL (Railway)")
     logger.info(f"🤖 Hugging Face перевод: {'ДОСТУПЕН' if hf_translator.is_available('en', 'ru') else 'НЕ ДОСТУПЕН'}")
     logger.info(f"📊 Hugging Face анализ: {'ДОСТУПЕН' if HUGGING_FACE_ENABLED else 'НЕ ДОСТУПЕН'}")
     logger.info(f"📈 NLTK анализ: {'ДОСТУПЕН' if NLTK_AVAILABLE else 'НЕ ДОСТУПЕН'}")
