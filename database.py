@@ -1,6 +1,6 @@
-# database.py
+# database.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text  # <-- ДОБАВЬТЕ text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import SQLAlchemyError
 import logging
@@ -9,7 +9,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ВАША СТРОКА ПОДКЛЮЧЕНИЯ K Railway
+# ВАША СТРОКА ПОДКЛЮЧЕНИЯ
 DATABASE_URL = "postgresql://postgres:BQIGEvhzTcTvyCSYqzLtcMOMjzlVjUQg@shinkansen.proxy.rlwy.net:48342/railway"
 
 # Также проверяем переменные окружения на Railway
@@ -41,9 +41,11 @@ try:
         echo=False
     )
     
-    # Тестируем подключение
+    # Тестируем подключение - ИСПРАВЛЕННАЯ СТРОКА
     with engine.connect() as conn:
-        result = conn.execute("SELECT version()")
+        # БЫЛО: result = conn.execute("SELECT version()")
+        # СТАЛО: используем text()
+        result = conn.execute(text("SELECT version()"))  # <-- ИСПРАВЛЕНО
         logger.info(f"✅ PostgreSQL подключен: {result.fetchone()[0][:50]}...")
         
 except Exception as e:
@@ -61,4 +63,3 @@ def get_db():
         yield db
     finally:
         db.close()
-        
