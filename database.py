@@ -1,48 +1,64 @@
-# database.py - АСИНХРОННАЯ ВЕРСИЯ (без databases)
+# database.py
 import os
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.exc import SQLAlchemyError
 import logging
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ВАША СТРОКА ПОДКЛЮЧЕНИЯ
+# ВАША СТРОКА ПОДКЛЮЧЕНИЯ K Railway
 DATABASE_URL = "postgresql://postgres:BQIGEvhzTcTvyCSYqzLtcMOMjzlVjUQg@shinkansen.proxy.rlwy.net:48342/railway"
 
-# Для asyncpg нужно использовать asyncpg://
+# Также проверяем переменные окружения на Railway
+if os.getenv('DATABASE_URL'):
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    logger.info("✅ Используем DATABASE_URL из переменных окружения")
+
+# Преобразуем для SQLAlchemy если нужно
 if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
 
-logger.info(f"🔗 Подключаемся к PostgreSQL (асинхронно)")
+logger.info(f"🔗 Подключаемся к PostgreSQL")
 
-# Создаем асинхронный engine
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_size=10,
-    max_overflow=5,
-    pool_pre_ping=True
-)
+# Создаем engine с настройками для Railway
+try:
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=10,
+        max_overflow=5,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        connect_args={
+            'connect_timeout': 10,
+            'keepalives': 1,
+            'keepalives_idle': 30,
+            'keepalives_interval': 10,
+            'keepalives_count': 5,
+        },
+        echo=False
+    )
+    
+    # Тестируем подключение
+    with engine.connect() as conn:
+        result = conn.execute("SELECT version()")
+        logger.info(f"✅ PostgreSQL подключен: {result.fetchone()[0][:50]}...")
+        
+except Exception as e:
+    logger.error(f"❌ Ошибка подключения к PostgreSQL: {e}")
+    raise
 
-# Создаем асинхронную сессию
-AsyncSessionLocal = sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False
-)
-
+# Создаем сессию
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Dependency для получения асинхронной сессии БД
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+# Dependency для получения сессии БД
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+        
