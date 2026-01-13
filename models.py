@@ -2,7 +2,6 @@
 from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, Float, JSON
 from sqlalchemy.orm import relationship
 from datetime import datetime
-import uuid
 from database import Base
 
 class User(Base):
@@ -19,9 +18,9 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     
     # Связи
-    documents = relationship("Document", back_populates="user")
-    notes = relationship("DocumentNote", back_populates="user")
-    reading_progress = relationship("ReadingProgress", back_populates="user")
+    documents = relationship("Document", back_populates="user", cascade="all, delete-orphan")
+    notes = relationship("DocumentNote", back_populates="user", cascade="all, delete-orphan")
+    reading_progress = relationship("ReadingProgress", back_populates="user", cascade="all, delete-orphan")
 
 class Document(Base):
     """Модель документа"""
@@ -32,10 +31,10 @@ class Document(Base):
     title = Column(String(500), nullable=False)
     filename = Column(String(500), nullable=False)
     original_filename = Column(String(500), nullable=False)
-    file_type = Column(String(50), nullable=False)  # pdf, txt, docx, epub
+    file_type = Column(String(50), nullable=False)
     file_path = Column(String(1000), nullable=True)
-    file_size = Column(Integer, default=0)  # в байтах
-    file_hash = Column(String(64), unique=True, index=True)  # для избежания дубликатов
+    file_size = Column(Integer, default=0)
+    file_hash = Column(String(64), nullable=True)
     
     content = Column(Text, nullable=True)
     translated_content = Column(Text, nullable=True)
@@ -48,8 +47,8 @@ class Document(Base):
     reading_time_minutes = Column(Integer, default=0)
     
     # Метаданные
-    metadata = Column(JSON, nullable=True, default=dict)  # автор, год и т.д.
-    chapters = Column(JSON, nullable=True, default=list)  # список глав
+    metadata = Column(JSON, nullable=True, default=dict)
+    chapters = Column(JSON, nullable=True, default=list)
     
     # Системные поля
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -58,9 +57,8 @@ class Document(Base):
     
     # Связи
     user = relationship("User", back_populates="documents")
-    notes = relationship("DocumentNote", back_populates="document")
-    reading_progress = relationship("ReadingProgress", back_populates="document")
-    analyses = relationship("DocumentAnalysis", back_populates="document")
+    notes = relationship("DocumentNote", back_populates="document", cascade="all, delete-orphan")
+    reading_progress = relationship("ReadingProgress", back_populates="document", cascade="all, delete-orphan")
 
 class DocumentNote(Base):
     """Модель заметки к документу"""
@@ -71,16 +69,13 @@ class DocumentNote(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     chapter_index = Column(Integer, default=0)
     
-    # Текст заметки
     text = Column(Text, nullable=False)
-    selected_text = Column(Text, nullable=True)  # выделенный текст
-    text_position = Column(Integer, nullable=True)  # позиция в тексте
+    selected_text = Column(Text, nullable=True)
+    text_position = Column(Integer, nullable=True)
     
-    # Стили
-    color = Column(String(20), default="yellow")  # hex цвет или название
+    color = Column(String(20), default="yellow")
     is_highlight = Column(Boolean, default=False)
     
-    # Системные поля
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -97,8 +92,8 @@ class ReadingProgress(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     
     chapter_index = Column(Integer, default=0)
-    scroll_position = Column(Float, default=0.0)  # позиция скролла
-    percentage = Column(Float, default=0.0)  # процент прочтения
+    scroll_position = Column(Float, default=0.0)
+    percentage = Column(Float, default=0.0)
     
     last_read_at = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -115,7 +110,6 @@ class DocumentAnalysis(Base):
     id = Column(Integer, primary_key=True, index=True)
     document_id = Column(Integer, ForeignKey("documents.id"), nullable=False)
     
-    # Результаты анализа
     summary = Column(Text, nullable=True)
     themes = Column(JSON, nullable=True, default=list)
     sentiment = Column(String(50), nullable=True)
@@ -124,25 +118,21 @@ class DocumentAnalysis(Base):
     characters = Column(JSON, nullable=True, default=list)
     entities = Column(JSON, nullable=True, default=list)
     
-    # Статистика
     statistics = Column(JSON, nullable=True, default=dict)
     language_features = Column(JSON, nullable=True, default=dict)
     
-    # Метрики
-    analysis_type = Column(String(50), default="full")  # quick, standard, detailed, full
-    ai_provider = Column(String(50), nullable=True)  # huggingface, gemini, openai, basic
+    analysis_type = Column(String(50), default="full")
+    ai_provider = Column(String(50), nullable=True)
     ai_analysis = Column(Boolean, default=False)
     
-    # Кэширование
     is_cached = Column(Boolean, default=True)
-    cache_key = Column(String(255), unique=True, index=True)
+    cache_key = Column(String(255), nullable=True)
     
-    # Системные поля
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Связи
-    document = relationship("Document", back_populates="analyses")
+    document = relationship("Document")
 
 class FavoriteQuote(Base):
     """Модель избранных цитат"""
@@ -168,7 +158,7 @@ class FavoriteQuote(Base):
     user = relationship("User")
 
 class TranslationCache(Base):
-    """Кэш переводов для производительности"""
+    """Кэш переводов"""
     __tablename__ = "translation_cache"
     
     id = Column(Integer, primary_key=True, index=True)
@@ -180,9 +170,8 @@ class TranslationCache(Base):
     target_language = Column(String(10), nullable=False)
     style = Column(String(50), default="artistic")
     
-    # Статистика использования
     hit_count = Column(Integer, default=0)
     last_accessed = Column(DateTime, default=datetime.utcnow)
     
     created_at = Column(DateTime, default=datetime.utcnow)
-    expires_at = Column(DateTime, nullable=True)  # для очистки старых переводов
+    expires_at = Column(DateTime, nullable=True)
