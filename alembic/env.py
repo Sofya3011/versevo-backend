@@ -1,26 +1,28 @@
-# alembic/env.py
-from logging.config import fileConfig
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
-from alembic import context
 import os
 import sys
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config, pool
+from alembic import context
 
-# Добавляем путь к корневой директории
+# Добавляем путь к проекту
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 # Импортируем модели и Base
-from models import Base
-from database import engine
+from database import Base
+from models import User, Document, DocumentNote, ReadingProgress, DocumentAnalysis, FavoriteQuote, TranslationCache
 
+# Конфиг Alembic
 config = context.config
 
+# Настройка логирования
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+# Устанавливаем target_metadata
 target_metadata = Base.metadata
 
 def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode."""
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
@@ -33,7 +35,12 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 def run_migrations_online() -> None:
-    connectable = engine
+    """Run migrations in 'online' mode."""
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
 
     with connectable.connect() as connection:
         context.configure(
