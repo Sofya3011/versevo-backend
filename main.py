@@ -1,3 +1,5 @@
+import asyncio
+import time
 # main.py - Бэкенд Versevo с PostgreSQL и Hugging Face AI
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -970,6 +972,20 @@ async def root():
         },
         "timestamp": datetime.now().isoformat(),
         "endpoints": endpoints
+    }
+
+# В main.py ПОСЛЕ СОЗДАНИЯ app = FastAPI(...) ДОБАВЬТЕ:
+
+@app.get("/")
+@app.get("/health")
+@app.get("/api")
+async def simple_health():
+    """Простой healthcheck который всегда работает"""
+    return {
+        "status": "ok",
+        "message": "Versevo API is running",
+        "timestamp": datetime.now().isoformat(),
+        "version": "6.0.0"
     }
 
 @app.get("/api/flutter/health")
