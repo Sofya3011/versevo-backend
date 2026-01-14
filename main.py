@@ -1,7 +1,7 @@
+# main.py - Бэкенд Versevo с PostgreSQL и Hugging Face AI
 import asyncio
 import time
 import threading
-# main.py - Бэкенд Versevo с PostgreSQL и Hugging Face AI
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -24,13 +24,75 @@ from sqlalchemy.orm import Session
 from database import get_db, SessionLocal
 from models import User, Document, DocumentNote, ReadingProgress, DocumentAnalysis, FavoriteQuote, TranslationCache
 
-# Настройка логирования
+# ========== СНАЧАЛА СОЗДАЕМ APP И ПРОСТЫЕ ENDPOINTS ==========
+app = FastAPI(
+    title="Versevo Backend API",
+    description="Modern document reader with translation and AI features",
+    version="6.0.0"
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ========== ОЧЕНЬ ВАЖНО: ПРОСТЫЕ HEALTHCHECK СРАЗУ ==========
+@app.get("/")
+async def root():
+    """Корневой эндпоинт - работает сразу!"""
+    return {
+        "message": "Versevo Backend API v6.0",
+        "version": "6.0.0",
+        "status": "running",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/api/flutter/health")
+async def flutter_health_check():
+    """Эндпоинт для healthcheck Railway/Flutter - работает СРАЗУ!"""
+    return {
+        "status": "healthy", 
+        "service": "versevo-backend",
+        "database": "PostgreSQL",
+        "timestamp": datetime.now().isoformat(),
+        "version": "6.0.0"
+    }
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint - работает СРАЗУ!"""
+    return {
+        "status": "healthy", 
+        "service": "versevo-backend", 
+        "database": "PostgreSQL",
+        "timestamp": datetime.now().isoformat(),
+        "version": "6.0.0"
+    }
+
+# ========== ТЕПЕРЬ НАСТРАИВАЕМ ЛОГИРОВАНИЕ ==========
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+
+logger.info(f"{'='*60}")
+logger.info(f"🚀 VERSION 6.0 STARTING...")
+logger.info(f"⚡ Healthcheck endpoints: READY")
+logger.info(f"{'='*60}")
+
+# ========== СОЗДАЕМ ДИРЕКТОРИИ ==========
+UPLOAD_FOLDER = "uploads"
+BOOKS_FOLDER = "books"
+ANALYSIS_CACHE_FOLDER = "cache/analysis"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(BOOKS_FOLDER, exist_ok=True)
+os.makedirs(ANALYSIS_CACHE_FOLDER, exist_ok=True)
 
 # ========== МОДЕЛИ PYDANTIC ==========
 class TranslateRequest(BaseModel):
@@ -70,31 +132,7 @@ class AnalysisType(str, Enum):
     DETAILED = "detailed"
     FULL = "full"
 
-# ========== СОЗДАЕМ APP ==========
-app = FastAPI(
-    title="Versevo Backend API",
-    description="Modern document reader with translation and AI features",
-    version="6.0.0"
-)
-
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Создаем директории
-UPLOAD_FOLDER = "uploads"
-BOOKS_FOLDER = "books"
-ANALYSIS_CACHE_FOLDER = "cache/analysis"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(BOOKS_FOLDER, exist_ok=True)
-os.makedirs(ANALYSIS_CACHE_FOLDER, exist_ok=True)
-
-# Статические файлы
+# ========== СТАТИЧЕСКИЕ ФАЙЛЫ ==========
 try:
     app.mount("/uploads", StaticFiles(directory=UPLOAD_FOLDER), name="uploads")
     app.mount("/books", StaticFiles(directory=BOOKS_FOLDER), name="books")
@@ -110,156 +148,74 @@ documents_store = {}
 current_doc_id = 1
 
 # ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ AI ==========
-# Инициализируем флаги загрузки
 HUGGING_FACE_ENABLED = False
 HF_ANALYSIS_PIPELINES = {}
 HF_TRANSLATOR_READY = False
 HF_ANALYSIS_READY = False
 
-# ========== УПРОЩЕННЫЙ ПЕРЕВОДЧИК С УЛУЧШЕНИЯМИ ==========
+# ========== УПРОЩЕННЫЙ ПЕРЕВОДЧИК ==========
 class LocalTranslator:
-    """Улучшенный упрощенный переводчик для fallback"""
+    """Упрощенный переводчик для fallback"""
     
     def __init__(self):
         logger.info("🚀 Инициализация улучшенного переводчика")
-        # Расширенный словарь
         self.translation_dict = {
             'en-ru': {
-                # Основные слова
-                'hello': 'привет',
-                'world': 'мир',
-                'book': 'книга',
-                'read': 'читать',
-                'page': 'страница',
-                'chapter': 'глава',
-                'text': 'текст',
-                'document': 'документ',
-                'translate': 'переводить',
-                'library': 'библиотека',
-                'author': 'автор',
-                'title': 'название',
-                'content': 'содержание',
-                'analysis': 'анализ',
-                'summary': 'краткое содержание',
-                'character': 'персонаж',
-                'plot': 'сюжет',
-                'story': 'история',
-                'novel': 'роман',
-                'poem': 'стихотворение',
-                'literature': 'литература',
-                
-                # Союзы и предлоги
-                'the': '',
-                'a': '',
-                'an': '',
-                'and': 'и',
-                'or': 'или',
-                'but': 'но',
-                'in': 'в',
-                'on': 'на',
-                'at': 'в',
-                'to': 'к',
-                'for': 'для',
-                'with': 'с',
-                'from': 'из',
-                'of': 'из',
-                'by': 'от',
-                
-                # Частые глаголы
-                'is': 'является',
-                'are': 'являются',
-                'was': 'был',
-                'were': 'были',
-                'have': 'иметь',
-                'has': 'имеет',
-                'do': 'делать',
-                'does': 'делает',
-                'can': 'мочь',
-                'could': 'мог',
-                'will': 'будет',
-                'would': 'бы',
-                
-                # Прилагательные
-                'good': 'хороший',
-                'bad': 'плохой',
-                'new': 'новый',
-                'old': 'старый',
-                'big': 'большой',
-                'small': 'маленький',
-                'beautiful': 'красивый',
-                'interesting': 'интересный',
-                'important': 'важный',
+                'hello': 'привет', 'world': 'мир', 'book': 'книга', 'read': 'читать',
+                'page': 'страница', 'chapter': 'глава', 'text': 'текст', 'document': 'документ',
+                'translate': 'переводить', 'library': 'библиотека', 'author': 'автор',
+                'title': 'название', 'content': 'содержание', 'analysis': 'анализ',
+                'summary': 'краткое содержание', 'character': 'персонаж', 'plot': 'сюжет',
+                'story': 'история', 'novel': 'роман', 'poem': 'стихотворение', 'literature': 'литература',
+                'the': '', 'a': '', 'an': '', 'and': 'и', 'or': 'или', 'but': 'но',
+                'in': 'в', 'on': 'на', 'at': 'в', 'to': 'к', 'for': 'для', 'with': 'с',
+                'from': 'из', 'of': 'из', 'by': 'от', 'is': 'является', 'are': 'являются',
+                'was': 'был', 'were': 'были', 'have': 'иметь', 'has': 'имеет',
+                'do': 'делать', 'does': 'делает', 'can': 'мочь', 'could': 'мог',
+                'will': 'будет', 'would': 'бы', 'good': 'хороший', 'bad': 'плохой',
+                'new': 'новый', 'old': 'старый', 'big': 'большой', 'small': 'маленький',
+                'beautiful': 'красивый', 'interesting': 'интересный', 'important': 'важный',
             },
             'ru-en': {
-                'привет': 'hello',
-                'мир': 'world',
-                'книга': 'book',
-                'читать': 'read',
-                'страница': 'page',
-                'глава': 'chapter',
-                'текст': 'text',
-                'документ': 'document',
-                'автор': 'author',
-                'название': 'title',
-                'содержание': 'content',
-                'анализ': 'analysis',
-                'персонаж': 'character',
-                'сюжет': 'plot',
-                'история': 'story',
-                'литература': 'literature',
-                'и': 'and',
-                'или': 'or',
-                'но': 'but',
-                'в': 'in',
-                'на': 'on',
-                'для': 'for',
-                'с': 'with',
+                'привет': 'hello', 'мир': 'world', 'книга': 'book', 'читать': 'read',
+                'страница': 'page', 'глава': 'chapter', 'текст': 'text', 'документ': 'document',
+                'автор': 'author', 'название': 'title', 'содержание': 'content',
+                'анализ': 'analysis', 'персонаж': 'character', 'сюжет': 'plot',
+                'история': 'story', 'литература': 'literature', 'и': 'and', 'или': 'or',
+                'но': 'but', 'в': 'in', 'на': 'on', 'для': 'for', 'с': 'with',
             }
         }
         
-        # Паттерны для литературных переводов
         self.literary_patterns = {
             'en-ru': [
-                (r'\bIt is\b', 'Это'),
-                (r'\bhe said\b', 'сказал он'),
-                (r'\bshe said\b', 'сказала она'),
-                (r'\bthey said\b', 'сказали они'),
-                (r'\bI think\b', 'Я думаю'),
-                (r'\byou know\b', 'знаете ли'),
-                (r'\bof course\b', 'конечно'),
-                (r'\bin fact\b', 'на самом деле'),
-                (r'\bat first\b', 'сначала'),
-                (r'\bat last\b', 'наконец'),
+                (r'\bIt is\b', 'Это'), (r'\bhe said\b', 'сказал он'),
+                (r'\bshe said\b', 'сказала она'), (r'\bthey said\b', 'сказали они'),
+                (r'\bI think\b', 'Я думаю'), (r'\byou know\b', 'знаете ли'),
+                (r'\bof course\b', 'конечно'), (r'\bin fact\b', 'на самом деле'),
+                (r'\bat first\b', 'сначала'), (r'\bat last\b', 'наконец'),
             ]
         }
     
     def translate(self, text: str, source_lang: str, target_lang: str, style: str = "artistic") -> str:
-        """Улучшенный перевод с литературными паттернами"""
-        # Если языки совпадают
         if source_lang == target_lang:
             return self._apply_style(text, style)
         
         key = f"{source_lang}-{target_lang}"
         
-        # Ограничиваем длину текста
         if len(text) > 800:
             text = text[:800] + "..."
         
-        # Применяем литературные паттерны
         if key in self.literary_patterns:
             for pattern, replacement in self.literary_patterns[key]:
                 text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
         
-        # Пробуем словарный перевод
         if key in self.translation_dict:
             result = self._dictionary_translate(text, key)
         else:
             result = text
         
-        # Применяем стиль
         result = self._apply_style(result, style)
         
-        # Добавляем префикс языка
         if source_lang == 'en' and target_lang == 'ru':
             result = f"[ПЕРЕВОД] {result}"
         elif source_lang == 'ru' and target_lang == 'en':
@@ -270,7 +226,6 @@ class LocalTranslator:
         return result
     
     def _dictionary_translate(self, text: str, lang_key: str) -> str:
-        """Перевод по словарю"""
         words = re.findall(r'\b\w+\b|[^\w\s]', text)
         translated = []
         dict_map = self.translation_dict[lang_key]
@@ -281,7 +236,6 @@ class LocalTranslator:
                 if lower_word in dict_map:
                     trans = dict_map[lower_word]
                     if trans:
-                        # Сохраняем регистр первого символа
                         if word[0].isupper():
                             trans = trans[0].upper() + trans[1:] if len(trans) > 0 else trans
                         translated.append(trans)
@@ -292,7 +246,6 @@ class LocalTranslator:
             else:
                 translated.append(word)
         
-        # Собираем текст, убирая лишние пробелы перед знаками препинания
         result = ' '.join(translated)
         result = re.sub(r'\s+([.,!?;:])', r'\1', result)
         result = re.sub(r'\s+', ' ', result)
@@ -300,7 +253,6 @@ class LocalTranslator:
         return result.strip()
     
     def _apply_style(self, text: str, style: str) -> str:
-        """Применение стиля к тексту"""
         if style == "artistic":
             return f"🎨 {text}"
         elif style == "formal":
@@ -312,10 +264,9 @@ class LocalTranslator:
         else:
             return text
 
-# Создаем экземпляр простого переводчика сразу
 local_translator = LocalTranslator()
 
-# ========== НАСТОЯЩИЙ ПЕРЕВОДЧИК HUGGING FACE (отложенная загрузка) ==========
+# ========== HUGGING FACE ПЕРЕВОДЧИК ==========
 class HuggingFaceTranslator:
     """Настоящий переводчик через Hugging Face модели"""
     
@@ -328,7 +279,6 @@ class HuggingFaceTranslator:
         self.initialized = False
     
     def initialize(self):
-        """Инициализация моделей перевода (ленивая загрузка)"""
         if self.initialized:
             return True
             
@@ -340,7 +290,6 @@ class HuggingFaceTranslator:
             device = 0 if torch.cuda.is_available() else -1
             device_name = "CUDA" if torch.cuda.is_available() else "CPU"
             
-            # Конфигурация моделей
             self.model_configs = {
                 'en-ru': {
                     'model': 'Helsinki-NLP/opus-mt-en-ru',
@@ -363,7 +312,6 @@ class HuggingFaceTranslator:
             return False
     
     def _get_translation_pipeline(self, source_lang: str, target_lang: str):
-        """Получить или загрузить pipeline для перевода"""
         if not self.initialized:
             return None
             
@@ -401,40 +349,31 @@ class HuggingFaceTranslator:
         return self.translation_pipelines[key]
     
     def translate(self, text: str, source_lang: str, target_lang: str, style: str = "artistic") -> str:
-        """Настоящий перевод через Hugging Face"""
-        # Если не инициализирован, используем fallback
         if not self.initialized:
             return local_translator.translate(text, source_lang, target_lang, style)
         
-        # Если языки совпадают - возвращаем как есть
         if source_lang == target_lang:
             return local_translator._apply_style(text, style)
         
-        # Основные поддерживаемые языки
         supported_pairs = ['en-ru', 'ru-en']
         key = f"{source_lang}-{target_lang}"
         
         if key not in supported_pairs:
-            # Для неподдерживаемых пар используем простой перевод
             logger.warning(f"⚠️ Неподдерживаемая пара переводов: {key}")
             return local_translator.translate(text, source_lang, target_lang, style)
         
         try:
-            # Получаем pipeline
             pipeline = self._get_translation_pipeline(source_lang, target_lang)
             
             if pipeline is None:
-                # Fallback на простой перевод
                 logger.warning(f"⚠️ Pipeline перевода {key} не загружен")
                 return local_translator.translate(text, source_lang, target_lang, style)
             
-            # Ограничиваем длину для памяти
             if len(text) > 1000:
                 original_text = text
                 text = text[:1000]
                 logger.info(f"📝 Текст усечен с {len(original_text)} до {len(text)} символов")
             
-            # Выполняем перевод
             logger.info(f"🔄 Перевод {len(text)} символов: {source_lang} → {target_lang}")
             
             result = pipeline(text, max_length=400, truncation=True)
@@ -443,7 +382,6 @@ class HuggingFaceTranslator:
                 translated_text = result[0].get('translation_text', text)
                 logger.info(f"✅ Перевод завершен: {len(text)} → {len(translated_text)} символов")
                 
-                # Применяем стиль
                 translated_text = local_translator._apply_style(translated_text, style)
                 
                 return translated_text
@@ -453,11 +391,9 @@ class HuggingFaceTranslator:
                 
         except Exception as e:
             logger.error(f"❌ Ошибка перевода {key}: {e}")
-            # Fallback на простой перевод
             return local_translator.translate(text, source_lang, target_lang, style)
     
     def is_available(self, source_lang: str, target_lang: str) -> bool:
-        """Проверка доступности перевода для языковой пары"""
         if not self.initialized:
             return False
             
@@ -469,7 +405,6 @@ class HuggingFaceTranslator:
         
         return False
 
-# Создаем экземпляр, но НЕ инициализируем пока
 hf_translator = HuggingFaceTranslator()
 
 # ========== ФУНКЦИИ ДЛЯ ОТЛОЖЕННОЙ ЗАГРУЗКИ AI МОДЕЛЕЙ ==========
@@ -481,12 +416,10 @@ def init_huggingface_for_analysis_background():
         import transformers
         import torch
         
-        # Проверяем доступность CUDA
         device = 0 if torch.cuda.is_available() else -1
         device_name = "CUDA" if torch.cuda.is_available() else "CPU"
         logger.info(f"🏗️ Фоновая инициализация Hugging Face анализа на {device_name}")
         
-        # Список моделей для анализа
         analysis_models = {
             "sentiment": {
                 "model_name": "blanchefort/rubert-base-cased-sentiment",
@@ -502,7 +435,6 @@ def init_huggingface_for_analysis_background():
             },
         }
         
-        # Ленивая загрузка моделей
         HF_ANALYSIS_PIPELINES = {
             task: {"model_name": config["model_name"], "pipeline": None, "task": config["task"]}
             for task, config in analysis_models.items()
@@ -510,7 +442,6 @@ def init_huggingface_for_analysis_background():
         
         HUGGING_FACE_ENABLED = True
         
-        # Предзагружаем только sentiment модель (самую легкую)
         try:
             logger.info("🔄 Фоновая загрузка модели анализа тональности...")
             from transformers import pipeline
@@ -599,7 +530,6 @@ def init_all_ai_models_in_background():
     logger.info("🎉 Все AI модели инициализированы в фоне!")
 
 # ========== ЗАПУСКАЕМ ФОНОВУЮ ИНИЦИАЛИЗАЦИЮ AI МОДЕЛЕЙ ==========
-# Но НЕ блокируем основной поток!
 ai_init_thread = threading.Thread(target=init_all_ai_models_in_background, daemon=True)
 ai_init_thread.start()
 logger.info("🧵 Запущен фоновый поток для инициализации AI моделей")
@@ -620,16 +550,12 @@ def init_database():
         logger.info("📝 Используем in-memory хранилище для документов")
         return False
 
-# Запускаем инициализацию БД
-init_database()
-
-# ========== ИНИЦИАЛИЗАЦИЯ NLTK (если доступен) ==========
+# ========== ИНИЦИАЛИЗАЦИЯ NLTK ==========
 try:
     import nltk
     from nltk.tokenize import sent_tokenize, word_tokenize
     from nltk.corpus import stopwords
     
-    # Загружаем ресурсы NLTK
     try:
         nltk.data.find('tokenizers/punkt')
         nltk.data.find('corpora/stopwords')
@@ -688,18 +614,16 @@ def detect_language_safe(text: str) -> str:
         return "en"
     
     try:
-        # Простая проверка по символам
         cyrillic = sum(1 for c in text if 'а' <= c <= 'я' or 'А' <= c <= 'Я')
         latin = sum(1 for c in text if 'a' <= c <= 'z' or 'A' <= c <= 'Z')
         
-        if cyrillic > latin * 1.5:  # Учитываем коэффициент
+        if cyrillic > latin * 1.5:
             return "ru"
         else:
             return "en"
     except:
         return "en"
 
-# ========== УЛУЧШЕННОЕ ОПРЕДЕЛЕНИЕ ГЛАВ ==========
 def detect_chapters(text: str) -> List[Dict]:
     """Улучшенное определение глав в тексте"""
     chapters = []
@@ -707,20 +631,17 @@ def detect_chapters(text: str) -> List[Dict]:
     if not text:
         return [{'title': 'Документ', 'content': 'Нет содержимого'}]
     
-    # Убираем лишние пробелы и переносы
     text = re.sub(r'\n{3,}', '\n\n', text.strip())
     
-    # Паттерны для определения глав (русский и английский)
     chapter_patterns = [
         r'^\s*(?:ГЛАВА|Глава|Г\.)\s+[IVXLCDM\d]+[\.\s].*$',
         r'^\s*(?:CHAPTER|Chapter|Ch\.)\s+[IVXLCDM\d]+[\.\s].*$',
         r'^\s*[IVXLCDM\d]+[\.\)]\s+.*$',
         r'^\s*\d+[\.\)]\s+.*$',
-        r'^\s*[A-Z][A-Z\s]{2,}[\.\?!]?$',  # Заголовки ВСЕМИ БУКВАМИ
-        r'^\s*.+\n[-=]{3,}$',  # Заголовок с подчеркиванием
+        r'^\s*[A-Z][A-Z\s]{2,}[\.\?!]?$',
+        r'^\s*.+\n[-=]{3,}$',
     ]
     
-    # Разбиваем текст на абзацы
     paragraphs = text.split('\n\n')
     
     current_chapter = None
@@ -731,7 +652,6 @@ def detect_chapters(text: str) -> List[Dict]:
         if not paragraph:
             continue
         
-        # Проверяем, является ли абзац заголовком главы
         is_chapter_title = False
         for pattern in chapter_patterns:
             if re.match(pattern, paragraph, re.MULTILINE | re.IGNORECASE):
@@ -739,31 +659,25 @@ def detect_chapters(text: str) -> List[Dict]:
                 break
         
         if is_chapter_title:
-            # Сохраняем предыдущую главу, если есть
             if current_chapter is not None and chapter_content:
                 chapters.append({
                     'title': current_chapter,
                     'content': '\n\n'.join(chapter_content)
                 })
             
-            # Начинаем новую главу
-            current_chapter = paragraph[:100]  # Ограничиваем длину заголовка
+            current_chapter = paragraph[:100]
             chapter_content = []
         else:
-            # Добавляем абзац к текущей главе
             if current_chapter is None:
-                # Если еще нет главы, создаем первую
                 current_chapter = 'Начало'
             chapter_content.append(paragraph)
     
-    # Добавляем последнюю главу
     if current_chapter and chapter_content:
         chapters.append({
             'title': current_chapter,
             'content': '\n\n'.join(chapter_content)
         })
     
-    # Если не нашли глав, разбиваем на части по объему
     if not chapters:
         chunk_size = 5000
         for i in range(0, len(text), chunk_size):
@@ -776,45 +690,10 @@ def detect_chapters(text: str) -> List[Dict]:
     
     return chapters
 
-# ========== HEALTH CHECK ENDPOINTS (ДОЛЖНЫ РАБОТАТЬ СРАЗУ!) ==========
-@app.get("/")
-async def root():
-    """Корневой эндпоинт - работает сразу!"""
-    return {
-        "message": "Versevo Backend API v6.0",
-        "version": "6.0.0",
-        "status": "running",
-        "ai_models_loading": "in_progress" if not HF_TRANSLATOR_READY else "ready",
-        "database": "PostgreSQL",
-        "timestamp": datetime.now().isoformat()
-    }
+# ========== ЗАПУСКАЕМ ИНИЦИАЛИЗАЦИЮ БАЗЫ ДАННЫХ ==========
+init_database()
 
-@app.get("/api/flutter/health")
-async def flutter_health_check():
-    """Эндпоинт для healthcheck Railway/Flutter - работает СРАЗУ!"""
-    return {
-        "status": "healthy", 
-        "service": "versevo-backend",
-        "database": "PostgreSQL",
-        "timestamp": datetime.now().isoformat(),
-        "version": "6.0.0",
-        "ai_models": "loading_in_background" if not HF_TRANSLATOR_READY else "ready"
-    }
-
-@app.get("/api/health")
-async def health_check():
-    """Health check endpoint - работает СРАЗУ!"""
-    return {
-        "status": "healthy", 
-        "service": "versevo-backend", 
-        "database": "PostgreSQL",
-        "ai_translator": "ready" if HF_TRANSLATOR_READY else "loading",
-        "ai_analysis": "ready" if HF_ANALYSIS_READY else "loading",
-        "timestamp": datetime.now().isoformat(),
-        "version": "6.0.0"
-    }
-
-# ========== ДОКУМЕНТЫ (СТАРЫЕ ЭНДПОИНТЫ ДЛЯ СОВМЕСТИМОСТИ) ==========
+# ========== ДОКУМЕНТЫ (СТАРЫЕ ЭНДПОИНТЫ) ==========
 @app.post("/api/documents/upload-base64")
 async def upload_document_base64(request: dict):
     """Загрузка документа в формате base64"""
@@ -845,7 +724,6 @@ async def upload_document_base64(request: dict):
         language = detect_language_safe(content_str)
         chapters = detect_chapters(content_str)
         
-        # Вычисляем статистику
         word_count = len(content_str.split())
         char_count = len(content_str)
         reading_time = max(1, word_count // 200)
@@ -933,6 +811,34 @@ async def get_document(document_id: int):
         "chapters": doc["chapters"],
     }
 
+@app.delete("/api/documents/{document_id}")
+async def delete_document(document_id: int):
+    """Удаление документа"""
+    try:
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        doc = documents_store[document_id]
+        if os.path.exists(doc["file_path"]):
+            try:
+                os.remove(doc["file_path"])
+            except:
+                pass
+        
+        del documents_store[document_id]
+        
+        logger.info(f"🗑️ Документ удален: ID {document_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Document {document_id} deleted",
+            "deleted_id": document_id
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка удаления документа: {e}")
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+
 # ========== ПЕРЕВОД ==========
 @app.post("/api/translate/text")
 async def translate_text(request: TranslateRequest):
@@ -947,7 +853,6 @@ async def translate_text(request: TranslateRequest):
         
         target_lang = request.target_language
         
-        # Выбираем переводчик в зависимости от доступности
         use_huggingface = HF_TRANSLATOR_READY and hf_translator.is_available(source_lang, target_lang)
         
         if use_huggingface:
@@ -985,7 +890,7 @@ async def translate_text(request: TranslateRequest):
         logger.error(f"Translate error: {e}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
-# ========== УЛУЧШЕННЫЙ БАЗОВЫЙ АНАЛИЗ ==========
+# ========== БАЗОВЫЙ АНАЛИЗ ==========
 def _perform_basic_analysis(text: str) -> Dict[str, Any]:
     """Улучшенный базовый анализ текста"""
     result = {
@@ -1003,12 +908,10 @@ def _perform_basic_analysis(text: str) -> Dict[str, Any]:
         return result
     
     try:
-        # Базовые метрики
         words = [w for w in text.split() if w.strip()]
         sentences = re.split(r'[.!?]+', text)
         paragraphs = text.split('\n\n')
         
-        # Убираем пустые элементы
         sentences = [s.strip() for s in sentences if s.strip()]
         paragraphs = [p.strip() for p in paragraphs if p.strip()]
         
@@ -1016,7 +919,6 @@ def _perform_basic_analysis(text: str) -> Dict[str, Any]:
         sentence_count = len(sentences)
         paragraph_count = len(paragraphs)
         
-        # Сложность текста
         avg_sentence_length = word_count / sentence_count if sentence_count > 0 else 0
         if avg_sentence_length < 8:
             complexity = "Простой"
@@ -1025,12 +927,11 @@ def _perform_basic_analysis(text: str) -> Dict[str, Any]:
         else:
             complexity = "Сложный"
         
-        # Создаем краткое содержание
         if sentence_count >= 3:
             summary_sentences = []
             for sent in sentences[:4]:
                 clean_sent = sent.strip()
-                if len(clean_sent) > 10 and not clean_sent.isupper():  # Пропускаем заголовки
+                if len(clean_sent) > 10 and not clean_sent.isupper():
                     summary_sentences.append(clean_sent)
             
             if summary_sentences:
@@ -1042,10 +943,8 @@ def _perform_basic_analysis(text: str) -> Dict[str, Any]:
         else:
             result["summary"] = text[:200] + "..." if len(text) > 200 else text
         
-        # Определяем темы (слова с большой буквы и частые слова)
         themes = []
         
-        # Имена собственные (слова с большой буквы)
         proper_nouns = re.findall(r'\b[A-Z][a-z]+\b', text[:1000])
         if proper_nouns:
             noun_counter = Counter([n.lower() for n in proper_nouns])
@@ -1053,7 +952,6 @@ def _perform_basic_analysis(text: str) -> Dict[str, Any]:
                            if count > 1 and len(noun) > 3]
             themes.extend(common_proper[:3])
         
-        # Частые слова (длиной более 3 букв)
         if not themes:
             word_freq = Counter([w.lower() for w in words if len(w) > 3])
             stop_words = {'это', 'что', 'как', 'для', 'того', 'чтобы', 'если', 
@@ -1063,7 +961,6 @@ def _perform_basic_analysis(text: str) -> Dict[str, Any]:
                           if word not in stop_words and count > 1][:3]
             themes.extend(common_words)
         
-        # Если все еще нет тем, используем общие
         if not themes:
             themes = ["Документ", "Текст", "Содержание"]
         
@@ -1080,7 +977,6 @@ def _perform_basic_analysis(text: str) -> Dict[str, Any]:
             "reading_time_minutes": max(1, word_count // 200),
         }
         
-        # Анализ языка
         cyrillic = sum(1 for c in text if 'а' <= c <= 'я' or 'А' <= c <= 'Я')
         latin = sum(1 for c in text if 'a' <= c <= 'z' or 'A' <= c <= 'Z')
         
@@ -1092,7 +988,6 @@ def _perform_basic_analysis(text: str) -> Dict[str, Any]:
             "has_exclamations": "!" in text,
         }
         
-        # Ключевые точки
         key_points = [
             f"Объем: {word_count} слов",
             f"Сложность: {complexity}",
@@ -1111,37 +1006,7 @@ def _perform_basic_analysis(text: str) -> Dict[str, Any]:
     
     return result
 
-@app.delete("/api/documents/{document_id}")
-async def delete_document(document_id: int):
-    """Удаление документа"""
-    try:
-        if document_id not in documents_store:
-            raise HTTPException(status_code=404, detail="Document not found")
-        
-        # Удаляем файл с диска
-        doc = documents_store[document_id]
-        if os.path.exists(doc["file_path"]):
-            try:
-                os.remove(doc["file_path"])
-            except:
-                pass
-        
-        # Удаляем из хранилища
-        del documents_store[document_id]
-        
-        logger.info(f"🗑️ Документ удален: ID {document_id}")
-        
-        return {
-            "status": "success",
-            "message": f"Document {document_id} deleted",
-            "deleted_id": document_id
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка удаления документа: {e}")
-        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
-
-# ========== УЛУЧШЕННЫЙ AI АНАЛИЗ ==========
+# ========== AI АНАЛИЗ ==========
 def _perform_ai_analysis(text: str) -> Dict[str, Any]:
     """Улучшенный AI анализ текста через Hugging Face"""
     result = {
@@ -1161,10 +1026,8 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
         return result
     
     try:
-        # Берем первые 2000 символов для анализа
         sample_text = text[:2000]
         
-        # 1. Анализ тональности
         sentiment_pipeline = get_hf_analysis_pipeline("sentiment")
         if sentiment_pipeline:
             try:
@@ -1189,13 +1052,11 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка анализа тональности: {e}")
         
-        # 2. Суммаризация (только для достаточно длинных текстов)
         if len(text.split()) > 150:
             summarization_pipeline = get_hf_analysis_pipeline("summarization")
             
             if summarization_pipeline:
                 try:
-                    # Подготавливаем текст для суммаризации
                     clean_text = re.sub(r'\s+', ' ', sample_text.strip())
                     if len(clean_text) > 100:
                         summary_result = summarization_pipeline(
@@ -1207,7 +1068,6 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
                         
                         if summary_result and len(summary_result) > 0:
                             summary = summary_result[0].get("summary_text", "")
-                            # Убираем [ПЕРЕВОД] если есть
                             summary = re.sub(r'^\[ПЕРЕВОД\]\s*', '', summary)
                             result["summary"] = summary
                             result["models_used"].append("summarization")
@@ -1215,7 +1075,6 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
                 except Exception as e:
                     logger.warning(f"⚠️ Ошибка суммаризации: {e}")
         
-        # 3. Извлечение именованных сущностей
         ner_pipeline = get_hf_analysis_pipeline("ner")
         
         if ner_pipeline:
@@ -1228,7 +1087,6 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
                         entity_word = entity.get("word", "")
                         entity_group = entity.get("entity_group", "")
                         
-                        # Фильтруем мусор
                         if (entity_group in ["PER", "ORG", "LOC"] and 
                             len(entity_word) > 2 and 
                             not re.match(r'^\d+$', entity_word)):
@@ -1240,7 +1098,6 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
                             })
                 
                 if entities:
-                    # Берем только уникальные сущности
                     unique_entities = []
                     seen = set()
                     for e in entities:
@@ -1253,7 +1110,6 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
                     result["models_used"].append("ner")
                     result["ai_analysis"] = True
                     
-                    # Формируем темы из сущностей
                     entity_types = Counter([e["entity"] for e in result["entities"]])
                     themes = []
                     for entity_type, count in entity_types.most_common(3):
@@ -1270,7 +1126,6 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка NER анализа: {e}")
         
-        # 4. Определение стиля письма
         word_count = len(text.split())
         sentence_count = len(re.split(r'[.!?]+', text))
         
@@ -1285,7 +1140,6 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
         
         result["writing_style"] = writing_style
         
-        # 5. Формируем ключевые точки на основе анализа
         key_points = []
         
         if result["entities"]:
@@ -1298,7 +1152,6 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
         
         key_points.append(f"Стиль письма: {writing_style}")
         
-        # Добавляем базовые ключевые точки
         if word_count > 0:
             reading_time = max(1, word_count // 200)
             key_points.append(f"Время чтения: {reading_time} мин")
@@ -1306,14 +1159,13 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
         
         result["key_points"] = key_points
         
-        # 6. Если не удалось получить суммаризацию, создаем базовую
         if not result["summary"]:
             sentences = re.split(r'[.!?]+', text)
             if len(sentences) > 2:
                 summary_sentences = []
                 for sent in sentences[:3]:
                     clean_sent = sent.strip()
-                    if len(clean_sent) > 10:  # Пропускаем очень короткие
+                    if len(clean_sent) > 10:
                         summary_sentences.append(clean_sent)
                 
                 if summary_sentences:
@@ -1323,10 +1175,8 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
             else:
                 result["summary"] = text[:300] + "..." if len(text) > 300 else text
         
-        # 7. Если не определили темы, используем частые слова
         if not result["themes"]:
             try:
-                # Извлекаем существительные (слова с большой буквы)
                 nouns = re.findall(r'\b[A-Z][a-z]+\b', text[:1000])
                 if nouns:
                     noun_counter = Counter([n.lower() for n in nouns])
@@ -1337,7 +1187,6 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
             except:
                 pass
         
-        # Если темы все еще пустые, используем общие
         if not result["themes"]:
             result["themes"] = ["Литература", "Текст", "Содержание"]
         
@@ -1378,7 +1227,6 @@ async def analyze_with_ai(request: AIAnalysisRequest):
         if not content or len(content.strip()) < 10:
             raise HTTPException(status_code=400, detail="Document has no content")
         
-        # Проверяем готовность AI
         if not HF_ANALYSIS_READY:
             return {
                 "document_id": document_id,
@@ -1396,45 +1244,31 @@ async def analyze_with_ai(request: AIAnalysisRequest):
                 "analysis_timestamp": datetime.now().isoformat(),
             }
         
-        # Выполняем анализ
         logger.info(f"🔍 Начинаем AI анализ документа {document_id}")
         
-        # Базовый анализ
         basic_analysis = _perform_basic_analysis(content)
-        
-        # AI анализ (если доступен)
         ai_analysis = _perform_ai_analysis(content)
         
-        # Объединяем результаты
         result = {
             "document_id": document_id,
             "filename": doc["filename"],
             "language": doc["language"],
-            
-            # Основные результаты
             "summary": ai_analysis.get("summary") or basic_analysis.get("summary"),
             "themes": ai_analysis.get("themes") or basic_analysis.get("themes", []),
             "sentiment": ai_analysis.get("sentiment") or basic_analysis.get("sentiment"),
             "writing_style": ai_analysis.get("writing_style") or "Информационный",
-            
-            # Детали анализа
             "key_points": ai_analysis.get("key_points") or basic_analysis.get("key_points", []),
             "entities": ai_analysis.get("entities", []),
             "statistics": basic_analysis.get("statistics", {}),
             "language_features": basic_analysis.get("language_features", {}),
-            
-            # Метрики
             "ai_analysis": ai_analysis.get("ai_analysis", False),
             "fallback": ai_analysis.get("fallback", True),
             "models_used": ai_analysis.get("models_used", []),
             "analysis_type": request.analysis_type,
-            
-            # Время
             "analysis_timestamp": datetime.now().isoformat(),
             "analysis_duration_ms": 0,
         }
         
-        # Добавляем дополнительную информацию из документа
         result["document_metadata"] = {
             "word_count": doc["word_count"],
             "chapter_count": doc["chapter_count"],
@@ -1442,7 +1276,6 @@ async def analyze_with_ai(request: AIAnalysisRequest):
             "created_at": doc["created_at"],
         }
         
-        # Если AI анализ не удался, добавляем информацию о fallback
         if ai_analysis.get("fallback"):
             result["analysis_notes"] = ["Использован базовый анализ из-за недоступности AI"]
         
@@ -1453,7 +1286,6 @@ async def analyze_with_ai(request: AIAnalysisRequest):
     except Exception as e:
         logger.error(f"❌ Ошибка AI анализа документа: {e}")
         
-        # Fallback ответ
         return {
             "document_id": request.document_id,
             "summary": "Произошла ошибка при AI-анализе. Используется упрощенный анализ.",
@@ -1489,30 +1321,20 @@ async def analyze_document(request: AnalysisRequest):
         
         logger.info(f"🔍 Базовый анализ документа {document_id}")
         
-        # Выполняем базовый анализ
         analysis_result = _perform_basic_analysis(content)
         
-        # Формируем полный ответ
         result = {
             "document_id": document_id,
             "filename": doc["filename"],
             "language": doc["language"],
-            
-            # Результаты анализа
             "summary": analysis_result["summary"],
             "themes": analysis_result["themes"],
             "sentiment": analysis_result["sentiment"],
             "complexity": analysis_result["complexity"],
             "writing_style": "Информационный",
-            
-            # Ключевые точки
             "key_points": analysis_result["key_points"],
-            
-            # Статистика
             "statistics": analysis_result["statistics"],
             "language_features": analysis_result["language_features"],
-            
-            # Метрики документа
             "document_statistics": {
                 "word_count": doc["word_count"],
                 "char_count": doc["char_count"],
@@ -1520,12 +1342,8 @@ async def analyze_document(request: AnalysisRequest):
                 "reading_time_minutes": doc["reading_time_minutes"],
                 "file_type": doc["file_type"],
             },
-            
-            # Персонажи (пустой для базового анализа)
             "characters": [],
             "entities": [],
-            
-            # Метрики анализа
             "ai_analysis": False,
             "fallback": False,
             "analysis_type": request.analysis_type,
@@ -1543,7 +1361,6 @@ async def analyze_document(request: AnalysisRequest):
 # ========== ЦИТАТЫ ИЗ ДОКУМЕНТА ==========
 def _similarity(s1: str, s2: str) -> float:
     """Вычисление схожести строк (упрощенное)"""
-    # Используем последовательности слов для сравнения
     words1 = set(s1.split())
     words2 = set(s2.split())
     
@@ -1574,30 +1391,24 @@ async def get_document_quotes(document_id: int, limit: int = 5):
                 "fallback": True
             }
         
-        # Извлекаем предложения
         sentences = re.split(r'(?<=[.!?])\s+', content)
         quotes = []
         
         for sentence in sentences:
             sentence = sentence.strip()
-            # Берем только содержательные предложения
             if 30 < len(sentence) < 250:
                 quotes.append(sentence)
-                if len(quotes) >= limit * 2:  # Берем больше для фильтрации
+                if len(quotes) >= limit * 2:
                     break
         
-        # Фильтруем похожие цитаты
         unique_quotes = []
         seen_content = set()
         
         for quote in quotes:
-            # Нормализуем цитату (убираем лишние пробелы, приводим к нижнему регистру)
             normalized = ' '.join(quote.lower().split())
             
-            # Проверяем, нет ли похожей цитаты
             is_similar = False
             for seen in seen_content:
-                # Если цитаты похожи более чем на 70%, пропускаем
                 if _similarity(normalized, seen) > 0.7:
                     is_similar = True
                     break
@@ -1606,7 +1417,6 @@ async def get_document_quotes(document_id: int, limit: int = 5):
                 unique_quotes.append(quote)
                 seen_content.add(normalized)
         
-        # Если не нашли достаточно цитат, добавляем запасные
         if len(unique_quotes) < limit:
             fallback_quotes = [
                 "Каждая книга открывает новые горизонты.",
@@ -1616,7 +1426,6 @@ async def get_document_quotes(document_id: int, limit: int = 5):
                 "Текст — это мост между мыслью и её воплощением.",
             ]
             
-            # Добавляем недостающие цитаты
             for i in range(limit - len(unique_quotes)):
                 if i < len(fallback_quotes):
                     unique_quotes.append(fallback_quotes[i])
@@ -1667,5 +1476,5 @@ if __name__ == "__main__":
         port=PORT,
         log_level="info",
         access_log=True,
-        timeout_keep_alive=60  # Увеличиваем timeout для Railway
+        timeout_keep_alive=60
     )
