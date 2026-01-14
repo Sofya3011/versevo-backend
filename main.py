@@ -1,5 +1,6 @@
 import asyncio
 import time
+import threading
 # main.py - Бэкенд Versevo с PostgreSQL и Hugging Face AI
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -107,6 +108,13 @@ PORT = int(os.getenv("PORT", 8080))
 # Хранилище документов в памяти (для совместимости со старыми эндпоинтами)
 documents_store = {}
 current_doc_id = 1
+
+# ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ AI ==========
+# Инициализируем флаги загрузки
+HUGGING_FACE_ENABLED = False
+HF_ANALYSIS_PIPELINES = {}
+HF_TRANSLATOR_READY = False
+HF_ANALYSIS_READY = False
 
 # ========== УПРОЩЕННЫЙ ПЕРЕВОДЧИК С УЛУЧШЕНИЯМИ ==========
 class LocalTranslator:
@@ -304,22 +312,28 @@ class LocalTranslator:
         else:
             return text
 
-# ========== НАСТОЯЩИЙ ПЕРЕВОДЧИК HUGGING FACE ==========
+# Создаем экземпляр простого переводчика сразу
+local_translator = LocalTranslator()
+
+# ========== НАСТОЯЩИЙ ПЕРЕВОДЧИК HUGGING FACE (отложенная загрузка) ==========
 class HuggingFaceTranslator:
     """Настоящий переводчик через Hugging Face модели"""
     
     def __init__(self):
-        logger.info("🌍 Инициализация настоящего переводчика Hugging Face")
         self.translation_pipelines = {
             'en-ru': None,
             'ru-en': None,
         }
-        self.fallback_translator = LocalTranslator()
-        self._init_translation_models()
+        self.model_configs = {}
+        self.initialized = False
     
-    def _init_translation_models(self):
-        """Инициализация моделей перевода"""
+    def initialize(self):
+        """Инициализация моделей перевода (ленивая загрузка)"""
+        if self.initialized:
+            return True
+            
         try:
+            logger.info("🌍 Начинаем загрузку Hugging Face переводчика...")
             from transformers import pipeline
             import torch
             
@@ -340,14 +354,19 @@ class HuggingFaceTranslator:
                 }
             }
             
-            logger.info(f"✅ Переводчик Hugging Face готов (устройство: {device_name})")
+            logger.info(f"✅ Hugging Face переводчик готов к ленивой загрузке (устройство: {device_name})")
+            self.initialized = True
+            return True
             
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации переводчика: {e}")
-            self.model_configs = {}
+            return False
     
     def _get_translation_pipeline(self, source_lang: str, target_lang: str):
         """Получить или загрузить pipeline для перевода"""
+        if not self.initialized:
+            return None
+            
         key = f"{source_lang}-{target_lang}"
         
         if key not in self.translation_pipelines:
@@ -362,7 +381,7 @@ class HuggingFaceTranslator:
                 
                 if key in self.model_configs:
                     model_config = self.model_configs[key]
-                    logger.info(f"🔄 Загрузка модели перевода {key} ({model_config['model']})...")
+                    logger.info(f"🔄 Загружаем модель перевода {key} ({model_config['model']})...")
                     
                     self.translation_pipelines[key] = pipeline(
                         "translation",
@@ -383,9 +402,13 @@ class HuggingFaceTranslator:
     
     def translate(self, text: str, source_lang: str, target_lang: str, style: str = "artistic") -> str:
         """Настоящий перевод через Hugging Face"""
+        # Если не инициализирован, используем fallback
+        if not self.initialized:
+            return local_translator.translate(text, source_lang, target_lang, style)
+        
         # Если языки совпадают - возвращаем как есть
         if source_lang == target_lang:
-            return self.fallback_translator._apply_style(text, style)
+            return local_translator._apply_style(text, style)
         
         # Основные поддерживаемые языки
         supported_pairs = ['en-ru', 'ru-en']
@@ -394,7 +417,7 @@ class HuggingFaceTranslator:
         if key not in supported_pairs:
             # Для неподдерживаемых пар используем простой перевод
             logger.warning(f"⚠️ Неподдерживаемая пара переводов: {key}")
-            return self.fallback_translator.translate(text, source_lang, target_lang, style)
+            return local_translator.translate(text, source_lang, target_lang, style)
         
         try:
             # Получаем pipeline
@@ -403,7 +426,7 @@ class HuggingFaceTranslator:
             if pipeline is None:
                 # Fallback на простой перевод
                 logger.warning(f"⚠️ Pipeline перевода {key} не загружен")
-                return self.fallback_translator.translate(text, source_lang, target_lang, style)
+                return local_translator.translate(text, source_lang, target_lang, style)
             
             # Ограничиваем длину для памяти
             if len(text) > 1000:
@@ -421,20 +444,23 @@ class HuggingFaceTranslator:
                 logger.info(f"✅ Перевод завершен: {len(text)} → {len(translated_text)} символов")
                 
                 # Применяем стиль
-                translated_text = self.fallback_translator._apply_style(translated_text, style)
+                translated_text = local_translator._apply_style(translated_text, style)
                 
                 return translated_text
             else:
                 logger.warning(f"⚠️ Переводчик вернул пустой результат для {key}")
-                return self.fallback_translator.translate(text, source_lang, target_lang, style)
+                return local_translator.translate(text, source_lang, target_lang, style)
                 
         except Exception as e:
             logger.error(f"❌ Ошибка перевода {key}: {e}")
             # Fallback на простой перевод
-            return self.fallback_translator.translate(text, source_lang, target_lang, style)
+            return local_translator.translate(text, source_lang, target_lang, style)
     
     def is_available(self, source_lang: str, target_lang: str) -> bool:
         """Проверка доступности перевода для языковой пары"""
+        if not self.initialized:
+            return False
+            
         key = f"{source_lang}-{target_lang}"
         
         if key in self.model_configs:
@@ -443,13 +469,13 @@ class HuggingFaceTranslator:
         
         return False
 
-# ========== ИНИЦИАЛИЗАЦИЯ HUGGING FACE ДЛЯ АНАЛИЗА ==========
-HUGGING_FACE_ENABLED = False
-HF_ANALYSIS_PIPELINES = {}
+# Создаем экземпляр, но НЕ инициализируем пока
+hf_translator = HuggingFaceTranslator()
 
-def init_huggingface_for_analysis():
-    """Инициализация Hugging Face моделей для анализа"""
-    global HUGGING_FACE_ENABLED, HF_ANALYSIS_PIPELINES
+# ========== ФУНКЦИИ ДЛЯ ОТЛОЖЕННОЙ ЗАГРУЗКИ AI МОДЕЛЕЙ ==========
+def init_huggingface_for_analysis_background():
+    """Инициализация Hugging Face моделей для анализа в фоне"""
+    global HUGGING_FACE_ENABLED, HF_ANALYSIS_PIPELINES, HF_ANALYSIS_READY
     
     try:
         import transformers
@@ -458,7 +484,7 @@ def init_huggingface_for_analysis():
         # Проверяем доступность CUDA
         device = 0 if torch.cuda.is_available() else -1
         device_name = "CUDA" if torch.cuda.is_available() else "CPU"
-        logger.info(f"🏗️ Инициализация Hugging Face анализа на {device_name}")
+        logger.info(f"🏗️ Фоновая инициализация Hugging Face анализа на {device_name}")
         
         # Список моделей для анализа
         analysis_models = {
@@ -483,12 +509,10 @@ def init_huggingface_for_analysis():
         }
         
         HUGGING_FACE_ENABLED = True
-        logger.info("✅ Hugging Face анализ инициализирован (ленивая загрузка)")
-        logger.info(f"📦 Доступные модели анализа: {list(analysis_models.keys())}")
         
         # Предзагружаем только sentiment модель (самую легкую)
         try:
-            logger.info("🔄 Предзагрузка модели анализа тональности...")
+            logger.info("🔄 Фоновая загрузка модели анализа тональности...")
             from transformers import pipeline
             sentiment_pipeline = pipeline(
                 "sentiment-analysis",
@@ -496,47 +520,17 @@ def init_huggingface_for_analysis():
                 device=device
             )
             HF_ANALYSIS_PIPELINES["sentiment"]["pipeline"] = sentiment_pipeline
-            logger.info("✅ Модель анализа тональности загружена")
+            logger.info("✅ Модель анализа тональности загружена в фоне")
         except Exception as e:
             logger.warning(f"⚠️ Не удалось загрузить sentiment модель: {e}")
+        
+        HF_ANALYSIS_READY = True
+        logger.info("✅ Hugging Face анализ готов в фоне")
         
     except ImportError as e:
         logger.warning(f"⚠️ transformers не установлен: {e}")
     except Exception as e:
-        logger.error(f"❌ Ошибка инициализации Hugging Face анализа: {e}")
-
-# Инициализируем компоненты
-logger.info("=" * 60)
-logger.info("🚀 ИНИЦИАЛИЗАЦИЯ VERSION 6.0")
-logger.info("=" * 60)
-
-# Инициализируем переводчики
-local_translator = LocalTranslator()
-hf_translator = HuggingFaceTranslator()
-
-# Инициализируем анализ
-init_huggingface_for_analysis()
-
-# Инициализируем NLTK для анализа
-try:
-    import nltk
-    from nltk.tokenize import sent_tokenize, word_tokenize
-    from nltk.corpus import stopwords
-    
-    # Загружаем ресурсы NLTK
-    try:
-        nltk.data.find('tokenizers/punkt')
-        nltk.data.find('corpora/stopwords')
-    except LookupError:
-        nltk.download('punkt', quiet=True)
-        nltk.download('stopwords', quiet=True)
-        nltk.download('punkt_tab', quiet=True)
-    
-    NLTK_AVAILABLE = True
-    logger.info("✅ NLTK успешно инициализирован")
-except ImportError:
-    NLTK_AVAILABLE = False
-    logger.warning("⚠️ NLTK не установлен, часть анализа будет ограничена")
+        logger.error(f"❌ Ошибка фоновой инициализации Hugging Face анализа: {e}")
 
 def get_hf_analysis_pipeline(task: str):
     """Получить pipeline для задачи анализа (ленивая загрузка)"""
@@ -551,7 +545,7 @@ def get_hf_analysis_pipeline(task: str):
             
             device = 0 if torch.cuda.is_available() else -1
             model_config = HF_ANALYSIS_PIPELINES[task]
-            logger.info(f"🔄 Загрузка модели анализа {model_config['model_name']} для задачи {task}...")
+            logger.info(f"🔄 Ленивая загрузка модели анализа {model_config['model_name']} для задачи {task}...")
             
             if task == "summarization":
                 hf_pipeline = pipeline(
@@ -578,13 +572,77 @@ def get_hf_analysis_pipeline(task: str):
                 )
             
             HF_ANALYSIS_PIPELINES[task]["pipeline"] = hf_pipeline
-            logger.info(f"✅ Модель анализа {model_config['model_name']} загружена")
+            logger.info(f"✅ Модель анализа {model_config['model_name']} лениво загружена")
             
         except Exception as e:
-            logger.error(f"❌ Ошибка загрузки модели анализа {task}: {e}")
+            logger.error(f"❌ Ошибка ленивой загрузки модели анализа {task}: {e}")
             return None
     
     return HF_ANALYSIS_PIPELINES[task]["pipeline"]
+
+# ========== ФУНКЦИЯ ДЛЯ ФОНОВОЙ ИНИЦИАЛИЗАЦИИ ВСЕХ AI МОДЕЛЕЙ ==========
+def init_all_ai_models_in_background():
+    """Фоновая инициализация всех AI моделей"""
+    logger.info("🚀 Запуск фоновой инициализации AI моделей...")
+    
+    # 1. Сначала инициализируем Hugging Face переводчик
+    logger.info("🔄 Инициализация переводчика Hugging Face...")
+    if hf_translator.initialize():
+        global HF_TRANSLATOR_READY
+        HF_TRANSLATOR_READY = True
+        logger.info("✅ Переводчик Hugging Face инициализирован в фоне")
+    
+    # 2. Затем инициализируем анализ
+    logger.info("🔄 Инициализация анализа Hugging Face...")
+    init_huggingface_for_analysis_background()
+    
+    logger.info("🎉 Все AI модели инициализированы в фоне!")
+
+# ========== ЗАПУСКАЕМ ФОНОВУЮ ИНИЦИАЛИЗАЦИЮ AI МОДЕЛЕЙ ==========
+# Но НЕ блокируем основной поток!
+ai_init_thread = threading.Thread(target=init_all_ai_models_in_background, daemon=True)
+ai_init_thread.start()
+logger.info("🧵 Запущен фоновый поток для инициализации AI моделей")
+
+# ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ПРИ СТАРТЕ ==========
+def init_database():
+    """Инициализация базы данных"""
+    try:
+        from database import engine, Base
+        from models import User, Document, DocumentNote, ReadingProgress, DocumentAnalysis, FavoriteQuote, TranslationCache
+        
+        logger.info("🗄️  Создаем таблицы PostgreSQL...")
+        Base.metadata.create_all(bind=engine)
+        logger.info("✅ Таблицы созданы успешно!")
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ База данных недоступна: {e}")
+        logger.info("📝 Используем in-memory хранилище для документов")
+        return False
+
+# Запускаем инициализацию БД
+init_database()
+
+# ========== ИНИЦИАЛИЗАЦИЯ NLTK (если доступен) ==========
+try:
+    import nltk
+    from nltk.tokenize import sent_tokenize, word_tokenize
+    from nltk.corpus import stopwords
+    
+    # Загружаем ресурсы NLTK
+    try:
+        nltk.data.find('tokenizers/punkt')
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
+        nltk.download('stopwords', quiet=True)
+        nltk.download('punkt_tab', quiet=True)
+    
+    NLTK_AVAILABLE = True
+    logger.info("✅ NLTK успешно инициализирован")
+except ImportError:
+    NLTK_AVAILABLE = False
+    logger.warning("⚠️ NLTK не установлен, часть анализа будет ограничена")
 
 # ========== УТИЛИТЫ ДЛЯ АНАЛИЗА ==========
 def extract_text_from_file(file_path: str, file_type: str) -> str:
@@ -718,307 +776,40 @@ def detect_chapters(text: str) -> List[Dict]:
     
     return chapters
 
-# ========== НОВЫЕ ЭНДПОИНТЫ ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ ==========
-
-@app.get("/api/db/health")
-async def db_health(db: Session = Depends(get_db)):
-    """Проверка здоровья БД"""
-    try:
-        # Простой запрос для проверки
-        result = db.execute("SELECT 1")
-        return {
-            "status": "healthy",
-            "database": "PostgreSQL",
-            "connected": True,
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
-
-@app.post("/api/db/documents", response_model=dict)
-async def create_document(
-    document: DocumentCreate,
-    db: Session = Depends(get_db)
-):
-    """Создание документа в БД"""
-    try:
-        # Определяем главы
-        chapters = detect_chapters(document.content)
-        
-        db_document = Document(
-            title=document.title,
-            filename=document.filename,
-            content=document.content,
-            language=document.language,
-            file_type=document.file_type,
-            user_id=document.user_id,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-            word_count=len(document.content.split()),
-            char_count=len(document.content),
-            chapter_count=len(chapters),
-            reading_time_minutes=max(1, len(document.content.split()) // 200),
-            chapters=chapters,
-            metadata={"source": "web_upload"}
-        )
-        db.add(db_document)
-        db.commit()
-        db.refresh(db_document)
-        
-        return {
-            "id": db_document.id,
-            "title": db_document.title,
-            "filename": db_document.filename,
-            "message": "Document created successfully"
-        }
-    except Exception as e:
-        db.rollback()
-        logger.error(f"❌ Ошибка создания документа: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create document: {str(e)}")
-
-@app.get("/api/db/documents", response_model=List[dict])
-async def get_documents_db(
-    skip: int = 0,
-    limit: int = 100,
-    db: Session = Depends(get_db)
-):
-    """Получение документов из БД"""
-    documents = db.query(Document).order_by(Document.created_at.desc()).offset(skip).limit(limit).all()
-    
-    return [
-        {
-            "id": doc.id,
-            "title": doc.title,
-            "filename": doc.filename,
-            "language": doc.language,
-            "file_type": doc.file_type,
-            "word_count": doc.word_count,
-            "char_count": doc.char_count,
-            "chapter_count": doc.chapter_count,
-            "reading_time_minutes": doc.reading_time_minutes,
-            "created_at": doc.created_at.isoformat() if doc.created_at else None,
-            "updated_at": doc.updated_at.isoformat() if doc.updated_at else None
-        }
-        for doc in documents
-    ]
-
-@app.get("/api/db/documents/{document_id}")
-async def get_document_db(document_id: int, db: Session = Depends(get_db)):
-    """Получение документа по ID из БД"""
-    document = db.query(Document).filter(Document.id == document_id).first()
-    
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    return {
-        "id": document.id,
-        "title": document.title,
-        "filename": document.filename,
-        "content": document.content,
-        "language": document.language,
-        "file_type": document.file_type,
-        "word_count": document.word_count,
-        "char_count": document.char_count,
-        "chapter_count": document.chapter_count,
-        "reading_time_minutes": document.reading_time_minutes,
-        "created_at": document.created_at.isoformat() if document.created_at else None,
-        "chapters": document.chapters if document.chapters else [],
-        "metadata": document.metadata if document.metadata else {}
-    }
-
-@app.post("/api/db/notes")
-async def create_note(
-    note: NoteCreate,
-    db: Session = Depends(get_db)
-):
-    """Создание заметки"""
-    try:
-        db_note = DocumentNote(
-            document_id=note.document_id,
-            user_id=note.user_id,
-            text=note.text,
-            selected_text=note.selected_text,
-            chapter_index=note.chapter_index,
-            is_highlight=note.is_highlight,
-            created_at=datetime.utcnow()
-        )
-        db.add(db_note)
-        db.commit()
-        db.refresh(db_note)
-        return {"id": db_note.id, "message": "Note created"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/db/documents/{document_id}/notes")
-async def get_document_notes_db(
-    document_id: int,
-    db: Session = Depends(get_db)
-):
-    """Получение заметок документа"""
-    notes = db.query(DocumentNote).filter(
-        DocumentNote.document_id == document_id
-    ).order_by(DocumentNote.created_at.desc()).all()
-    
-    return [
-        {
-            "id": note.id,
-            "text": note.text,
-            "selected_text": note.selected_text,
-            "chapter_index": note.chapter_index,
-            "is_highlight": note.is_highlight,
-            "color": note.color,
-            "created_at": note.created_at.isoformat() if note.created_at else None
-        }
-        for note in notes
-    ]
-
-@app.post("/api/db/progress")
-async def update_reading_progress(
-    progress_data: dict,
-    db: Session = Depends(get_db)
-):
-    """Обновление прогресса чтения"""
-    try:
-        document_id = progress_data.get('document_id')
-        user_id = progress_data.get('user_id')
-        
-        # Проверяем, существует ли уже запись
-        existing = db.query(ReadingProgress).filter(
-            ReadingProgress.document_id == document_id,
-            ReadingProgress.user_id == user_id
-        ).first()
-        
-        if existing:
-            # Обновляем существующую запись
-            existing.chapter_index = progress_data.get('chapter_index', existing.chapter_index)
-            existing.scroll_position = progress_data.get('scroll_position', existing.scroll_position)
-            existing.percentage = progress_data.get('percentage', existing.percentage)
-            existing.last_read_at = datetime.utcnow()
-            existing.updated_at = datetime.utcnow()
-        else:
-            # Создаем новую запись
-            db_progress = ReadingProgress(
-                document_id=document_id,
-                user_id=user_id,
-                chapter_index=progress_data.get('chapter_index', 0),
-                scroll_position=progress_data.get('scroll_position', 0.0),
-                percentage=progress_data.get('percentage', 0.0),
-                last_read_at=datetime.utcnow(),
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
-            )
-            db.add(db_progress)
-        
-        db.commit()
-        return {"status": "success", "message": "Progress updated"}
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/db/users/{user_id}/progress")
-async def get_user_progress(
-    user_id: int,
-    db: Session = Depends(get_db)
-):
-    """Получение прогресса пользователя"""
-    progress_records = db.query(ReadingProgress).filter(
-        ReadingProgress.user_id == user_id
-    ).all()
-    
-    return [
-        {
-            "document_id": progress.document_id,
-            "chapter_index": progress.chapter_index,
-            "percentage": progress.percentage,
-            "last_read_at": progress.last_read_at.isoformat() if progress.last_read_at else None
-        }
-        for progress in progress_records
-    ]
-
-# ========== HEALTH CHECK ENDPOINTS ==========
+# ========== HEALTH CHECK ENDPOINTS (ДОЛЖНЫ РАБОТАТЬ СРАЗУ!) ==========
 @app.get("/")
 async def root():
-    """Корневой эндпоинт"""
-    endpoints = {
-        "health": "/api/health",
-        "db_health": "/api/db/health",
-        "upload": "/api/documents/upload-base64",
-        "documents": "/api/documents",
-        "db_documents": "/api/db/documents",
-        "translate": "/api/translate/text",
-        "analyze": "/api/analyze",
-        "notes": "/api/db/notes",
-        "progress": "/api/db/progress",
-    }
-    
+    """Корневой эндпоинт - работает сразу!"""
     return {
         "message": "Versevo Backend API v6.0",
         "version": "6.0.0",
         "status": "running",
+        "ai_models_loading": "in_progress" if not HF_TRANSLATOR_READY else "ready",
         "database": "PostgreSQL",
-        "translation": {
-            "huggingface_available": hf_translator.is_available('en', 'ru'),
-            "fallback_available": True
-        },
-        "analysis": {
-            "huggingface_available": HUGGING_FACE_ENABLED,
-            "nltk_available": NLTK_AVAILABLE
-        },
-        "timestamp": datetime.now().isoformat(),
-        "endpoints": endpoints
-    }
-
-# В main.py ПОСЛЕ СОЗДАНИЯ app = FastAPI(...) ДОБАВЬТЕ:
-
-@app.get("/")
-@app.get("/health")
-@app.get("/api")
-async def simple_health():
-    """Простой healthcheck который всегда работает"""
-    return {
-        "status": "ok",
-        "message": "Versevo API is running",
-        "timestamp": datetime.now().isoformat(),
-        "version": "6.0.0"
+        "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/api/flutter/health")
 async def flutter_health_check():
-    """Эндпоинт для healthcheck Railway/Flutter"""
+    """Эндпоинт для healthcheck Railway/Flutter - работает СРАЗУ!"""
     return {
         "status": "healthy", 
         "service": "versevo-backend",
         "database": "PostgreSQL",
         "timestamp": datetime.now().isoformat(),
         "version": "6.0.0",
-        "features": {
-            "translation": "huggingface+fallback",
-            "analysis": "huggingface+nltk+basic",
-            "database": "postgresql"
-        }
+        "ai_models": "loading_in_background" if not HF_TRANSLATOR_READY else "ready"
     }
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint - работает СРАЗУ!"""
     return {
         "status": "healthy", 
         "service": "versevo-backend", 
         "database": "PostgreSQL",
-        "translation": {
-            "huggingface": hf_translator.is_available('en', 'ru'),
-            "fallback": True
-        },
-        "analysis": {
-            "huggingface": HUGGING_FACE_ENABLED,
-            "nltk": NLTK_AVAILABLE
-        },
+        "ai_translator": "ready" if HF_TRANSLATOR_READY else "loading",
+        "ai_analysis": "ready" if HF_ANALYSIS_READY else "loading",
         "timestamp": datetime.now().isoformat(),
         "version": "6.0.0"
     }
@@ -1157,7 +948,7 @@ async def translate_text(request: TranslateRequest):
         target_lang = request.target_language
         
         # Выбираем переводчик в зависимости от доступности
-        use_huggingface = hf_translator.is_available(source_lang, target_lang)
+        use_huggingface = HF_TRANSLATOR_READY and hf_translator.is_available(source_lang, target_lang)
         
         if use_huggingface:
             logger.info(f"🔄 Используем Hugging Face перевод: {source_lang} → {target_lang}")
@@ -1563,10 +1354,10 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
 async def ai_health_check():
     """Проверка доступности AI"""
     return {
-        "status": "healthy" if HUGGING_FACE_ENABLED else "unavailable",
+        "status": "ready" if HF_ANALYSIS_READY else "loading",
         "service": "huggingface",
         "available": HUGGING_FACE_ENABLED,
-        "models_loaded": [k for k, v in HF_ANALYSIS_PIPELINES.items() if v["pipeline"] is not None],
+        "models_ready": HF_ANALYSIS_READY,
         "models_available": list(HF_ANALYSIS_PIPELINES.keys()),
         "timestamp": datetime.now().isoformat()
     }
@@ -1586,6 +1377,24 @@ async def analyze_with_ai(request: AIAnalysisRequest):
         
         if not content or len(content.strip()) < 10:
             raise HTTPException(status_code=400, detail="Document has no content")
+        
+        # Проверяем готовность AI
+        if not HF_ANALYSIS_READY:
+            return {
+                "document_id": document_id,
+                "summary": "AI модели еще загружаются. Пожалуйста, подождите несколько секунд и попробуйте снова.",
+                "themes": ["Загрузка AI"],
+                "sentiment": "Не определена",
+                "writing_style": "Не определен",
+                "key_points": [
+                    "AI модели загружаются в фоне",
+                    "Попробуйте обновить страницу через 30 секунд",
+                    "Используйте базовый анализ пока"
+                ],
+                "ai_analysis": False,
+                "fallback": True,
+                "analysis_timestamp": datetime.now().isoformat(),
+            }
         
         # Выполняем анализ
         logger.info(f"🔍 Начинаем AI анализ документа {document_id}")
@@ -1844,11 +1653,12 @@ if __name__ == "__main__":
     logger.info(f"🚀 ЗАПУСК VERSION 6.0 НА ПОРТУ {PORT}")
     logger.info(f"{'='*60}")
     logger.info(f"📁 Папка загрузок: {os.path.abspath(UPLOAD_FOLDER)}")
-    logger.info(f"🔤 Перевод: Hugging Face + Fallback")
+    logger.info(f"🔤 Перевод: Hugging Face + Fallback (загружается в фоне)")
     logger.info(f"🗄️  База данных: PostgreSQL (Railway)")
-    logger.info(f"🤖 Hugging Face перевод: {'ДОСТУПЕН' if hf_translator.is_available('en', 'ru') else 'НЕ ДОСТУПЕН'}")
-    logger.info(f"📊 Hugging Face анализ: {'ДОСТУПЕН' if HUGGING_FACE_ENABLED else 'НЕ ДОСТУПЕН'}")
+    logger.info(f"🤖 Hugging Face перевод: {'ЗАГРУЖАЕТСЯ В ФОНЕ'}")
+    logger.info(f"📊 Hugging Face анализ: {'ЗАГРУЖАЕТСЯ В ФОНЕ'}")
     logger.info(f"📈 NLTK анализ: {'ДОСТУПЕН' if NLTK_AVAILABLE else 'НЕ ДОСТУПЕН'}")
+    logger.info(f"💡 Healthcheck работает СРАЗУ, AI модели грузятся в фоне")
     logger.info(f"{'='*60}")
     
     uvicorn.run(
@@ -1856,5 +1666,6 @@ if __name__ == "__main__":
         host="0.0.0.0", 
         port=PORT,
         log_level="info",
-        access_log=True
+        access_log=True,
+        timeout_keep_alive=60  # Увеличиваем timeout для Railway
     )
