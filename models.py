@@ -46,8 +46,8 @@ class Document(Base):
     chapter_count = Column(Integer, default=0)
     reading_time_minutes = Column(Integer, default=0)
     
-    # Метаданные
-    metadata = Column(JSON, nullable=True, default=dict)
+    # Метаданные - ИЗМЕНЕНО: переименовано из 'metadata' в 'document_metadata'
+    document_metadata = Column(JSON, nullable=True, default=dict)  # <-- ИЗМЕНЕНИЕ ЗДЕСЬ
     chapters = Column(JSON, nullable=True, default=list)
     
     # Системные поля
