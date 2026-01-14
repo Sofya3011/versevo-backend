@@ -1,79 +1,48 @@
+#!/usr/bin/env python3
 """
 Railway Startup Script
-Загружает модели ПОСЛЕ успешного запуска healthcheck
+Запускает приложение с правильными настройками для Railway
 """
 import os
-import sys
-import threading
 import time
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def load_ai_models_in_background():
-    """Фоновая загрузка тяжелых моделей AI"""
-    def load_models():
-        try:
-            logger.info("🔄 Фоновая загрузка AI моделей...")
-            
-            # Импортируем и инициализируем модели ПОСЛЕ запуска сервера
-            time.sleep(10)  # Даем время запуститься healthcheck
-            
-            # Ленивая загрузка Hugging Face
-            from transformers import pipeline
-            
-            # Загружаем только минимальные модели для старта
-            logger.info("📦 Загружаем базовые модели...")
-            
-            # Translation pipeline (лениво загрузится при первом запросе)
-            global translation_pipeline
-            translation_pipeline = None  # Инициализируем позже
-            
-            logger.info("✅ AI модели готовы к ленивой загрузке")
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка загрузки моделей: {e}")
+def main():
+    logger.info("🚀 Запуск Versevo Backend на Railway...")
     
-    # Запускаем в отдельном потоке
-    thread = threading.Thread(target=load_models, daemon=True)
-    thread.start()
-    return thread
-
-def init_database():
-    """Инициализация базы данных"""
-    try:
-        from database import engine, Base
-        from models import User, Document, DocumentNote, ReadingProgress, DocumentAnalysis, FavoriteQuote, TranslationCache
-        
-        logger.info("🗄️  Создаем таблицы PostgreSQL...")
-        Base.metadata.create_all(bind=engine)
-        logger.info("✅ Таблицы созданы")
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️ База данных недоступна: {e}")
-        logger.info("📝 Используем in-memory хранилище для документов")
-        return False
-
-if __name__ == "__main__":
-    # 1. Сначала БД
-    init_database()
+    # Ждем немного чтобы Railway успел инициализировать окружение
+    logger.info("⏳ Ожидание инициализации окружения Railway...")
+    time.sleep(3)
     
-    # 2. Запускаем фоновую загрузку AI
-    load_ai_models_in_background()
+    # Устанавливаем переменные окружения для кэша моделей
+    os.environ.setdefault('HF_HOME', '/tmp/huggingface')
+    os.environ.setdefault('TRANSFORMERS_CACHE', '/tmp/huggingface')
+    os.environ.setdefault('TORCH_HOME', '/tmp/torch')
     
-    # 3. Импортируем и запускаем приложение
+    # Создаем директории для кэша
+    os.makedirs('/tmp/huggingface', exist_ok=True)
+    os.makedirs('/tmp/torch', exist_ok=True)
+    
+    # Импортируем и запускаем основное приложение
     from main import app
     import uvicorn
     
     port = int(os.getenv("PORT", 8080))
-    logger.info(f"🚀 Запуск Versevo на порту {port}")
+    logger.info(f"🎯 Запуск FastAPI на порту {port}")
     
+    # Запускаем с увеличенными таймаутами для Railway
     uvicorn.run(
-        app, 
-        host="0.0.0.0", 
+        app,
+        host="0.0.0.0",
         port=port,
-        # Важно для Railway!
-        timeout_keep_alive=30,
-        access_log=True
+        log_level="info",
+        access_log=True,
+        timeout_keep_alive=60,
+        timeout_graceful_shutdown=30
     )
+
+if __name__ == "__main__":
+    main()
