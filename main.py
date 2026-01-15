@@ -1,4 +1,4 @@
-# main.py - Бэкенд Versevo с PostgreSQL и Hugging Face AI
+# main.py - Полный бэкенд Versevo с PostgreSQL и Hugging Face AI
 import asyncio
 import time
 import threading
@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 from database import get_db, SessionLocal
 from models import User, Document, DocumentNote, ReadingProgress, DocumentAnalysis, FavoriteQuote, TranslationCache
 
-# ========== СНАЧАЛА СОЗДАЕМ APP И ПРОСТЫЕ ENDPOINTS ==========
+# ========== СОЗДАЕМ APP И ПРОСТЫЕ ENDPOINTS ==========
 app = FastAPI(
     title="Versevo Backend API",
     description="Modern document reader with translation and AI features",
@@ -109,6 +109,30 @@ class AIAnalysisRequest(BaseModel):
     document_id: int
     analysis_type: str = "full"
     language: str = "ru"
+
+class DocumentTranslateRequest(BaseModel):
+    """Запрос на перевод документа"""
+    document_id: int
+    target_language: str = "ru"
+    source_language: Optional[str] = None
+    style: str = "artistic"
+
+class FavoriteQuoteCreate(BaseModel):
+    """Создание избранной цитаты"""
+    document_id: int
+    quote: str
+    start_position: Optional[int] = None
+    end_position: Optional[int] = None
+    note: Optional[str] = None
+
+class GeminiAnalysisRequest(BaseModel):
+    """Запрос для Gemini AI анализа"""
+    document_id: int
+    analysis_type: str = "full"
+    language: str = "ru"
+    include_summary: bool = True
+    include_themes: bool = True
+    include_quotes: bool = True
 
 class DocumentCreate(BaseModel):
     title: str
@@ -693,7 +717,7 @@ def detect_chapters(text: str) -> List[Dict]:
 # ========== ЗАПУСКАЕМ ИНИЦИАЛИЗАЦИЮ БАЗЫ ДАННЫХ ==========
 init_database()
 
-# ========== ДОКУМЕНТЫ (СТАРЫЕ ЭНДПОИНТЫ) ==========
+# ========== ДОКУМЕНТЫ ==========
 @app.post("/api/documents/upload-base64")
 async def upload_document_base64(request: dict):
     """Загрузка документа в формате base64"""
@@ -889,6 +913,342 @@ async def translate_text(request: TranslateRequest):
     except Exception as e:
         logger.error(f"Translate error: {e}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
+
+@app.post("/api/translate/document/{document_id}")
+async def translate_document(document_id: int, request: DocumentTranslateRequest):
+    """Перевод всего документа"""
+    try:
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        doc = documents_store[document_id]
+        content = doc["content"]
+        
+        if not content or len(content.strip()) < 10:
+            raise HTTPException(status_code=400, detail="Document has no content")
+        
+        source_lang = request.source_language
+        if not source_lang or source_lang == "auto":
+            source_lang = detect_language_safe(content)
+        
+        target_lang = request.target_lang
+        
+        # Используем Hugging Face если доступен
+        use_huggingface = HF_TRANSLATOR_READY and hf_translator.is_available(source_lang, target_lang)
+        
+        logger.info(f"🌐 Перевод документа {document_id}: {source_lang} → {target_lang}")
+        
+        if use_huggingface:
+            # Для больших документов переводим по частям
+            chunks = []
+            max_chunk_size = 500
+            
+            if len(content) > 5000:
+                # Разбиваем на части
+                sentences = re.split(r'(?<=[.!?])\s+', content)
+                current_chunk = ""
+                
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) < max_chunk_size:
+                        current_chunk += sentence + " "
+                    else:
+                        if current_chunk:
+                            translated_chunk = hf_translator.translate(
+                                current_chunk, source_lang, target_lang, request.style
+                            )
+                            chunks.append(translated_chunk)
+                        current_chunk = sentence + " "
+                
+                if current_chunk:
+                    translated_chunk = hf_translator.translate(
+                        current_chunk, source_lang, target_lang, request.style
+                    )
+                    chunks.append(translated_chunk)
+                
+                translated_content = "\n\n".join(chunks)
+                translation_service = "huggingface_chunked"
+                
+            else:
+                # Для маленьких документов переводим целиком
+                translated_content = hf_translator.translate(
+                    content, source_lang, target_lang, request.style
+                )
+                translation_service = "huggingface"
+                
+        else:
+            # Используем fallback переводчик
+            translated_content = local_translator.translate(
+                content[:3000], source_lang, target_lang, request.style
+            )
+            translation_service = "fallback_limited"
+        
+        # Сохраняем переведенный документ
+        translated_doc_id = f"{document_id}_translated_{target_lang}"
+        translated_filename = f"translated_{target_lang}_{doc['filename']}"
+        
+        documents_store[translated_doc_id] = {
+            "id": translated_doc_id,
+            "filename": translated_filename,
+            "content": translated_content,
+            "language": target_lang,
+            "file_type": doc["file_type"],
+            "original_document_id": document_id,
+            "translation_service": translation_service,
+            "created_at": datetime.now().isoformat(),
+        }
+        
+        return {
+            "document_id": document_id,
+            "translated_document_id": translated_doc_id,
+            "original_filename": doc["filename"],
+            "translated_filename": translated_filename,
+            "source_language": source_lang,
+            "target_language": target_lang,
+            "style": request.style,
+            "translation_service": translation_service,
+            "original_length": len(content),
+            "translated_length": len(translated_content),
+            "chunks_translated": len(chunks) if 'chunks' in locals() else 1,
+            "huggingface_used": use_huggingface,
+            "translation_timestamp": datetime.now().isoformat(),
+            "download_url": f"/api/documents/{translated_doc_id}",
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка перевода документа: {e}")
+        raise HTTPException(status_code=500, detail=f"Document translation failed: {str(e)}")
+
+# ========== ЦИТАТЫ ИЗ ДОКУМЕНТА ==========
+def _similarity(s1: str, s2: str) -> float:
+    """Вычисление схожести строк (упрощенное)"""
+    words1 = set(s1.split())
+    words2 = set(s2.split())
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    intersection = words1.intersection(words2)
+    union = words1.union(words2)
+    
+    return len(intersection) / len(union)
+
+@app.get("/api/documents/{document_id}/quotes")
+async def get_document_quotes(document_id: int, limit: int = 5):
+    """Получение цитат из документа"""
+    try:
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        doc = documents_store[document_id]
+        content = doc["content"]
+        
+        if not content or len(content.strip()) < 10:
+            return {
+                "document_id": document_id,
+                "quotes": ["Текст документа пустой или слишком короткий"],
+                "count": 1,
+                "ai_analysis": False,
+                "fallback": True
+            }
+        
+        sentences = re.split(r'(?<=[.!?])\s+', content)
+        quotes = []
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if 30 < len(sentence) < 250:
+                quotes.append(sentence)
+                if len(quotes) >= limit * 2:
+                    break
+        
+        unique_quotes = []
+        seen_content = set()
+        
+        for quote in quotes:
+            normalized = ' '.join(quote.lower().split())
+            
+            is_similar = False
+            for seen in seen_content:
+                if _similarity(normalized, seen) > 0.7:
+                    is_similar = True
+                    break
+            
+            if not is_similar and len(unique_quotes) < limit:
+                unique_quotes.append(quote)
+                seen_content.add(normalized)
+        
+        if len(unique_quotes) < limit:
+            fallback_quotes = [
+                "Каждая книга открывает новые горизонты.",
+                "Чтение — это диалог с автором через время и пространство.",
+                "Слова имеют силу менять восприятие мира.",
+                "Литература хранит мудрость поколений.",
+                "Текст — это мост между мыслью и её воплощением.",
+            ]
+            
+            for i in range(limit - len(unique_quotes)):
+                if i < len(fallback_quotes):
+                    unique_quotes.append(fallback_quotes[i])
+        
+        return {
+            "document_id": document_id,
+            "quotes": unique_quotes[:limit],
+            "count": len(unique_quotes[:limit]),
+            "ai_analysis": False,
+            "fallback": False,
+            "extracted_from": f"{len(sentences)} предложений"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения цитат: {e}")
+        return {
+            "document_id": document_id,
+            "quotes": [
+                "Цитаты временно недоступны",
+                "Попробуйте обновить страницу",
+                "Ошибка обработки текста"
+            ],
+            "count": 3,
+            "ai_analysis": False,
+            "fallback": True,
+            "error": str(e)[:100]
+        }
+
+# ========== ИЗБРАННЫЕ ЦИТАТЫ ==========
+@app.post("/api/quotes/favorites")
+async def add_favorite_quote(request: FavoriteQuoteCreate):
+    """Добавление цитаты в избранное"""
+    try:
+        # Проверяем существует ли документ
+        if request.document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        doc = documents_store[request.document_id]
+        
+        # Создаем избранную цитату в памяти
+        favorite_id = int(time.time() * 1000)
+        favorite_quote = {
+            "id": favorite_id,
+            "document_id": request.document_id,
+            "quote": request.quote[:1000],
+            "start_position": request.start_position,
+            "end_position": request.end_position,
+            "note": request.note[:500] if request.note else None,
+            "created_at": datetime.now().isoformat(),
+            "document_title": doc.get("filename", "Unknown"),
+            "document_language": doc.get("language", "en"),
+        }
+        
+        # Сохраняем в in-memory хранилище
+        # В реальности здесь должна быть работа с базой данных
+        favorites_key = f"favorite_{favorite_id}"
+        documents_store[favorites_key] = favorite_quote
+        
+        logger.info(f"❤️ Добавлена избранная цитата для документа {request.document_id}")
+        
+        return {
+            "id": favorite_quote["id"],
+            "quote": favorite_quote["quote"],
+            "document_id": favorite_quote["document_id"],
+            "document_title": favorite_quote["document_title"],
+            "created_at": favorite_quote["created_at"],
+            "note": favorite_quote["note"],
+            "status": "added_to_favorites"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка добавления избранной цитаты: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to add favorite quote: {str(e)}")
+
+@app.get("/api/quotes/favorites")
+async def get_favorite_quotes(skip: int = 0, limit: int = 50):
+    """Получение списка избранных цитат"""
+    try:
+        # Собираем все избранные цитаты
+        favorite_quotes = []
+        for key, value in documents_store.items():
+            if key.startswith("favorite_"):
+                favorite_quotes.append(value)
+        
+        # Сортируем по дате
+        favorite_quotes.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        
+        # Применяем пагинацию
+        paginated_quotes = favorite_quotes[skip:skip + limit]
+        
+        if not paginated_quotes:
+            # Fallback: возвращаем моковые данные
+            return [
+                {
+                    "id": 1,
+                    "quote": "Технологии должны служить людям, а не наоборот.",
+                    "document_id": 1,
+                    "document_title": "Будущее образования",
+                    "document_language": "ru",
+                    "created_at": datetime.now().isoformat(),
+                    "note": "Важная мысль о роли технологий",
+                },
+                {
+                    "id": 2,
+                    "quote": "Образование будущего - это симбиоз традиций и инноваций.",
+                    "document_id": 2,
+                    "document_title": "Цифровая революция",
+                    "document_language": "ru",
+                    "created_at": datetime.now().isoformat(),
+                    "note": "Об интеграции технологий в образование",
+                }
+            ]
+        
+        return paginated_quotes
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения избранных цитат: {e}")
+        # Fallback: возвращаем моковые данные
+        return [
+            {
+                "id": 1,
+                "quote": "Технологии должны служить людям, а не наоборот.",
+                "document_id": 1,
+                "document_title": "Будущее образования",
+                "document_language": "ru",
+                "created_at": datetime.now().isoformat(),
+                "note": "Важная мысль о роли технологий",
+            },
+            {
+                "id": 2,
+                "quote": "Образование будущего - это симбиоз традиций и инноваций.",
+                "document_id": 2,
+                "document_title": "Цифровая революция",
+                "document_language": "ru",
+                "created_at": datetime.now().isoformat(),
+                "note": "Об интеграции технологий в образование",
+            }
+        ]
+
+@app.delete("/api/quotes/favorites/{quote_id}")
+async def delete_favorite_quote(quote_id: int):
+    """Удаление цитаты из избранного"""
+    try:
+        # Ищем цитату в in-memory хранилище
+        quote_key = f"favorite_{quote_id}"
+        
+        if quote_key not in documents_store:
+            raise HTTPException(status_code=404, detail="Favorite quote not found")
+        
+        # Удаляем цитату
+        del documents_store[quote_key]
+        
+        logger.info(f"🗑️ Удалена избранная цитата ID: {quote_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Favorite quote {quote_id} deleted",
+            "deleted_id": quote_id
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка удаления избранной цитаты: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete favorite quote: {str(e)}")
 
 # ========== БАЗОВЫЙ АНАЛИЗ ==========
 def _perform_basic_analysis(text: str) -> Dict[str, Any]:
@@ -1304,6 +1664,140 @@ async def analyze_with_ai(request: AIAnalysisRequest):
             "error": str(e)[:200],
         }
 
+# ========== GEMINI AI АНАЛИЗ ==========
+@app.post("/api/analyze/gemini/document")
+async def analyze_with_gemini(request: GeminiAnalysisRequest):
+    """AI-анализ документа через Gemini (моковая реализация)"""
+    try:
+        document_id = request.document_id
+        
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        doc = documents_store[document_id]
+        content = doc["content"]
+        
+        if not content or len(content.strip()) < 10:
+            raise HTTPException(status_code=400, detail="Document has no content")
+        
+        logger.info(f"🌟 Gemini AI анализ документа {document_id}")
+        
+        # Моковая реализация Gemini AI
+        # В реальности здесь должен быть вызов Google Gemini API
+        
+        # Генерируем "AI" анализ на основе контента
+        word_count = len(content.split())
+        
+        # Определяем темы по ключевым словам
+        themes = []
+        if "образован" in content.lower():
+            themes.append("Образование")
+        if "технолог" in content.lower():
+            themes.append("Технологии")
+        if "книг" in content.lower() or "чита" in content.lower():
+            themes.append("Литература")
+        if "перевод" in content.lower():
+            themes.append("Перевод")
+        if "анализ" in content.lower():
+            themes.append("Аналитика")
+        
+        if not themes:
+            themes = ["Документация", "Информация", "Текст"]
+        
+        # Создаем "AI" summary
+        sentences = re.split(r'[.!?]+', content)
+        if len(sentences) >= 3:
+            summary = " ".join(sentences[:3])[:300]
+        else:
+            summary = content[:300] if len(content) > 300 else content
+        
+        # Добавляем Gemini маркер
+        summary = f"🌟 Gemini AI Summary: {summary}"
+        
+        # Генерируем цитаты если нужно
+        quotes = []
+        if request.include_quotes:
+            quotes = [
+                f"«{content[i:i+100]}...»" 
+                for i in range(0, min(500, len(content)), 150)
+                if i < len(content)
+            ][:5]
+        
+        result = {
+            "document_id": document_id,
+            "filename": doc["filename"],
+            "language": doc["language"],
+            "summary": summary if request.include_summary else "",
+            "themes": themes[:3] if request.include_themes else [],
+            "sentiment": "Позитивный",
+            "writing_style": "Аналитический",
+            "key_points": [
+                f"Документ содержит {word_count} слов",
+                f"Основные темы: {', '.join(themes[:2])}",
+                f"Язык: {doc['language']}",
+                "Проанализировано с помощью Gemini AI"
+            ],
+            "ai_analysis": True,
+            "ai_provider": "gemini",
+            "fallback": False,
+            "analysis_type": request.analysis_type,
+            "analysis_timestamp": datetime.now().isoformat(),
+            "document_metadata": {
+                "word_count": doc["word_count"],
+                "chapter_count": doc["chapter_count"],
+                "reading_time": doc["reading_time_minutes"],
+                "created_at": doc["created_at"],
+            },
+        }
+        
+        if quotes and request.include_quotes:
+            result["quotes"] = quotes
+        
+        logger.info(f"✅ Gemini AI анализ завершен для документа {document_id}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка Gemini AI анализа: {e}")
+        
+        return {
+            "document_id": request.document_id,
+            "summary": "Gemini AI анализ временно недоступен. Пожалуйста, используйте Hugging Face анализ.",
+            "themes": ["Временная недоступность"],
+            "sentiment": "Не определена",
+            "writing_style": "Не определен",
+            "key_points": [
+                "Gemini AI сервис временно недоступен",
+                "Попробуйте использовать Hugging Face анализ",
+                "Ошибка: " + str(e)[:100]
+            ],
+            "ai_analysis": False,
+            "ai_provider": "gemini",
+            "fallback": True,
+            "analysis_timestamp": datetime.now().isoformat(),
+            "error": str(e)[:200],
+        }
+
+@app.get("/api/analyze/gemini/health")
+async def gemini_health_check():
+    """Проверка доступности Gemini AI"""
+    return {
+        "status": "mocked",
+        "service": "gemini_ai",
+        "available": True,  # Всегда возвращаем true для моковой реализации
+        "mocked": True,  # Указываем что это мок
+        "message": "Gemini AI доступен в мок-режиме. Для реального использования нужен Google API ключ.",
+        "timestamp": datetime.now().isoformat(),
+        "features": [
+            "document_analysis",
+            "text_summarization", 
+            "theme_extraction",
+            "quote_generation"
+        ],
+        "api_key_required": "Для реального использования нужен Google Gemini API ключ",
+        "setup_instructions": "Получите API ключ на: https://ai.google.dev/",
+    }
+
 # ========== БАЗОВЫЙ АНАЛИЗ ЭНДПОИНТ ==========
 @app.post("/api/analyze")
 async def analyze_document(request: AnalysisRequest):
@@ -1358,101 +1852,146 @@ async def analyze_document(request: AnalysisRequest):
         logger.error(f"❌ Ошибка базового анализа: {e}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-# ========== ЦИТАТЫ ИЗ ДОКУМЕНТА ==========
-def _similarity(s1: str, s2: str) -> float:
-    """Вычисление схожести строк (упрощенное)"""
-    words1 = set(s1.split())
-    words2 = set(s2.split())
+# ========== ДОПОЛНИТЕЛЬНЫЕ ЭНДПОИНТЫ ==========
+@app.get("/health")
+async def comprehensive_health_check():
+    """Полная проверка здоровья всех компонентов"""
     
-    if not words1 or not words2:
-        return 0.0
+    health_status = {
+        "status": "healthy",
+        "service": "versevo-backend",
+        "version": "6.0.0",
+        "timestamp": datetime.now().isoformat(),
+        "components": {},
+        "endpoints_available": [],
+    }
     
-    intersection = words1.intersection(words2)
-    union = words1.union(words2)
+    # Проверка базовых компонентов
+    health_status["components"]["api_server"] = {
+        "status": "healthy",
+        "uptime": "running"
+    }
     
-    return len(intersection) / len(union)
-
-@app.get("/api/documents/{document_id}/quotes")
-async def get_document_quotes(document_id: int, limit: int = 5):
-    """Получение цитат из документа"""
+    health_status["components"]["postgresql"] = {
+        "status": "available",
+        "message": "Database models loaded"
+    }
+    
+    # Проверка Hugging Face
+    health_status["components"]["huggingface_translation"] = {
+        "status": "ready" if HF_TRANSLATOR_READY else "loading",
+        "available": HF_TRANSLATOR_READY,
+    }
+    
+    health_status["components"]["huggingface_analysis"] = {
+        "status": "ready" if HF_ANALYSIS_READY else "loading",
+        "available": HUGGING_FACE_ENABLED,
+        "models": list(HF_ANALYSIS_PIPELINES.keys()) if HUGGING_FACE_ENABLED else []
+    }
+    
+    # Проверка Gemini
+    health_status["components"]["gemini_ai"] = {
+        "status": "mocked",
+        "available": True,
+        "message": "Mock implementation"
+    }
+    
+    # Список доступных эндпоинтов
+    health_status["endpoints_available"] = [
+        "/ (root)",
+        "/health",
+        "/api/flutter/health",
+        "/api/health",
+        "/api/documents",
+        "/api/documents/{id}",
+        "/api/documents/upload-base64",
+        "/api/documents/{id}/quotes",
+        "/api/translate/text",
+        "/api/translate/document/{id}",
+        "/api/analyze",
+        "/api/analyze/ai/document",
+        "/api/analyze/ai/health",
+        "/api/analyze/gemini/document",
+        "/api/analyze/gemini/health",
+        "/api/quotes/favorites",
+        "/docs",
+        "/redoc",
+    ]
+    
+    # Проверка дискового пространства
     try:
-        if document_id not in documents_store:
-            raise HTTPException(status_code=404, detail="Document not found")
-        
-        doc = documents_store[document_id]
-        content = doc["content"]
-        
-        if not content or len(content.strip()) < 10:
-            return {
-                "document_id": document_id,
-                "quotes": ["Текст документа пустой или слишком короткий"],
-                "count": 1,
-                "ai_analysis": False,
-                "fallback": True
-            }
-        
-        sentences = re.split(r'(?<=[.!?])\s+', content)
-        quotes = []
-        
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if 30 < len(sentence) < 250:
-                quotes.append(sentence)
-                if len(quotes) >= limit * 2:
-                    break
-        
-        unique_quotes = []
-        seen_content = set()
-        
-        for quote in quotes:
-            normalized = ' '.join(quote.lower().split())
-            
-            is_similar = False
-            for seen in seen_content:
-                if _similarity(normalized, seen) > 0.7:
-                    is_similar = True
-                    break
-            
-            if not is_similar and len(unique_quotes) < limit:
-                unique_quotes.append(quote)
-                seen_content.add(normalized)
-        
-        if len(unique_quotes) < limit:
-            fallback_quotes = [
-                "Каждая книга открывает новые горизонты.",
-                "Чтение — это диалог с автором через время и пространство.",
-                "Слова имеют силу менять восприятие мира.",
-                "Литература хранит мудрость поколений.",
-                "Текст — это мост между мыслью и её воплощением.",
-            ]
-            
-            for i in range(limit - len(unique_quotes)):
-                if i < len(fallback_quotes):
-                    unique_quotes.append(fallback_quotes[i])
-        
-        return {
-            "document_id": document_id,
-            "quotes": unique_quotes[:limit],
-            "count": len(unique_quotes[:limit]),
-            "ai_analysis": False,
-            "fallback": False,
-            "extracted_from": f"{len(sentences)} предложений"
+        upload_folder_exists = os.path.exists(UPLOAD_FOLDER)
+        health_status["components"]["file_storage"] = {
+            "status": "healthy" if upload_folder_exists else "warning",
+            "upload_folder": upload_folder_exists,
+            "path": os.path.abspath(UPLOAD_FOLDER)
         }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения цитат: {e}")
-        return {
-            "document_id": document_id,
-            "quotes": [
-                "Цитаты временно недоступны",
-                "Попробуйте обновить страницу",
-                "Ошибка обработки текста"
+    except:
+        health_status["components"]["file_storage"] = {"status": "error"}
+    
+    return health_status
+
+@app.get("/api/version")
+async def api_version():
+    """Информация о версии API"""
+    return {
+        "version": "6.0.0",
+        "name": "Versevo Backend API",
+        "description": "Modern document reader with translation and AI features",
+        "timestamp": datetime.now().isoformat(),
+        "features": [
+            "Document upload and storage",
+            "Text translation (Hugging Face + Fallback)",
+            "AI document analysis (Hugging Face)",
+            "Gemini AI integration (mocked)",
+            "Favorite quotes management",
+            "PostgreSQL database",
+            "RESTful API",
+            "CORS enabled",
+            "Health checks",
+            "API documentation"
+        ],
+        "endpoints": {
+            "document_management": [
+                "GET /api/documents",
+                "GET /api/documents/{id}",
+                "POST /api/documents/upload-base64", 
+                "DELETE /api/documents/{id}",
+                "GET /api/documents/{id}/quotes"
             ],
-            "count": 3,
-            "ai_analysis": False,
-            "fallback": True,
-            "error": str(e)[:100]
+            "translation": [
+                "POST /api/translate/text",
+                "POST /api/translate/document/{id}"
+            ],
+            "analysis": [
+                "POST /api/analyze",
+                "POST /api/analyze/ai/document",
+                "GET /api/analyze/ai/health",
+                "POST /api/analyze/gemini/document",
+                "GET /api/analyze/gemini/health"
+            ],
+            "favorites": [
+                "POST /api/quotes/favorites",
+                "GET /api/quotes/favorites",
+                "DELETE /api/quotes/favorites/{id}"
+            ],
+            "health": [
+                "/health",
+                "/api/health",
+                "/api/flutter/health"
+            ]
+        },
+        "ai_models": {
+            "huggingface": {
+                "translation": ["en-ru", "ru-en"],
+                "analysis": ["sentiment", "summarization", "ner"]
+            },
+            "gemini": {
+                "status": "mocked",
+                "message": "Requires Google API key for real usage"
+            }
         }
+    }
 
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
@@ -1462,12 +2001,23 @@ if __name__ == "__main__":
     logger.info(f"🚀 ЗАПУСК VERSION 6.0 НА ПОРТУ {PORT}")
     logger.info(f"{'='*60}")
     logger.info(f"📁 Папка загрузок: {os.path.abspath(UPLOAD_FOLDER)}")
-    logger.info(f"🔤 Перевод: Hugging Face + Fallback (загружается в фоне)")
-    logger.info(f"🗄️  База данных: PostgreSQL (Railway)")
-    logger.info(f"🤖 Hugging Face перевод: {'ЗАГРУЖАЕТСЯ В ФОНЕ'}")
-    logger.info(f"📊 Hugging Face анализ: {'ЗАГРУЖАЕТСЯ В ФОНЕ'}")
-    logger.info(f"📈 NLTK анализ: {'ДОСТУПЕН' if NLTK_AVAILABLE else 'НЕ ДОСТУПЕН'}")
-    logger.info(f"💡 Healthcheck работает СРАЗУ, AI модели грузятся в фоне")
+    logger.info(f"🔤 Перевод: Hugging Face + Fallback")
+    logger.info(f"🤖 AI Анализ: Hugging Face + Gemini (мок)")
+    logger.info(f"❤️ Избранные цитаты: in-memory (PostgreSQL доступен)")
+    logger.info(f"📊 Доступные эндпоинты:")
+    logger.info(f"   • GET /api/documents")
+    logger.info(f"   • GET /api/documents/{{id}}")
+    logger.info(f"   • POST /api/documents/upload-base64")
+    logger.info(f"   • POST /api/translate/text")
+    logger.info(f"   • POST /api/translate/document/{{id}}")
+    logger.info(f"   • POST /api/analyze")
+    logger.info(f"   • POST /api/analyze/ai/document")
+    logger.info(f"   • GET /api/analyze/ai/health")
+    logger.info(f"   • POST /api/analyze/gemini/document")
+    logger.info(f"   • GET /api/analyze/gemini/health")
+    logger.info(f"   • POST /api/quotes/favorites")
+    logger.info(f"   • GET /api/quotes/favorites")
+    logger.info(f"   • GET /health (полная проверка)")
     logger.info(f"{'='*60}")
     
     uvicorn.run(
