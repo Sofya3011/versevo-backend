@@ -1,9 +1,8 @@
+# models.py - SQLAlchemy модели для PostgreSQL
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean, Float
-from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 from datetime import datetime
-
-Base = declarative_base()
+from database import Base
 
 class User(Base):
     """Пользователи"""
@@ -24,8 +23,8 @@ class Document(Base):
     __tablename__ = "documents"
     
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    title = Column(String(255), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # Изменили на nullable=True
+    title = Column(String(255), nullable=True, default="Без названия")  # Изменили на nullable=True
     filename = Column(String(255), nullable=False)
     content = Column(Text, nullable=True)
     language = Column(String(10), default='en')
@@ -48,7 +47,7 @@ class DocumentNote(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     document_id = Column(Integer, ForeignKey("documents.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # Изменили на nullable=True
     text = Column(Text, nullable=False)
     selected_text = Column(Text, nullable=True)
     chapter_index = Column(Integer, default=0)
@@ -66,7 +65,7 @@ class ReadingProgress(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     document_id = Column(Integer, ForeignKey("documents.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # Изменили на nullable=True
     chapter_index = Column(Integer, default=0)
     scroll_position = Column(Float, default=0.0)
     timestamp = Column(DateTime(timezone=True), default=datetime.now)
