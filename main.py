@@ -33,6 +33,9 @@ import fitz  # PyMuPDF
 import docx
 from PIL import Image
 import io
+import jwt
+import secrets
+from passlib.context import CryptContext
 
 # Импортируем настройки БД
 from database import get_db, SessionLocal, engine
@@ -42,7 +45,7 @@ from models import Base, User, Document, DocumentNote, ReadingProgress, Document
 app = FastAPI(
     title="Versevo Backend API",
     description="Modern document reader with translation and AI features",
-    version="7.0.0",
+    version="8.0.0",  # Обновили версию
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -82,6 +85,11 @@ class Config:
     HF_TRANSLATION_MODEL = "Helsinki-NLP/opus-mt-en-ru"
     HF_SUMMARIZATION_MODEL = "Falconsai/text_summarization"
     HF_SENTIMENT_MODEL = "blanchefort/rubert-base-cased-sentiment"
+    
+    # JWT
+    JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))
+    JWT_ALGORITHM = "HS256"
+    JWT_EXPIRE_DAYS = 30
     
     # Лимиты
     MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
@@ -143,6 +151,51 @@ class UserCreate(BaseModel):
 class UserLogin(BaseModel):
     email: str
     password: str
+
+class TokenData(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+# ========== ХЕШИРОВАНИЕ ПАРОЛЕЙ ==========
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(days=config.JWT_EXPIRE_DAYS)
+    
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(lambda: None), db: Session = Depends(get_db)):
+    if not token:
+        raise HTTPException(status_code=401, detail="Токен не предоставлен")
+    
+    try:
+        payload = jwt.decode(token, config.JWT_SECRET, algorithms=[config.JWT_ALGORITHM])
+        user_id: int = payload.get("user_id")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Неверный токен")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Токен истек")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Неверный токен")
+    
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    return user
 
 # ========== ИНИЦИАЛИЗАЦИЯ МОДЕЛЕЙ AI ==========
 class AIModels:
@@ -690,17 +743,125 @@ def calculate_statistics(text: str) -> Dict[str, Any]:
             "reading_time_minutes": 1
         }
 
+# ========== АУТЕНТИФИКАЦИЯ ==========
+@app.post("/api/auth/register", response_model=Dict[str, Any])
+async def register_user(request: UserCreate, db: Session = Depends(get_db)):
+    """Регистрация нового пользователя"""
+    try:
+        logger.info(f"📝 Регистрация пользователя: {request.email} ({request.username})")
+        
+        # Проверяем, существует ли пользователь
+        existing_user = db.query(User).filter(User.email == request.email).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Пользователь с таким email уже существует")
+        
+        # Проверяем username
+        existing_username = db.query(User).filter(User.username == request.username).first()
+        if existing_username:
+            raise HTTPException(status_code=400, detail="Пользователь с таким именем уже существует")
+        
+        # Хешируем пароль
+        hashed_password = hash_password(request.password)
+        
+        # Создаем пользователя
+        user = User(
+            email=request.email,
+            username=request.username,
+            hashed_password=hashed_password,
+            created_at=datetime.now(),
+            last_login=datetime.now()
+        )
+        
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        
+        # Создаем токен
+        access_token = create_access_token(data={"user_id": user.id, "email": user.email})
+        
+        logger.info(f"✅ Новый пользователь зарегистрирован: {user.email}")
+        
+        return {
+            "id": user.id,
+            "email": user.email,
+            "username": user.username,
+            "token": access_token,
+            "created_at": user.created_at.isoformat(),
+            "last_login": user.last_login.isoformat(),
+            "message": "Регистрация успешна"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Ошибка регистрации: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Ошибка регистрации: {str(e)}")
+
+@app.post("/api/auth/login", response_model=Dict[str, Any])
+async def login_user(request: UserLogin, db: Session = Depends(get_db)):
+    """Вход пользователя"""
+    try:
+        logger.info(f"🔐 Попытка входа: {request.email}")
+        
+        # Ищем пользователя
+        user = db.query(User).filter(User.email == request.email).first()
+        
+        if not user:
+            raise HTTPException(status_code=401, detail="Неверный email или пароль")
+        
+        # Проверяем пароль
+        if not verify_password(request.password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Неверный email или пароль")
+        
+        # Обновляем время последнего входа
+        user.last_login = datetime.now()
+        db.commit()
+        
+        # Создаем токен
+        access_token = create_access_token(data={"user_id": user.id, "email": user.email})
+        
+        logger.info(f"✅ Пользователь вошел: {user.email}")
+        
+        return {
+            "id": user.id,
+            "email": user.email,
+            "username": user.username,
+            "token": access_token,
+            "created_at": user.created_at.isoformat(),
+            "last_login": user.last_login.isoformat(),
+            "message": "Вход успешен"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Ошибка входа: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка входа: {str(e)}")
+
+@app.get("/api/auth/me", response_model=Dict[str, Any])
+async def get_current_user_endpoint(current_user: User = Depends(get_current_user)):
+    """Получение текущего пользователя"""
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "username": current_user.username,
+        "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
+        "last_login": current_user.last_login.isoformat() if current_user.last_login else None
+    }
+
 # ========== HEALTHCHECK ==========
 @app.get("/")
 async def root():
     return {
-        "message": "Versevo Backend API v7.0",
-        "version": "7.0.0",
+        "message": "Versevo Backend API v8.0",
+        "version": "8.0.0",
         "status": "running",
         "timestamp": datetime.now().isoformat(),
         "endpoints": [
             "/docs - документация API",
             "/health - проверка здоровья",
+            "/api/auth/* - аутентификация",
             "/api/documents - управление документами",
             "/api/translate - перевод",
             "/api/analyze - анализ",
@@ -715,7 +876,7 @@ async def health_check():
     health_status = {
         "status": "healthy",
         "service": "versevo-backend",
-        "version": "7.0.0",
+        "version": "8.0.0",
         "timestamp": datetime.now().isoformat(),
         "components": {}
     }
@@ -724,10 +885,15 @@ async def health_check():
     try:
         db = SessionLocal()
         db.execute(text("SELECT 1"))
+        
+        # Проверяем таблицу users
+        users_count = db.query(User).count()
         db.close()
+        
         health_status["components"]["database"] = {
             "status": "healthy",
-            "type": "PostgreSQL"
+            "type": "PostgreSQL",
+            "users_count": users_count
         }
     except Exception as e:
         health_status["components"]["database"] = {
@@ -761,18 +927,6 @@ async def health_check():
     except:
         health_status["components"]["file_system"] = {"status": "error"}
     
-    # Проверка памяти
-    try:
-        import psutil
-        memory = psutil.virtual_memory()
-        health_status["components"]["memory"] = {
-            "total_gb": round(memory.total / (1024**3), 2),
-            "available_gb": round(memory.available / (1024**3), 2),
-            "percent_used": memory.percent
-        }
-    except:
-        pass
-    
     return health_status
 
 @app.get("/api/flutter/health")
@@ -787,6 +941,7 @@ async def flutter_health_check():
             "status": "healthy",
             "database": "available",
             "ai_models": ai_models.initialized,
+            "auth": "available",
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
@@ -796,16 +951,63 @@ async def flutter_health_check():
             "timestamp": datetime.now().isoformat()
         }
 
+# ========== БАЗА ДАННЫХ ==========
+@app.get("/api/db/tables")
+async def get_database_tables(db: Session = Depends(get_db)):
+    """Получение списка таблиц и их содержимого"""
+    try:
+        # Получаем все таблицы
+        result = db.execute(text("""
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public'
+        """))
+        tables = result.fetchall()
+        
+        table_data = {}
+        
+        for table in tables:
+            table_name = table[0]
+            
+            # Получаем данные из каждой таблицы
+            try:
+                data_result = db.execute(text(f"SELECT * FROM {table_name} LIMIT 5"))
+                columns = [desc[0] for desc in data_result.cursor.description]
+                rows = data_result.fetchall()
+                
+                table_data[table_name] = {
+                    "columns": columns,
+                    "rows": [dict(zip(columns, row)) for row in rows],
+                    "count": len(rows)
+                }
+            except Exception as table_error:
+                table_data[table_name] = {"error": str(table_error)}
+        
+        return {
+            "status": "success",
+            "tables": [t[0] for t in tables],
+            "data": table_data,
+            "total_tables": len(tables)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения таблиц: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ========== ДОКУМЕНТЫ ==========
 @app.post("/api/documents/upload-base64")
-async def upload_document_base64(request: DocumentUploadRequest, db: Session = Depends(get_db)):
+async def upload_document_base64(
+    request: DocumentUploadRequest, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Загрузка документа в формате base64"""
     try:
         # Проверка размера файла
         if request.file_size > config.MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail=f"Файл слишком большой. Максимум: {config.MAX_FILE_SIZE // 1024 // 1024}MB")
         
-        logger.info(f"📤 Загрузка файла: {request.filename}")
+        logger.info(f"📤 Загрузка файла пользователем {current_user.id}: {request.filename}")
         
         # Сохраняем файл
         file_path = save_base64_file(request.file_data, request.filename)
@@ -837,6 +1039,7 @@ async def upload_document_base64(request: DocumentUploadRequest, db: Session = D
             char_count=stats["char_count"],
             chapter_count=len(chapters),
             reading_time_minutes=stats["reading_time_minutes"],
+            user_id=current_user.id,
             created_at=datetime.now(),
             updated_at=datetime.now()
         )
@@ -879,10 +1082,20 @@ async def upload_document_base64(request: DocumentUploadRequest, db: Session = D
         raise HTTPException(status_code=500, detail=f"Ошибка загрузки: {str(e)}")
 
 @app.get("/api/documents")
-async def get_documents(skip: int = 0, limit: int = 50, db: Session = Depends(get_db)):
-    """Получение списка документов"""
+async def get_documents(
+    skip: int = 0, 
+    limit: int = 50, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Получение списка документов пользователя"""
     try:
-        documents = db.query(Document).order_by(Document.created_at.desc()).offset(skip).limit(limit).all()
+        documents = db.query(Document)\
+            .filter(Document.user_id == current_user.id)\
+            .order_by(Document.created_at.desc())\
+            .offset(skip)\
+            .limit(limit)\
+            .all()
         
         return [
             {
@@ -905,10 +1118,16 @@ async def get_documents(skip: int = 0, limit: int = 50, db: Session = Depends(ge
         raise HTTPException(status_code=500, detail=f"Ошибка получения документов: {str(e)}")
 
 @app.get("/api/documents/{document_id}")
-async def get_document(document_id: int, db: Session = Depends(get_db)):
+async def get_document(
+    document_id: int, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Получение документа по ID"""
     try:
-        document = db.query(Document).filter(Document.id == document_id).first()
+        document = db.query(Document)\
+            .filter(Document.id == document_id, Document.user_id == current_user.id)\
+            .first()
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
@@ -936,10 +1155,16 @@ async def get_document(document_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Ошибка получения документа: {str(e)}")
 
 @app.delete("/api/documents/{document_id}")
-async def delete_document(document_id: int, db: Session = Depends(get_db)):
+async def delete_document(
+    document_id: int, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Удаление документа"""
     try:
-        document = db.query(Document).filter(Document.id == document_id).first()
+        document = db.query(Document)\
+            .filter(Document.id == document_id, Document.user_id == current_user.id)\
+            .first()
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
@@ -1064,11 +1289,14 @@ async def translate_text(request: TranslateRequest):
 async def translate_document(
     document_id: int,
     request: DocumentTranslateRequest,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """Перевод всего документа"""
     try:
-        document = db.query(Document).filter(Document.id == document_id).first()
+        document = db.query(Document)\
+            .filter(Document.id == document_id, Document.user_id == current_user.id)\
+            .first()
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
@@ -1150,6 +1378,7 @@ async def translate_document(
             char_count=len(translated_content),
             chapter_count=document.chapter_count,
             reading_time_minutes=document.reading_time_minutes,
+            user_id=current_user.id,
             created_at=datetime.now()
         )
         
@@ -1183,10 +1412,16 @@ async def translate_document(
 
 # ========== АНАЛИЗ ==========
 @app.post("/api/analyze")
-async def analyze_document(request: AnalysisRequest, db: Session = Depends(get_db)):
+async def analyze_document(
+    request: AnalysisRequest, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Базовый анализ документа"""
     try:
-        document = db.query(Document).filter(Document.id == request.document_id).first()
+        document = db.query(Document)\
+            .filter(Document.id == request.document_id, Document.user_id == current_user.id)\
+            .first()
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
@@ -1290,10 +1525,16 @@ async def analyze_document(request: AnalysisRequest, db: Session = Depends(get_d
         raise HTTPException(status_code=500, detail=f"Ошибка анализа: {str(e)}")
 
 @app.post("/api/analyze/ai/document")
-async def analyze_with_ai(request: AIAnalysisRequest, db: Session = Depends(get_db)):
+async def analyze_with_ai(
+    request: AIAnalysisRequest, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """AI анализ документа"""
     try:
-        document = db.query(Document).filter(Document.id == request.document_id).first()
+        document = db.query(Document)\
+            .filter(Document.id == request.document_id, Document.user_id == current_user.id)\
+            .first()
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
@@ -1435,13 +1676,19 @@ async def ai_health_check():
     }
 
 @app.post("/api/analyze/gemini/document")
-async def analyze_with_gemini(request: AIAnalysisRequest, db: Session = Depends(get_db)):
+async def analyze_with_gemini(
+    request: AIAnalysisRequest, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Анализ документа через Gemini AI"""
     try:
         if not ai_models.is_gemini_available():
             raise HTTPException(status_code=503, detail="Gemini AI не доступен. Установите GEMINI_API_KEY.")
         
-        document = db.query(Document).filter(Document.id == request.document_id).first()
+        document = db.query(Document)\
+            .filter(Document.id == request.document_id, Document.user_id == current_user.id)\
+            .first()
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
@@ -1514,10 +1761,17 @@ async def gemini_health_check():
 
 # ========== ЦИТАТЫ ==========
 @app.get("/api/documents/{document_id}/quotes")
-async def get_document_quotes(document_id: int, limit: int = 5, db: Session = Depends(get_db)):
+async def get_document_quotes(
+    document_id: int, 
+    limit: int = 5, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Получение цитат из документа"""
     try:
-        document = db.query(Document).filter(Document.id == document_id).first()
+        document = db.query(Document)\
+            .filter(Document.id == document_id, Document.user_id == current_user.id)\
+            .first()
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
@@ -1577,11 +1831,18 @@ async def get_document_quotes(document_id: int, limit: int = 5, db: Session = De
 
 # ========== ИЗБРАННЫЕ ЦИТАТЫ ==========
 @app.post("/api/quotes/favorites")
-async def add_favorite_quote(request: FavoriteQuoteCreate, db: Session = Depends(get_db)):
+async def add_favorite_quote(
+    request: FavoriteQuoteCreate, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Добавление цитаты в избранное"""
     try:
         # Проверяем существование документа
-        document = db.query(Document).filter(Document.id == request.document_id).first()
+        document = db.query(Document)\
+            .filter(Document.id == request.document_id, Document.user_id == current_user.id)\
+            .first()
+        
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
         
@@ -1621,10 +1882,26 @@ async def add_favorite_quote(request: FavoriteQuoteCreate, db: Session = Depends
         raise HTTPException(status_code=500, detail=f"Ошибка добавления цитаты: {str(e)}")
 
 @app.get("/api/quotes/favorites")
-async def get_favorite_quotes(skip: int = 0, limit: int = 50, db: Session = Depends(get_db)):
+async def get_favorite_quotes(
+    skip: int = 0, 
+    limit: int = 50, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Получение списка избранных цитат"""
     try:
+        # Получаем документы пользователя
+        user_documents = db.query(Document.id)\
+            .filter(Document.user_id == current_user.id)\
+            .all()
+        
+        document_ids = [doc.id for doc in user_documents]
+        
+        if not document_ids:
+            return []
+        
         quotes = db.query(FavoriteQuote)\
+            .filter(FavoriteQuote.document_id.in_(document_ids))\
             .order_by(FavoriteQuote.created_at.desc())\
             .offset(skip)\
             .limit(limit)\
@@ -1650,13 +1927,25 @@ async def get_favorite_quotes(skip: int = 0, limit: int = 50, db: Session = Depe
         raise HTTPException(status_code=500, detail=f"Ошибка получения цитат: {str(e)}")
 
 @app.delete("/api/quotes/favorites/{quote_id}")
-async def delete_favorite_quote(quote_id: int, db: Session = Depends(get_db)):
+async def delete_favorite_quote(
+    quote_id: int, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """Удаление цитаты из избранного"""
     try:
         quote = db.query(FavoriteQuote).filter(FavoriteQuote.id == quote_id).first()
         
         if not quote:
             raise HTTPException(status_code=404, detail="Цитата не найдена")
+        
+        # Проверяем, что цитата принадлежит документу пользователя
+        document = db.query(Document)\
+            .filter(Document.id == quote.document_id, Document.user_id == current_user.id)\
+            .first()
+        
+        if not document:
+            raise HTTPException(status_code=403, detail="Нет доступа к этой цитате")
         
         db.delete(quote)
         db.commit()
@@ -1717,16 +2006,39 @@ async def healthcheck_middleware(request: Request, call_next):
     response = await call_next(request)
     return response
 
+# ========== СОЗДАНИЕ ТАБЛИЦ ==========
+def create_tables():
+    """Создание таблиц при запуске"""
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("✅ Таблицы базы данных созданы/проверены")
+        
+        # Проверяем таблицу users
+        db = SessionLocal()
+        result = db.execute(text("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')"))
+        users_exists = result.scalar()
+        
+        if users_exists:
+            logger.info("✅ Таблица users существует")
+            # Проверяем есть ли пользователи
+            users_count = db.query(User).count()
+            logger.info(f"📊 Количество пользователей в базе: {users_count}")
+        else:
+            logger.warning("⚠️ Таблица users не существует")
+            
+        db.close()
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания таблиц: {e}")
+
 # ========== ИНИЦИАЛИЗАЦИЯ ПРИ СТАРТЕ ==========
 @app.on_event("startup")
 async def startup_event():
     """Инициализация при старте приложения"""
-    logger.info("🚀 Запуск Versevo Backend v7.0")
+    logger.info("🚀 Запуск Versevo Backend v8.0")
     
     try:
         # Создаем таблицы в базе данных
-        Base.metadata.create_all(bind=engine)
-        logger.info("✅ Таблицы базы данных созданы")
+        create_tables()
         
         # Проверяем подключение к БД
         db = SessionLocal()
@@ -1768,11 +2080,12 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     
     logger.info(f"{'='*60}")
-    logger.info(f"🚀 VERSION 7.0 - ПОЛНАЯ РЕАЛЬНАЯ РЕАЛИЗАЦИЯ")
+    logger.info(f"🚀 VERSION 8.0 - ПОЛНАЯ РЕАЛИЗАЦИЯ С АУТЕНТИФИКАЦИЕЙ")
     logger.info(f"{'='*60}")
     logger.info(f"📁 Папка загрузок: {config.UPLOAD_FOLDER}")
     logger.info(f"🤖 AI Модели: Hugging Face + Gemini (реальные)")
     logger.info(f"🗄️  База данных: PostgreSQL (Railway)")
+    logger.info(f"🔐 Аутентификация: JWT токены")
     logger.info(f"🔤 Перевод: Реальный через AI модели")
     logger.info(f"📊 Анализ: Полный AI анализ")
     logger.info(f"❤️ Избранные цитаты: Реальная база данных")
