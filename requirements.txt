@@ -4,7 +4,7 @@ uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 psutil==5.9.7
 aiohttp==3.9.3
-
+PyJWT==2.8.0
 # === DATABASE ===
 asyncpg==0.29.0
 sqlalchemy==2.0.23
@@ -73,3 +73,4 @@ pytest-cov==4.1.0
 black==23.12.1
 flake8==7.0.0
 mypy==1.8.0
+
