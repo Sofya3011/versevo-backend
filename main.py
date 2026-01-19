@@ -10,10 +10,10 @@ import re
 import json
 import aiohttp
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Union
 from datetime import datetime, timedelta
@@ -23,7 +23,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, text
 import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords
@@ -195,36 +195,73 @@ class AIModels:
     def _init_huggingface(self):
         """Инициализация Hugging Face моделей"""
         try:
-            device = 0 if torch.cuda.is_available() else -1
-            device_name = "CUDA" if torch.cuda.is_available() else "CPU"
+            # Проверяем доступность CUDA
+            if torch.cuda.is_available():
+                device = 0
+                device_name = "CUDA"
+                logger.info("✅ CUDA доступна")
+            else:
+                device = -1
+                device_name = "CPU"
+                logger.info("⚠️ CUDA не доступна, используем CPU")
+            
             logger.info(f"🔄 Загрузка Hugging Face моделей на {device_name}...")
             
-            # Переводчик
-            self.translator = pipeline(
-                "translation",
-                model=config.HF_TRANSLATION_MODEL,
-                device=device,
-                max_length=512
-            )
-            logger.info(f"✅ Переводчик загружен: {config.HF_TRANSLATION_MODEL}")
+            # Переводчик (с загрузкой в фоне, чтобы не блокировать старт)
+            def load_translator():
+                try:
+                    translator = pipeline(
+                        "translation",
+                        model=config.HF_TRANSLATION_MODEL,
+                        device=device,
+                        max_length=512
+                    )
+                    logger.info(f"✅ Переводчик загружен: {config.HF_TRANSLATION_MODEL}")
+                    return translator
+                except Exception as e:
+                    logger.error(f"❌ Ошибка загрузки переводчика: {e}")
+                    return None
             
             # Суммаризатор
-            self.summarizer = pipeline(
-                "summarization",
-                model=config.HF_SUMMARIZATION_MODEL,
-                device=device,
-                max_length=150,
-                min_length=50
-            )
-            logger.info(f"✅ Суммаризатор загружен: {config.HF_SUMMARIZATION_MODEL}")
+            def load_summarizer():
+                try:
+                    summarizer = pipeline(
+                        "summarization",
+                        model=config.HF_SUMMARIZATION_MODEL,
+                        device=device,
+                        max_length=150,
+                        min_length=50
+                    )
+                    logger.info(f"✅ Суммаризатор загружен: {config.HF_SUMMARIZATION_MODEL}")
+                    return summarizer
+                except Exception as e:
+                    logger.error(f"❌ Ошибка загрузки суммаризатора: {e}")
+                    return None
             
             # Анализатор тональности
-            self.sentiment_analyzer = pipeline(
-                "sentiment-analysis",
-                model=config.HF_SENTIMENT_MODEL,
-                device=device
-            )
-            logger.info(f"✅ Анализатор тональности загружен: {config.HF_SENTIMENT_MODEL}")
+            def load_sentiment_analyzer():
+                try:
+                    sentiment_analyzer = pipeline(
+                        "sentiment-analysis",
+                        model=config.HF_SENTIMENT_MODEL,
+                        device=device
+                    )
+                    logger.info(f"✅ Анализатор тональности загружен: {config.HF_SENTIMENT_MODEL}")
+                    return sentiment_analyzer
+                except Exception as e:
+                    logger.error(f"❌ Ошибка загрузки анализатора тональности: {e}")
+                    return None
+            
+            # Загружаем модели асинхронно
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                future_translator = executor.submit(load_translator)
+                future_summarizer = executor.submit(load_summarizer)
+                future_sentiment = executor.submit(load_sentiment_analyzer)
+                
+                self.translator = future_translator.result()
+                self.summarizer = future_summarizer.result()
+                self.sentiment_analyzer = future_sentiment.result()
             
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки Hugging Face моделей: {e}")
@@ -686,7 +723,7 @@ async def health_check():
     # Проверка базы данных
     try:
         db = SessionLocal()
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
         db.close()
         health_status["components"]["database"] = {
             "status": "healthy",
@@ -743,7 +780,7 @@ async def flutter_health_check():
     """Упрощенная проверка для Flutter"""
     try:
         db = SessionLocal()
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
         db.close()
         
         return {
@@ -1646,34 +1683,81 @@ try:
 except Exception as e:
     logger.warning(f"⚠️ Не удалось подключить статические файлы: {e}")
 
+# ========== КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Healthcheck Middleware ==========
+@app.middleware("http")
+async def healthcheck_middleware(request: Request, call_next):
+    # Быстрый ответ для healthcheck чтобы Railway не падал
+    if request.url.path == "/api/flutter/health":
+        try:
+            # Проверяем БД быстро
+            db = SessionLocal()
+            db.execute(text("SELECT 1"))
+            db.close()
+            
+            response = JSONResponse(
+                status_code=200,
+                content={
+                    "status": "healthy",
+                    "database": "available",
+                    "timestamp": datetime.now().isoformat()
+                }
+            )
+            return response
+        except Exception as e:
+            response = JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unhealthy",
+                    "error": str(e),
+                    "timestamp": datetime.now().isoformat()
+                }
+            )
+            return response
+    
+    response = await call_next(request)
+    return response
+
 # ========== ИНИЦИАЛИЗАЦИЯ ПРИ СТАРТЕ ==========
 @app.on_event("startup")
 async def startup_event():
     """Инициализация при старте приложения"""
     logger.info("🚀 Запуск Versevo Backend v7.0")
     
-    # Создаем таблицы в базе данных
     try:
+        # Создаем таблицы в базе данных
         Base.metadata.create_all(bind=engine)
         logger.info("✅ Таблицы базы данных созданы")
+        
+        # Проверяем подключение к БД
+        db = SessionLocal()
+        db.execute(text("SELECT 1"))
+        db.close()
+        logger.info("✅ Подключение к базе данных успешно")
+        
     except Exception as e:
-        logger.error(f"❌ Ошибка создания таблиц БД: {e}")
+        logger.error(f"❌ Ошибка инициализации базы данных: {e}")
+        # НЕ падаем при ошибке БД - Railway будет перезапускать
     
-    # Инициализация NLTK
-    if init_nltk():
-        logger.info("✅ NLTK инициализирован")
-    else:
-        logger.error("❌ Ошибка инициализации NLTK")
-    
-    # Инициализация AI моделей в фоне
-    async def init_ai_models():
-        if ai_models.initialize():
-            logger.info("✅ AI модели инициализированы")
+    # Инициализация NLTK в фоне
+    try:
+        if init_nltk():
+            logger.info("✅ NLTK инициализирован")
         else:
-            logger.warning("⚠️ Не удалось инициализировать AI модели")
+            logger.warning("⚠️ Ошибка инициализации NLTK")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации NLTK: {e}")
     
-    # Запускаем в фоне, чтобы не блокировать старт приложения
-    asyncio.create_task(init_ai_models())
+    # Инициализация AI моделей в фоне (не блокируем старт)
+    async def init_ai_background():
+        try:
+            if ai_models.initialize():
+                logger.info("✅ AI модели инициализированы")
+            else:
+                logger.warning("⚠️ Не удалось инициализировать AI модели")
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации AI моделей: {e}")
+    
+    asyncio.create_task(init_ai_background())
     
     logger.info(f"🌐 Сервер готов на порту {os.getenv('PORT', 8000)}")
 
