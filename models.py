@@ -1,129 +1,120 @@
-# models.py - SQLAlchemy модели для PostgreSQL
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean, Float
-from sqlalchemy.sql import func
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean, Float, BigInteger
+from sqlalchemy.orm import relationship
 from datetime import datetime
 from database import Base
 
 class User(Base):
-    """Пользователи"""
     __tablename__ = "users"
     
     id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(255), unique=True, index=True, nullable=False)
+    email = Column(String(255), unique=True, nullable=False, index=True)
     username = Column(String(100), nullable=False)
     hashed_password = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=datetime.now)
-    last_login = Column(DateTime, nullable=True)
+    last_login = Column(DateTime, default=datetime.now)
     
-    def __repr__(self):
-        return f"<User(id={self.id}, email={self.email})>"
+    # Связи
+    documents = relationship("Document", back_populates="user")
+    notes = relationship("DocumentNote", back_populates="user")
+    reading_progress = relationship("ReadingProgress", back_populates="user")
 
 class Document(Base):
-    """Документы"""
     __tablename__ = "documents"
     
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=True)  # Сделали nullable=True
-    title = Column(String(255), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     filename = Column(String(255), nullable=False)
-    content = Column(Text, nullable=True)
-    language = Column(String(10), default='en')
-    file_type = Column(String(20), default='txt')
-    file_path = Column(String(500), nullable=True)
-    file_size = Column(Integer, default=0)
-    word_count = Column(Integer, default=0)
-    char_count = Column(Integer, default=0)
+    content = Column(Text)
+    language = Column(String(10))
+    file_type = Column(String(10))
+    file_path = Column(String(500))
+    file_size = Column(Integer)
+    word_count = Column(Integer)
+    char_count = Column(Integer)
     chapter_count = Column(Integer, default=1)
     reading_time_minutes = Column(Integer, default=1)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
-    def __repr__(self):
-        return f"<Document(id={self.id}, filename={self.filename})>"
+    # Связи
+    user = relationship("User", back_populates="documents")
+    notes = relationship("DocumentNote", back_populates="document")
+    analyses = relationship("DocumentAnalysis", back_populates="document")
+    quotes = relationship("FavoriteQuote", back_populates="document")
+    reading_progress = relationship("ReadingProgress", back_populates="document")
 
 class DocumentNote(Base):
-    """Заметки к документам"""
     __tablename__ = "document_notes"
     
     id = Column(Integer, primary_key=True, index=True)
-    document_id = Column(Integer, ForeignKey("documents.id"), nullable=False)
-    user_id = Column(Integer, nullable=True)
-    text = Column(Text, nullable=False)
-    selected_text = Column(Text, nullable=True)
-    chapter_index = Column(Integer, default=0)
-    text_position = Column(Integer, nullable=True)
-    color = Column(String(20), default='yellow')
-    is_highlight = Column(Boolean, default=False)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    document_id = Column(Integer, ForeignKey("documents.id"))
+    note = Column(Text)
+    position = Column(Integer)
     created_at = Column(DateTime, default=datetime.now)
     
-    def __repr__(self):
-        return f"<DocumentNote(id={self.id}, document_id={self.document_id})>"
+    # Связи
+    user = relationship("User", back_populates="notes")
+    document = relationship("Document", back_populates="notes")
 
 class ReadingProgress(Base):
-    """Прогресс чтения"""
     __tablename__ = "reading_progress"
     
     id = Column(Integer, primary_key=True, index=True)
-    document_id = Column(Integer, ForeignKey("documents.id"), nullable=False)
-    user_id = Column(Integer, nullable=True)
-    chapter_index = Column(Integer, default=0)
-    scroll_position = Column(Float, default=0.0)
-    timestamp = Column(DateTime, default=datetime.now)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    document_id = Column(Integer, ForeignKey("documents.id"))
+    progress_percentage = Column(Float, default=0.0)
+    last_position = Column(Integer, default=0)
+    total_time_seconds = Column(Integer, default=0)
+    last_read = Column(DateTime, default=datetime.now)
     
-    def __repr__(self):
-        return f"<ReadingProgress(id={self.id}, document_id={self.document_id})>"
+    # Связи
+    user = relationship("User", back_populates="reading_progress")
+    document = relationship("Document", back_populates="reading_progress")
 
 class DocumentAnalysis(Base):
-    """Анализ документов"""
     __tablename__ = "document_analysis"
     
     id = Column(Integer, primary_key=True, index=True)
-    document_id = Column(Integer, ForeignKey("documents.id"), nullable=False)
-    analysis_type = Column(String(50), nullable=False)
-    summary = Column(Text, nullable=True)
-    themes = Column(Text, nullable=True)
-    sentiment = Column(String(50), nullable=True)
-    writing_style = Column(String(100), nullable=True)
-    key_points = Column(Text, nullable=True)
-    entities = Column(Text, nullable=True)
+    document_id = Column(Integer, ForeignKey("documents.id"))
+    analysis_type = Column(String(50))
+    summary = Column(Text)
+    themes = Column(Text)
+    sentiment = Column(String(50))
+    writing_style = Column(String(100))
+    key_points = Column(Text)
     ai_analysis = Column(Boolean, default=False)
-    ai_provider = Column(String(50), nullable=True)
-    analysis_timestamp = Column(DateTime, default=datetime.now)
+    ai_provider = Column(String(50))
     created_at = Column(DateTime, default=datetime.now)
     
-    def __repr__(self):
-        return f"<DocumentAnalysis(id={self.id}, document_id={self.document_id})>"
+    # Связи
+    document = relationship("Document", back_populates="analyses")
 
 class FavoriteQuote(Base):
-    """Избранные цитаты"""
     __tablename__ = "favorite_quotes"
     
     id = Column(Integer, primary_key=True, index=True)
-    document_id = Column(Integer, nullable=False)
+    document_id = Column(Integer, ForeignKey("documents.id"))
     quote = Column(Text, nullable=False)
-    start_position = Column(Integer, nullable=True)
-    end_position = Column(Integer, nullable=True)
-    note = Column(Text, nullable=True)
+    start_position = Column(Integer)
+    end_position = Column(Integer)
+    note = Column(Text)
+    document_title = Column(String(255))
+    document_language = Column(String(10))
     created_at = Column(DateTime, default=datetime.now)
-    document_title = Column(String(255), nullable=True)
-    document_language = Column(String(10), default='en')
     
-    def __repr__(self):
-        return f"<FavoriteQuote(id={self.id}, document_id={self.document_id})>"
+    # Связи
+    document = relationship("Document", back_populates="quotes")
 
 class TranslationCache(Base):
-    """Кэш переводов"""
     __tablename__ = "translation_cache"
     
     id = Column(Integer, primary_key=True, index=True)
-    original_text_hash = Column(String(64), unique=True, nullable=False)
-    original_text = Column(Text, nullable=False)
-    translated_text = Column(Text, nullable=False)
-    source_language = Column(String(10), nullable=False)
-    target_language = Column(String(10), nullable=False)
-    style = Column(String(50), default='artistic')
-    translation_service = Column(String(50), nullable=False)
+    original_text = Column(Text)
+    original_text_hash = Column(String(64), index=True)
+    translated_text = Column(Text)
+    source_language = Column(String(10))
+    target_language = Column(String(10))
+    translation_service = Column(String(50))
+    style = Column(String(50))
     created_at = Column(DateTime, default=datetime.now)
-    
-    def __repr__(self):
-        return f"<TranslationCache(id={self.id}, source={self.source_language}→target={self.target_language})>"
