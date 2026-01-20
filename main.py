@@ -824,6 +824,132 @@ async def flutter_health_check():
             "timestamp": datetime.now().isoformat()
         }
 
+# ========== ДОБАВЛЕННЫЕ ФУНКЦИИ ДЛЯ РЕШЕНИЯ ПРОБЛЕМЫ ==========
+def check_and_fix_database_structure():
+    """Проверка и исправление структуры базы данных"""
+    try:
+        db = SessionLocal()
+        
+        # Проверяем структуру таблицы users
+        result = db.execute(text("""
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_name = 'users'
+        """))
+        
+        columns = result.fetchall()
+        column_names = [col[0] for col in columns]
+        logger.info(f"📊 Существующие колонки в users: {column_names}")
+        
+        # Проверяем наличие необходимых колонок
+        if 'hashed_password' not in column_names:
+            logger.error("❌ Критическая ошибка: Колонка hashed_password отсутствует в таблице users!")
+            logger.info("🔄 Пытаемся добавить колонку...")
+            
+            try:
+                # Добавляем колонку если её нет
+                db.execute(text("""
+                    ALTER TABLE users 
+                    ADD COLUMN IF NOT EXISTS hashed_password VARCHAR(255)
+                """))
+                db.commit()
+                logger.info("✅ Колонка hashed_password добавлена в таблицу users")
+            except Exception as e:
+                logger.error(f"❌ Не удалось добавить колонку: {e}")
+                
+                # Пробуем пересоздать таблицу
+                logger.info("🔄 Пытаемся пересоздать таблицу users...")
+                try:
+                    # Создаем временную таблицу для сохранения данных
+                    db.execute(text("""
+                        CREATE TABLE IF NOT EXISTS users_new (
+                            id SERIAL PRIMARY KEY,
+                            email VARCHAR(255) UNIQUE NOT NULL,
+                            username VARCHAR(100) NOT NULL,
+                            hashed_password VARCHAR(255) NOT NULL,
+                            created_at TIMESTAMP,
+                            last_login TIMESTAMP
+                        )
+                    """))
+                    
+                    # Копируем данные из старой таблицы если они есть
+                    db.execute(text("""
+                        INSERT INTO users_new (id, email, username, created_at, last_login)
+                        SELECT id, email, username, created_at, last_login 
+                        FROM users
+                    """))
+                    
+                    # Удаляем старую таблицу
+                    db.execute(text("DROP TABLE IF EXISTS users CASCADE"))
+                    
+                    # Переименовываем новую таблицу
+                    db.execute(text("ALTER TABLE users_new RENAME TO users"))
+                    
+                    db.commit()
+                    logger.info("✅ Таблица users успешно пересоздана")
+                except Exception as recreate_error:
+                    logger.error(f"❌ Не удалось пересоздать таблицу: {recreate_error}")
+        
+        # Проверяем остальные таблицы
+        required_tables = ['documents', 'document_notes', 'reading_progress', 
+                          'document_analysis', 'favorite_quotes', 'translation_cache']
+        
+        for table_name in required_tables:
+            result = db.execute(text(f"""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = '{table_name}'
+                )
+            """))
+            exists = result.scalar()
+            
+            if exists:
+                logger.info(f"✅ Таблица {table_name} существует")
+            else:
+                logger.warning(f"⚠️ Таблица {table_name} не существует")
+        
+        db.close()
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки структуры БД: {e}")
+        return False
+
+def recreate_users_table_completely():
+    """Полное пересоздание таблицы users"""
+    try:
+        db = SessionLocal()
+        
+        logger.info("🔄 Начинаем полное пересоздание таблицы users...")
+        
+        # Удаляем таблицу если существует
+        db.execute(text("DROP TABLE IF EXISTS users CASCADE"))
+        db.commit()
+        
+        # Создаем таблицу заново через SQLAlchemy
+        Base.metadata.tables['users'].create(bind=engine)
+        
+        logger.info("✅ Таблица users полностью пересоздана")
+        
+        # Проверяем структуру
+        result = db.execute(text("""
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_name = 'users'
+        """))
+        
+        columns = result.fetchall()
+        logger.info("📊 Новая структура таблицы users:")
+        for col in columns:
+            logger.info(f"   - {col[0]}: {col[1]}")
+        
+        db.close()
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка пересоздания таблицы users: {e}")
+        return False
+
 # ========== АУТЕНТИФИКАЦИЯ ==========
 @app.post("/api/auth/register")
 async def register_user(request: UserCreate, db: Session = Depends(get_db)):
@@ -1843,6 +1969,45 @@ async def get_database_tables(db: Session = Depends(get_db)):
         logger.error(f"❌ Ошибка получения таблиц: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ========== API ДЛЯ УПРАВЛЕНИЯ БАЗОЙ ДАННЫХ ==========
+@app.post("/api/dev/fix-database")
+async def fix_database():
+    """Исправление структуры базы данных (для разработки)"""
+    try:
+        logger.info("🛠️  Начинаем исправление структуры базы данных...")
+        
+        # Проверяем и исправляем структуру
+        check_and_fix_database_structure()
+        
+        return {
+            "status": "success",
+            "message": "Структура базы данных проверена и исправлена",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка исправления базы данных: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/dev/recreate-users-table")
+async def recreate_users_table_endpoint():
+    """Пересоздание таблицы users (для разработки)"""
+    try:
+        logger.info("🔄 Запрос на пересоздание таблицы users...")
+        
+        if recreate_users_table_completely():
+            return {
+                "status": "success",
+                "message": "Таблица users успешно пересоздана",
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Не удалось пересоздать таблицу users")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка пересоздания таблицы: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ========== СТАТИЧЕСКИЕ ФАЙЛЫ ==========
 try:
     app.mount("/uploads", StaticFiles(directory=config.UPLOAD_FOLDER), name="uploads")
@@ -1918,6 +2083,9 @@ async def startup_event():
         # Создаем таблицы в базе данных
         create_tables()
         
+        # Проверяем и исправляем структуру базы данных
+        check_and_fix_database_structure()
+        
         # Проверяем подключение к БД
         db = SessionLocal()
         db.execute(text("SELECT 1"))
@@ -1967,6 +2135,10 @@ if __name__ == "__main__":
     logger.info(f"🔤 Перевод: Реальный через AI модели")
     logger.info(f"📊 Анализ: Полный AI анализ")
     logger.info(f"❤️ Избранные цитаты: Реальная база данных")
+    logger.info(f"{'='*60}")
+    logger.info(f"🛠️  Дополнительные функции:")
+    logger.info(f"   - /api/dev/fix-database - исправление структуры БД")
+    logger.info(f"   - /api/dev/recreate-users-table - пересоздание таблицы users")
     logger.info(f"{'='*60}")
     
     uvicorn.run(
