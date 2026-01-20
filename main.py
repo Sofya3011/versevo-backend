@@ -1988,7 +1988,464 @@ async def fix_database():
     except Exception as e:
         logger.error(f"❌ Ошибка исправления базы данных: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+# ========== SQL ЗАПРОСЫ ДЛЯ ОТЧЕТОВ ==========
 
+@app.get("/api/reports/user-activity")
+async def get_user_activity_report(
+    start_date: str = None,
+    end_date: str = None,
+    db: Session = Depends(get_db)
+):
+    """Отчет по активности пользователей"""
+    try:
+        query = """
+        SELECT 
+            u.id,
+            u.email,
+            u.username,
+            u.created_at,
+            COUNT(DISTINCT d.id) as documents_count,
+            SUM(d.word_count) as total_words_read,
+            COUNT(DISTINCT n.id) as notes_count,
+            MAX(u.last_login) as last_activity,
+            CASE 
+                WHEN u.last_login >= NOW() - INTERVAL '7 days' THEN 'active'
+                ELSE 'inactive'
+            END as activity_status
+        FROM users u
+        LEFT JOIN documents d ON u.id = d.user_id
+        LEFT JOIN document_notes n ON u.id = n.user_id
+        WHERE 1=1
+        """
+        
+        params = {}
+        
+        if start_date:
+            query += " AND u.created_at >= :start_date"
+            params['start_date'] = start_date
+            
+        if end_date:
+            query += " AND u.created_at <= :end_date"
+            params['end_date'] = end_date
+            
+        query += """
+        GROUP BY u.id, u.email, u.username, u.created_at
+        ORDER BY documents_count DESC
+        """
+        
+        result = db.execute(text(query), params)
+        rows = result.fetchall()
+        
+        return {
+            "report_type": "user_activity",
+            "period": {"start_date": start_date, "end_date": end_date},
+            "total_users": len(rows),
+            "data": [
+                {
+                    "user_id": row[0],
+                    "email": row[1],
+                    "username": row[2],
+                    "created_at": row[3].isoformat() if row[3] else None,
+                    "documents_count": row[4] or 0,
+                    "total_words_read": row[5] or 0,
+                    "notes_count": row[6] or 0,
+                    "last_activity": row[7].isoformat() if row[7] else None,
+                    "activity_status": row[8]
+                }
+                for row in rows
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка отчета по активности: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/reports/document-statistics")
+async def get_document_statistics_report(
+    language: str = None,
+    file_type: str = None,
+    min_words: int = 0,
+    max_words: int = 1000000,
+    db: Session = Depends(get_db)
+):
+    """Статистика по документам"""
+    try:
+        query = """
+        SELECT 
+            d.id,
+            d.filename,
+            d.language,
+            d.file_type,
+            d.word_count,
+            d.char_count,
+            d.chapter_count,
+            d.reading_time_minutes,
+            d.created_at,
+            COUNT(DISTINCT n.id) as notes_count,
+            COUNT(DISTINCT q.id) as quotes_count,
+            COALESCE(da.analysis_count, 0) as analysis_count,
+            COALESCE(da.last_analysis_type, 'none') as last_analysis_type
+        FROM documents d
+        LEFT JOIN document_notes n ON d.id = n.document_id
+        LEFT JOIN favorite_quotes q ON d.id = q.document_id
+        LEFT JOIN (
+            SELECT 
+                document_id,
+                COUNT(*) as analysis_count,
+                MAX(analysis_type) as last_analysis_type
+            FROM document_analysis
+            GROUP BY document_id
+        ) da ON d.id = da.document_id
+        WHERE d.word_count BETWEEN :min_words AND :max_words
+        """
+        
+        params = {"min_words": min_words, "max_words": max_words}
+        
+        if language:
+            query += " AND d.language = :language"
+            params['language'] = language
+            
+        if file_type:
+            query += " AND d.file_type = :file_type"
+            params['file_type'] = file_type
+            
+        query += """
+        GROUP BY d.id, d.filename, d.language, d.file_type, 
+                 d.word_count, d.char_count, d.chapter_count,
+                 d.reading_time_minutes, d.created_at,
+                 da.analysis_count, da.last_analysis_type
+        ORDER BY d.created_at DESC
+        """
+        
+        result = db.execute(text(query), params)
+        rows = result.fetchall()
+        
+        # Суммарная статистика
+        total_stats_query = """
+        SELECT 
+            COUNT(*) as total_documents,
+            SUM(word_count) as total_words,
+            AVG(word_count) as avg_words,
+            AVG(reading_time_minutes) as avg_reading_time,
+            COUNT(DISTINCT language) as languages_count,
+            COUNT(DISTINCT file_type) as file_types_count
+        FROM documents
+        WHERE word_count BETWEEN :min_words AND :max_words
+        """
+        
+        if language:
+            total_stats_query += " AND language = :language"
+        if file_type:
+            total_stats_query += " AND file_type = :file_type"
+            
+        stats_result = db.execute(text(total_stats_query), params)
+        stats_row = stats_result.fetchone()
+        
+        return {
+            "report_type": "document_statistics",
+            "filters": {
+                "language": language,
+                "file_type": file_type,
+                "min_words": min_words,
+                "max_words": max_words
+            },
+            "summary": {
+                "total_documents": stats_row[0] or 0,
+                "total_words": stats_row[1] or 0,
+                "avg_words": float(stats_row[2] or 0),
+                "avg_reading_time": float(stats_row[3] or 0),
+                "languages_count": stats_row[4] or 0,
+                "file_types_count": stats_row[5] or 0
+            },
+            "data": [
+                {
+                    "document_id": row[0],
+                    "filename": row[1],
+                    "language": row[2],
+                    "file_type": row[3],
+                    "word_count": row[4],
+                    "char_count": row[5],
+                    "chapter_count": row[6],
+                    "reading_time_minutes": row[7],
+                    "created_at": row[8].isoformat() if row[8] else None,
+                    "notes_count": row[9] or 0,
+                    "quotes_count": row[10] or 0,
+                    "analysis_count": row[11] or 0,
+                    "last_analysis_type": row[12]
+                }
+                for row in rows
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка статистики документов: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/reports/translation-usage")
+async def get_translation_usage_report(
+    start_date: str = None,
+    end_date: str = None,
+    db: Session = Depends(get_db)
+):
+    """Отчет по использованию перевода"""
+    try:
+        # Если таблица translation_cache существует
+        query = """
+        SELECT 
+            DATE(t.created_at) as date,
+            COUNT(*) as translation_count,
+            SUM(LENGTH(t.original_text)) as total_chars_translated,
+            t.source_language,
+            t.target_language,
+            t.translation_service,
+            COUNT(DISTINCT t.original_text_hash) as unique_translations
+        FROM translation_cache t
+        WHERE 1=1
+        """
+        
+        params = {}
+        
+        if start_date:
+            query += " AND t.created_at >= :start_date"
+            params['start_date'] = start_date
+            
+        if end_date:
+            query += " AND t.created_at <= :end_date"
+            params['end_date'] = end_date
+            
+        query += """
+        GROUP BY DATE(t.created_at), t.source_language, 
+                 t.target_language, t.translation_service
+        ORDER BY date DESC, translation_count DESC
+        """
+        
+        result = db.execute(text(query), params)
+        rows = result.fetchall()
+        
+        # Суммарная статистика
+        summary_query = """
+        SELECT 
+            COUNT(*) as total_translations,
+            SUM(LENGTH(original_text)) as total_chars,
+            COUNT(DISTINCT original_text_hash) as unique_count,
+            COUNT(DISTINCT source_language) as source_langs,
+            COUNT(DISTINCT target_language) as target_langs
+        FROM translation_cache
+        WHERE 1=1
+        """
+        
+        if start_date:
+            summary_query += " AND created_at >= :start_date"
+        if end_date:
+            summary_query += " AND created_at <= :end_date"
+            
+        summary_result = db.execute(text(summary_query), params)
+        summary_row = summary_result.fetchone()
+        
+        return {
+            "report_type": "translation_usage",
+            "period": {"start_date": start_date, "end_date": end_date},
+            "summary": {
+                "total_translations": summary_row[0] or 0,
+                "total_characters": summary_row[1] or 0,
+                "unique_translations": summary_row[2] or 0,
+                "source_languages": summary_row[3] or 0,
+                "target_languages": summary_row[4] or 0
+            },
+            "daily_data": [
+                {
+                    "date": row[0].isoformat() if row[0] else None,
+                    "translation_count": row[1],
+                    "total_chars_translated": row[2] or 0,
+                    "source_language": row[3],
+                    "target_language": row[4],
+                    "translation_service": row[5],
+                    "unique_translations": row[6] or 0
+                }
+                for row in rows
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка отчета перевода: {e}")
+        # Fallback если таблицы нет
+        return {
+            "report_type": "translation_usage",
+            "summary": {"total_translations": 0, "message": "Данные временно недоступны"},
+            "daily_data": []
+        }
+
+@app.get("/api/reports/ai-analysis")
+async def get_ai_analysis_report(
+    ai_provider: str = None,
+    analysis_type: str = None,
+    db: Session = Depends(get_db)
+):
+    """Отчет по AI анализу"""
+    try:
+        query = """
+        SELECT 
+            DATE(a.created_at) as date,
+            a.ai_provider,
+            a.analysis_type,
+            COUNT(*) as analysis_count,
+            AVG(LENGTH(a.summary)) as avg_summary_length,
+            COUNT(DISTINCT a.document_id) as unique_documents
+        FROM document_analysis a
+        WHERE a.ai_analysis = true
+        """
+        
+        params = {}
+        
+        if ai_provider:
+            query += " AND a.ai_provider = :ai_provider"
+            params['ai_provider'] = ai_provider
+            
+        if analysis_type:
+            query += " AND a.analysis_type = :analysis_type"
+            params['analysis_type'] = analysis_type
+            
+        query += """
+        GROUP BY DATE(a.created_at), a.ai_provider, a.analysis_type
+        ORDER BY date DESC, analysis_count DESC
+        """
+        
+        result = db.execute(text(query), params)
+        rows = result.fetchall()
+        
+        # Статистика по тональности
+        sentiment_query = """
+        SELECT 
+            a.sentiment,
+            COUNT(*) as count,
+            ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as percentage
+        FROM document_analysis a
+        WHERE a.ai_analysis = true AND a.sentiment IS NOT NULL
+        """
+        
+        if ai_provider:
+            sentiment_query += " AND a.ai_provider = :ai_provider"
+            
+        sentiment_query += " GROUP BY a.sentiment ORDER BY count DESC"
+        
+        sentiment_result = db.execute(text(sentiment_query), params)
+        sentiment_rows = sentiment_result.fetchall()
+        
+        return {
+            "report_type": "ai_analysis",
+            "filters": {
+                "ai_provider": ai_provider,
+                "analysis_type": analysis_type
+            },
+            "daily_analysis": [
+                {
+                    "date": row[0].isoformat() if row[0] else None,
+                    "ai_provider": row[1],
+                    "analysis_type": row[2],
+                    "analysis_count": row[3],
+                    "avg_summary_length": float(row[4] or 0),
+                    "unique_documents": row[5]
+                }
+                for row in rows
+            ],
+            "sentiment_distribution": [
+                {
+                    "sentiment": row[0],
+                    "count": row[1],
+                    "percentage": float(row[2] or 0)
+                }
+                for row in sentiment_rows
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка отчета AI анализа: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/reports/system-health")
+async def get_system_health_report(db: Session = Depends(get_db)):
+    """Отчет о здоровье системы"""
+    try:
+        # Статистика по таблицам
+        tables = ['users', 'documents', 'document_notes', 'document_analysis', 
+                 'favorite_quotes', 'translation_cache', 'reading_progress']
+        
+        table_stats = {}
+        
+        for table in tables:
+            try:
+                count_query = f"SELECT COUNT(*) FROM {table}"
+                result = db.execute(text(count_query))
+                count = result.scalar() or 0
+                table_stats[table] = count
+            except:
+                table_stats[table] = 0
+        
+        # Статистика роста
+        growth_query = """
+        SELECT 
+            'documents' as type,
+            DATE(created_at) as date,
+            COUNT(*) as count
+        FROM documents
+        WHERE created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY DATE(created_at)
+        UNION ALL
+        SELECT 
+            'users' as type,
+            DATE(created_at) as date,
+            COUNT(*) as count
+        FROM users
+        WHERE created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY DATE(created_at)
+        ORDER BY type, date
+        """
+        
+        growth_result = db.execute(text(growth_query))
+        growth_rows = growth_result.fetchall()
+        
+        # Активность пользователей
+        activity_query = """
+        SELECT 
+            COUNT(DISTINCT user_id) as active_users_7d,
+            COUNT(DISTINCT CASE WHEN last_login >= NOW() - INTERVAL '30 days' THEN user_id END) as active_users_30d,
+            COUNT(*) as total_users
+        FROM users
+        """
+        
+        activity_result = db.execute(text(activity_query))
+        activity_row = activity_result.fetchone()
+        
+        return {
+            "report_type": "system_health",
+            "timestamp": datetime.now().isoformat(),
+            "table_statistics": table_stats,
+            "user_activity": {
+                "total_users": activity_row[2] or 0,
+                "active_users_7d": activity_row[0] or 0,
+                "active_users_30d": activity_row[1] or 0,
+                "retention_rate": round((activity_row[1] or 0) * 100.0 / max(activity_row[2] or 1, 1), 2)
+            },
+            "growth_data": [
+                {
+                    "type": row[0],
+                    "date": row[1].isoformat() if row[1] else None,
+                    "count": row[2]
+                }
+                for row in growth_rows
+            ],
+            "storage_info": {
+                "documents_count": table_stats.get('documents', 0),
+                "users_count": table_stats.get('users', 0),
+                "analysis_count": table_stats.get('document_analysis', 0),
+                "quotes_count": table_stats.get('favorite_quotes', 0)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка отчета здоровья: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+        
 @app.post("/api/dev/recreate-users-table")
 async def recreate_users_table_endpoint():
     """Пересоздание таблицы users (для разработки)"""
