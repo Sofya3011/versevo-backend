@@ -1,4 +1,3 @@
-# database.py - Подключение к PostgreSQL на Railway
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -7,28 +6,23 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Получаем URL базы данных из переменных окружения Railway
+# Получаем URL базы данных из переменных окружения
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-# Если нет Railway URL, используем SQLite для локальной разработки
 if not DATABASE_URL:
-    DATABASE_URL = "sqlite:///./versevo.db"
+    # Fallback для локальной разработки
+    DATABASE_URL = "postgresql://postgres:password@localhost:5432/versevo"
 
-engine = create_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True
-)
+# Создаем движок SQLAlchemy
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
+# Создаем фабрику сессий
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+# Базовый класс для моделей
 Base = declarative_base()
 
+# Функция для получения сессии БД
 def get_db():
     db = SessionLocal()
     try:
