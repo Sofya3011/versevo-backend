@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SQL Схема БД - Versevo</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        .sql { background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0; }
+        .comment { color: #6a737d; }
+        .keyword { color: #d73a49; font-weight: bold; }
+        .table { color: #005cc5; }
+        .column { color: #6f42c1; }
+    </style>
+</head>
+<body>
+    <h1>SQL Схема базы данных Versevo</h1>
+    
+    <h2>1. Таблица пользователей</h2>
+    <div class="sql">
+        <span class="keyword">CREATE TABLE</span> <span class="table">users</span> (<br>
+        &nbsp;&nbsp;<span class="column">id</span> <span class="keyword">SERIAL PRIMARY KEY</span>,<br>
+        &nbsp;&nbsp;<span class="column">email</span> <span class="keyword">VARCHAR</span>(255) <span class="keyword">UNIQUE NOT NULL</span>,<br>
+        &nbsp;&nbsp;<span class="column">username</span> <span class="keyword">VARCHAR</span>(100) <span class="keyword">NOT NULL</span>,<br>
+        &nbsp;&nbsp;<span class="column">hashed_password</span> <span class="keyword">VARCHAR</span>(255) <span class="keyword">NOT NULL</span>,<br>
+        &nbsp;&nbsp;<span class="column">created_at</span> <span class="keyword">TIMESTAMP DEFAULT</span> <span class="keyword">CURRENT_TIMESTAMP</span>,<br>
+        &nbsp;&nbsp;<span class="column">last_login</span> <span class="keyword">TIMESTAMP</span><br>
+        );
+    </div>
+    
+    <h2>2. Таблица документов</h2>
+    <div class="sql">
+        <span class="keyword">CREATE TABLE</span> <span class="table">documents</span> (<br>
+        &nbsp;&nbsp;<span class="column">id</span> <span class="keyword">SERIAL PRIMARY KEY</span>,<br>
+        &nbsp;&nbsp;<span class="column">user_id</span> <span class="keyword">INTEGER REFERENCES</span> <span class="table">users</span>(<span class="column">id</span>),<br>
+        &nbsp;&nbsp;<span class="column">filename</span> <span class="keyword">VARCHAR</span>(255) <span class="keyword">NOT NULL</span>,<br>
+        &nbsp;&nbsp;<span class="column">content</span> <span class="keyword">TEXT</span>,<br>
+        &nbsp;&nbsp;<span class="column">language</span> <span class="keyword">VARCHAR</span>(10) <span class="keyword">DEFAULT</span> 'en',<br>
+        &nbsp;&nbsp;<span class="column">file_type</span> <span class="keyword">VARCHAR</span>(20) <span class="keyword">DEFAULT</span> 'txt',<br>
+        &nbsp;&nbsp;<span class="column">word_count</span> <span class="keyword">INTEGER DEFAULT</span> 0,<br>
+        &nbsp;&nbsp;<span class="column">created_at</span> <span class="keyword">TIMESTAMP DEFAULT</span> <span class="keyword">CURRENT_TIMESTAMP</span><br>
+        );
+    </div>
+    
+    <h2>3. Пример SQL запроса для отчета</h2>
+    <div class="sql">
+        <span class="comment">-- Отчет: Активные пользователи за последние 7 дней</span><br>
+        <span class="keyword">SELECT</span><br>
+        &nbsp;&nbsp;u.<span class="column">id</span>,<br>
+        &nbsp;&nbsp;u.<span class="column">email</span>,<br>
+        &nbsp;&nbsp;u.<span class="column">username</span>,<br>
+        &nbsp;&nbsp;<span class="keyword">COUNT</span>(<span class="keyword">DISTINCT</span> d.<span class="column">id</span>) <span class="keyword">AS</span> documents_count,<br>
+        &nbsp;&nbsp;<span class="keyword">COUNT</span>(<span class="keyword">DISTINCT</span> n.<span class="column">id</span>) <span class="keyword">AS</span> notes_count,<br>
+        &nbsp;&nbsp;<span class="keyword">MAX</span>(u.<span class="column">last_login</span>) <span class="keyword">AS</span> last_activity<br>
+        <span class="keyword">FROM</span> <span class="table">users</span> u<br>
+        <span class="keyword">LEFT JOIN</span> <span class="table">documents</span> d <span class="keyword">ON</span> u.<span class="column">id</span> = d.<span class="column">user_id</span><br>
+        <span class="keyword">LEFT JOIN</span> <span class="table">document_notes</span> n <span class="keyword">ON</span> u.<span class="column">id</span> = n.<span class="column">user_id</span><br>
+        <span class="keyword">WHERE</span> u.<span class="column">last_login</span> >= <span class="keyword">CURRENT_DATE</span> - <span class="keyword">INTERVAL</span> '7 days'<br>
+        <span class="keyword">GROUP BY</span> u.<span class="column">id</span>, u.<span class="column">email</span>, u.<span class="column">username</span><br>
+        <span class="keyword">ORDER BY</span> last_activity <span class="keyword">DESC</span>;<br>
+        <br>
+        <span class="comment">-- Защита от SQL-инъекций:</span><br>
+        <span class="comment">-- 1. Используются параметризованные запросы</span><br>
+        <span class="comment">-- 2. Входные данные валидируются</span><br>
+        <span class="comment">-- 3. ORM SQLAlchemy экранирует все параметры</span>
+    </div>
+</body>
+</html>
