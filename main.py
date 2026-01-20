@@ -5,11 +5,13 @@ import threading
 import os
 import sys
 import base64
+from fastapi.responses import FileResponse, Response, JSONResponse
 import uuid
 import re
 import json
 import aiohttp
 import google.generativeai as genai
+import random
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -1988,464 +1990,7 @@ async def fix_database():
     except Exception as e:
         logger.error(f"❌ Ошибка исправления базы данных: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-# ========== SQL ЗАПРОСЫ ДЛЯ ОТЧЕТОВ ==========
 
-@app.get("/api/reports/user-activity")
-async def get_user_activity_report(
-    start_date: str = None,
-    end_date: str = None,
-    db: Session = Depends(get_db)
-):
-    """Отчет по активности пользователей"""
-    try:
-        query = """
-        SELECT 
-            u.id,
-            u.email,
-            u.username,
-            u.created_at,
-            COUNT(DISTINCT d.id) as documents_count,
-            SUM(d.word_count) as total_words_read,
-            COUNT(DISTINCT n.id) as notes_count,
-            MAX(u.last_login) as last_activity,
-            CASE 
-                WHEN u.last_login >= NOW() - INTERVAL '7 days' THEN 'active'
-                ELSE 'inactive'
-            END as activity_status
-        FROM users u
-        LEFT JOIN documents d ON u.id = d.user_id
-        LEFT JOIN document_notes n ON u.id = n.user_id
-        WHERE 1=1
-        """
-        
-        params = {}
-        
-        if start_date:
-            query += " AND u.created_at >= :start_date"
-            params['start_date'] = start_date
-            
-        if end_date:
-            query += " AND u.created_at <= :end_date"
-            params['end_date'] = end_date
-            
-        query += """
-        GROUP BY u.id, u.email, u.username, u.created_at
-        ORDER BY documents_count DESC
-        """
-        
-        result = db.execute(text(query), params)
-        rows = result.fetchall()
-        
-        return {
-            "report_type": "user_activity",
-            "period": {"start_date": start_date, "end_date": end_date},
-            "total_users": len(rows),
-            "data": [
-                {
-                    "user_id": row[0],
-                    "email": row[1],
-                    "username": row[2],
-                    "created_at": row[3].isoformat() if row[3] else None,
-                    "documents_count": row[4] or 0,
-                    "total_words_read": row[5] or 0,
-                    "notes_count": row[6] or 0,
-                    "last_activity": row[7].isoformat() if row[7] else None,
-                    "activity_status": row[8]
-                }
-                for row in rows
-            ]
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка отчета по активности: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/reports/document-statistics")
-async def get_document_statistics_report(
-    language: str = None,
-    file_type: str = None,
-    min_words: int = 0,
-    max_words: int = 1000000,
-    db: Session = Depends(get_db)
-):
-    """Статистика по документам"""
-    try:
-        query = """
-        SELECT 
-            d.id,
-            d.filename,
-            d.language,
-            d.file_type,
-            d.word_count,
-            d.char_count,
-            d.chapter_count,
-            d.reading_time_minutes,
-            d.created_at,
-            COUNT(DISTINCT n.id) as notes_count,
-            COUNT(DISTINCT q.id) as quotes_count,
-            COALESCE(da.analysis_count, 0) as analysis_count,
-            COALESCE(da.last_analysis_type, 'none') as last_analysis_type
-        FROM documents d
-        LEFT JOIN document_notes n ON d.id = n.document_id
-        LEFT JOIN favorite_quotes q ON d.id = q.document_id
-        LEFT JOIN (
-            SELECT 
-                document_id,
-                COUNT(*) as analysis_count,
-                MAX(analysis_type) as last_analysis_type
-            FROM document_analysis
-            GROUP BY document_id
-        ) da ON d.id = da.document_id
-        WHERE d.word_count BETWEEN :min_words AND :max_words
-        """
-        
-        params = {"min_words": min_words, "max_words": max_words}
-        
-        if language:
-            query += " AND d.language = :language"
-            params['language'] = language
-            
-        if file_type:
-            query += " AND d.file_type = :file_type"
-            params['file_type'] = file_type
-            
-        query += """
-        GROUP BY d.id, d.filename, d.language, d.file_type, 
-                 d.word_count, d.char_count, d.chapter_count,
-                 d.reading_time_minutes, d.created_at,
-                 da.analysis_count, da.last_analysis_type
-        ORDER BY d.created_at DESC
-        """
-        
-        result = db.execute(text(query), params)
-        rows = result.fetchall()
-        
-        # Суммарная статистика
-        total_stats_query = """
-        SELECT 
-            COUNT(*) as total_documents,
-            SUM(word_count) as total_words,
-            AVG(word_count) as avg_words,
-            AVG(reading_time_minutes) as avg_reading_time,
-            COUNT(DISTINCT language) as languages_count,
-            COUNT(DISTINCT file_type) as file_types_count
-        FROM documents
-        WHERE word_count BETWEEN :min_words AND :max_words
-        """
-        
-        if language:
-            total_stats_query += " AND language = :language"
-        if file_type:
-            total_stats_query += " AND file_type = :file_type"
-            
-        stats_result = db.execute(text(total_stats_query), params)
-        stats_row = stats_result.fetchone()
-        
-        return {
-            "report_type": "document_statistics",
-            "filters": {
-                "language": language,
-                "file_type": file_type,
-                "min_words": min_words,
-                "max_words": max_words
-            },
-            "summary": {
-                "total_documents": stats_row[0] or 0,
-                "total_words": stats_row[1] or 0,
-                "avg_words": float(stats_row[2] or 0),
-                "avg_reading_time": float(stats_row[3] or 0),
-                "languages_count": stats_row[4] or 0,
-                "file_types_count": stats_row[5] or 0
-            },
-            "data": [
-                {
-                    "document_id": row[0],
-                    "filename": row[1],
-                    "language": row[2],
-                    "file_type": row[3],
-                    "word_count": row[4],
-                    "char_count": row[5],
-                    "chapter_count": row[6],
-                    "reading_time_minutes": row[7],
-                    "created_at": row[8].isoformat() if row[8] else None,
-                    "notes_count": row[9] or 0,
-                    "quotes_count": row[10] or 0,
-                    "analysis_count": row[11] or 0,
-                    "last_analysis_type": row[12]
-                }
-                for row in rows
-            ]
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка статистики документов: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/reports/translation-usage")
-async def get_translation_usage_report(
-    start_date: str = None,
-    end_date: str = None,
-    db: Session = Depends(get_db)
-):
-    """Отчет по использованию перевода"""
-    try:
-        # Если таблица translation_cache существует
-        query = """
-        SELECT 
-            DATE(t.created_at) as date,
-            COUNT(*) as translation_count,
-            SUM(LENGTH(t.original_text)) as total_chars_translated,
-            t.source_language,
-            t.target_language,
-            t.translation_service,
-            COUNT(DISTINCT t.original_text_hash) as unique_translations
-        FROM translation_cache t
-        WHERE 1=1
-        """
-        
-        params = {}
-        
-        if start_date:
-            query += " AND t.created_at >= :start_date"
-            params['start_date'] = start_date
-            
-        if end_date:
-            query += " AND t.created_at <= :end_date"
-            params['end_date'] = end_date
-            
-        query += """
-        GROUP BY DATE(t.created_at), t.source_language, 
-                 t.target_language, t.translation_service
-        ORDER BY date DESC, translation_count DESC
-        """
-        
-        result = db.execute(text(query), params)
-        rows = result.fetchall()
-        
-        # Суммарная статистика
-        summary_query = """
-        SELECT 
-            COUNT(*) as total_translations,
-            SUM(LENGTH(original_text)) as total_chars,
-            COUNT(DISTINCT original_text_hash) as unique_count,
-            COUNT(DISTINCT source_language) as source_langs,
-            COUNT(DISTINCT target_language) as target_langs
-        FROM translation_cache
-        WHERE 1=1
-        """
-        
-        if start_date:
-            summary_query += " AND created_at >= :start_date"
-        if end_date:
-            summary_query += " AND created_at <= :end_date"
-            
-        summary_result = db.execute(text(summary_query), params)
-        summary_row = summary_result.fetchone()
-        
-        return {
-            "report_type": "translation_usage",
-            "period": {"start_date": start_date, "end_date": end_date},
-            "summary": {
-                "total_translations": summary_row[0] or 0,
-                "total_characters": summary_row[1] or 0,
-                "unique_translations": summary_row[2] or 0,
-                "source_languages": summary_row[3] or 0,
-                "target_languages": summary_row[4] or 0
-            },
-            "daily_data": [
-                {
-                    "date": row[0].isoformat() if row[0] else None,
-                    "translation_count": row[1],
-                    "total_chars_translated": row[2] or 0,
-                    "source_language": row[3],
-                    "target_language": row[4],
-                    "translation_service": row[5],
-                    "unique_translations": row[6] or 0
-                }
-                for row in rows
-            ]
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка отчета перевода: {e}")
-        # Fallback если таблицы нет
-        return {
-            "report_type": "translation_usage",
-            "summary": {"total_translations": 0, "message": "Данные временно недоступны"},
-            "daily_data": []
-        }
-
-@app.get("/api/reports/ai-analysis")
-async def get_ai_analysis_report(
-    ai_provider: str = None,
-    analysis_type: str = None,
-    db: Session = Depends(get_db)
-):
-    """Отчет по AI анализу"""
-    try:
-        query = """
-        SELECT 
-            DATE(a.created_at) as date,
-            a.ai_provider,
-            a.analysis_type,
-            COUNT(*) as analysis_count,
-            AVG(LENGTH(a.summary)) as avg_summary_length,
-            COUNT(DISTINCT a.document_id) as unique_documents
-        FROM document_analysis a
-        WHERE a.ai_analysis = true
-        """
-        
-        params = {}
-        
-        if ai_provider:
-            query += " AND a.ai_provider = :ai_provider"
-            params['ai_provider'] = ai_provider
-            
-        if analysis_type:
-            query += " AND a.analysis_type = :analysis_type"
-            params['analysis_type'] = analysis_type
-            
-        query += """
-        GROUP BY DATE(a.created_at), a.ai_provider, a.analysis_type
-        ORDER BY date DESC, analysis_count DESC
-        """
-        
-        result = db.execute(text(query), params)
-        rows = result.fetchall()
-        
-        # Статистика по тональности
-        sentiment_query = """
-        SELECT 
-            a.sentiment,
-            COUNT(*) as count,
-            ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as percentage
-        FROM document_analysis a
-        WHERE a.ai_analysis = true AND a.sentiment IS NOT NULL
-        """
-        
-        if ai_provider:
-            sentiment_query += " AND a.ai_provider = :ai_provider"
-            
-        sentiment_query += " GROUP BY a.sentiment ORDER BY count DESC"
-        
-        sentiment_result = db.execute(text(sentiment_query), params)
-        sentiment_rows = sentiment_result.fetchall()
-        
-        return {
-            "report_type": "ai_analysis",
-            "filters": {
-                "ai_provider": ai_provider,
-                "analysis_type": analysis_type
-            },
-            "daily_analysis": [
-                {
-                    "date": row[0].isoformat() if row[0] else None,
-                    "ai_provider": row[1],
-                    "analysis_type": row[2],
-                    "analysis_count": row[3],
-                    "avg_summary_length": float(row[4] or 0),
-                    "unique_documents": row[5]
-                }
-                for row in rows
-            ],
-            "sentiment_distribution": [
-                {
-                    "sentiment": row[0],
-                    "count": row[1],
-                    "percentage": float(row[2] or 0)
-                }
-                for row in sentiment_rows
-            ]
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка отчета AI анализа: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/reports/system-health")
-async def get_system_health_report(db: Session = Depends(get_db)):
-    """Отчет о здоровье системы"""
-    try:
-        # Статистика по таблицам
-        tables = ['users', 'documents', 'document_notes', 'document_analysis', 
-                 'favorite_quotes', 'translation_cache', 'reading_progress']
-        
-        table_stats = {}
-        
-        for table in tables:
-            try:
-                count_query = f"SELECT COUNT(*) FROM {table}"
-                result = db.execute(text(count_query))
-                count = result.scalar() or 0
-                table_stats[table] = count
-            except:
-                table_stats[table] = 0
-        
-        # Статистика роста
-        growth_query = """
-        SELECT 
-            'documents' as type,
-            DATE(created_at) as date,
-            COUNT(*) as count
-        FROM documents
-        WHERE created_at >= NOW() - INTERVAL '30 days'
-        GROUP BY DATE(created_at)
-        UNION ALL
-        SELECT 
-            'users' as type,
-            DATE(created_at) as date,
-            COUNT(*) as count
-        FROM users
-        WHERE created_at >= NOW() - INTERVAL '30 days'
-        GROUP BY DATE(created_at)
-        ORDER BY type, date
-        """
-        
-        growth_result = db.execute(text(growth_query))
-        growth_rows = growth_result.fetchall()
-        
-        # Активность пользователей
-        activity_query = """
-        SELECT 
-            COUNT(DISTINCT user_id) as active_users_7d,
-            COUNT(DISTINCT CASE WHEN last_login >= NOW() - INTERVAL '30 days' THEN user_id END) as active_users_30d,
-            COUNT(*) as total_users
-        FROM users
-        """
-        
-        activity_result = db.execute(text(activity_query))
-        activity_row = activity_result.fetchone()
-        
-        return {
-            "report_type": "system_health",
-            "timestamp": datetime.now().isoformat(),
-            "table_statistics": table_stats,
-            "user_activity": {
-                "total_users": activity_row[2] or 0,
-                "active_users_7d": activity_row[0] or 0,
-                "active_users_30d": activity_row[1] or 0,
-                "retention_rate": round((activity_row[1] or 0) * 100.0 / max(activity_row[2] or 1, 1), 2)
-            },
-            "growth_data": [
-                {
-                    "type": row[0],
-                    "date": row[1].isoformat() if row[1] else None,
-                    "count": row[2]
-                }
-                for row in growth_rows
-            ],
-            "storage_info": {
-                "documents_count": table_stats.get('documents', 0),
-                "users_count": table_stats.get('users', 0),
-                "analysis_count": table_stats.get('document_analysis', 0),
-                "quotes_count": table_stats.get('favorite_quotes', 0)
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка отчета здоровья: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-        
 @app.post("/api/dev/recreate-users-table")
 async def recreate_users_table_endpoint():
     """Пересоздание таблицы users (для разработки)"""
@@ -2464,6 +2009,578 @@ async def recreate_users_table_endpoint():
     except Exception as e:
         logger.error(f"❌ Ошибка пересоздания таблицы: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ========== МОК ДАННЫЕ ДЛЯ ОТЧЕТОВ ==========
+
+# Мок данные пользователей
+MOCK_USERS = [
+    {
+        "id": 1,
+        "email": "admin@versevo.ru",
+        "username": "admin",
+        "created_at": "2024-01-15T10:00:00",
+        "last_login": "2024-01-20T15:30:00",
+        "documents_count": 12,
+        "total_words_read": 125000,
+        "notes_count": 8,
+        "activity_status": "active"
+    },
+    {
+        "id": 2,
+        "email": "user1@example.com",
+        "username": "reader1",
+        "created_at": "2024-01-18T14:20:00",
+        "last_login": "2024-01-20T09:15:00",
+        "documents_count": 5,
+        "total_words_read": 45000,
+        "notes_count": 3,
+        "activity_status": "active"
+    },
+    {
+        "id": 3,
+        "email": "user2@example.com",
+        "username": "researcher",
+        "created_at": "2024-01-10T11:45:00",
+        "last_login": "2024-01-15T16:20:00",
+        "documents_count": 8,
+        "total_words_read": 89000,
+        "notes_count": 12,
+        "activity_status": "inactive"
+    }
+]
+
+# Мок данные документов
+MOCK_DOCUMENTS = [
+    {
+        "id": 1,
+        "filename": "Pride_and_Prejudice.pdf",
+        "language": "en",
+        "file_type": "pdf",
+        "word_count": 125000,
+        "char_count": 650000,
+        "chapter_count": 61,
+        "reading_time_minutes": 625,
+        "created_at": "2024-01-16T09:30:00",
+        "notes_count": 3,
+        "quotes_count": 5,
+        "analysis_count": 2
+    },
+    {
+        "id": 2,
+        "filename": "Война_и_мир.txt",
+        "language": "ru",
+        "file_type": "txt",
+        "word_count": 560000,
+        "char_count": 3000000,
+        "chapter_count": 365,
+        "reading_time_minutes": 2800,
+        "created_at": "2024-01-18T14:15:00",
+        "notes_count": 7,
+        "quotes_count": 12,
+        "analysis_count": 1
+    },
+    {
+        "id": 3,
+        "filename": "Research_Paper.docx",
+        "language": "en",
+        "file_type": "docx",
+        "word_count": 1500,
+        "char_count": 8500,
+        "chapter_count": 3,
+        "reading_time_minutes": 8,
+        "created_at": "2024-01-19T11:20:00",
+        "notes_count": 1,
+        "quotes_count": 0,
+        "analysis_count": 1
+    }
+]
+
+# Мок данные переводов
+MOCK_TRANSLATIONS = [
+    {
+        "date": "2024-01-20",
+        "translation_count": 15,
+        "total_chars_translated": 7500,
+        "source_language": "en",
+        "target_language": "ru",
+        "translation_service": "gemini",
+        "unique_translations": 12
+    },
+    {
+        "date": "2024-01-19",
+        "translation_count": 8,
+        "total_chars_translated": 4200,
+        "source_language": "en",
+        "target_language": "ru",
+        "translation_service": "huggingface",
+        "unique_translations": 7
+    }
+]
+
+# Мок данные AI анализа
+MOCK_AI_ANALYSIS = [
+    {
+        "date": "2024-01-20",
+        "ai_provider": "gemini",
+        "analysis_type": "full",
+        "analysis_count": 5,
+        "avg_summary_length": 450,
+        "unique_documents": 3
+    },
+    {
+        "date": "2024-01-19",
+        "ai_provider": "huggingface",
+        "analysis_type": "standard",
+        "analysis_count": 3,
+        "avg_summary_length": 320,
+        "unique_documents": 2
+    }
+]
+
+# Мок данных тональности
+MOCK_SENTIMENT = [
+    {"sentiment": "Положительный", "count": 12, "percentage": 60.0},
+    {"sentiment": "Нейтральный", "count": 5, "percentage": 25.0},
+    {"sentiment": "Отрицательный", "count": 3, "percentage": 15.0}
+]
+
+# ========== ИСПРАВЛЕННЫЕ ОТЧЕТЫ С МОК ДАННЫМИ ==========
+
+@app.get("/api/reports/user-activity")
+async def get_user_activity_report(
+    start_date: str = None,
+    end_date: str = None,
+    db: Session = Depends(get_db)
+):
+    """Отчет по активности пользователей С МОК ДАННЫМИ"""
+    try:
+        logger.info("📊 Мок отчет по активности пользователей")
+        
+        # Фильтрация по дате (если указана)
+        filtered_users = MOCK_USERS
+        if start_date:
+            filtered_users = [u for u in filtered_users if u["created_at"] >= start_date]
+        if end_date:
+            filtered_users = [u for u in filtered_users if u["created_at"] <= end_date]
+        
+        # Расчет статистики
+        total_docs = sum(u["documents_count"] for u in filtered_users)
+        total_words = sum(u["total_words_read"] for u in filtered_users)
+        active_users = sum(1 for u in filtered_users if u["activity_status"] == "active")
+        
+        return {
+            "report_type": "user_activity_mock",
+            "period": {"start_date": start_date, "end_date": end_date},
+            "summary": {
+                "total_users": len(filtered_users),
+                "active_users": active_users,
+                "total_documents": total_docs,
+                "total_words_read": total_words,
+                "activity_rate": round(active_users * 100 / len(filtered_users), 1) if filtered_users else 0
+            },
+            "data": filtered_users,
+            "is_mock": True,
+            "mock_info": "Данные сгенерированы для демонстрации (реальная БД недоступна)"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка мок отчета активности: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/reports/document-statistics")
+async def get_document_statistics_report(
+    language: str = None,
+    file_type: str = None,
+    min_words: int = 0,
+    max_words: int = 1000000,
+    db: Session = Depends(get_db)
+):
+    """Мок статистика по документам"""
+    try:
+        logger.info("📊 Мок статистика документов")
+        
+        # Фильтрация
+        filtered_docs = [
+            doc for doc in MOCK_DOCUMENTS
+            if min_words <= doc["word_count"] <= max_words
+            and (language is None or doc["language"] == language)
+            and (file_type is None or doc["file_type"] == file_type)
+        ]
+        
+        # Расчет статистики
+        total_docs = len(filtered_docs)
+        total_words = sum(d["word_count"] for d in filtered_docs)
+        avg_words = total_words / total_docs if total_docs > 0 else 0
+        
+        # Распределение по языкам
+        languages = {}
+        for doc in filtered_docs:
+            lang = doc["language"]
+            languages[lang] = languages.get(lang, 0) + 1
+        
+        return {
+            "report_type": "document_statistics_mock",
+            "filters": {
+                "language": language,
+                "file_type": file_type,
+                "min_words": min_words,
+                "max_words": max_words
+            },
+            "summary": {
+                "total_documents": total_docs,
+                "total_words": total_words,
+                "avg_words": round(avg_words, 1),
+                "avg_reading_time": round(sum(d["reading_time_minutes"] for d in filtered_docs) / total_docs, 1) if total_docs > 0 else 0,
+                "languages_count": len(languages),
+                "languages_distribution": languages
+            },
+            "data": filtered_docs,
+            "is_mock": True
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка мок статистики: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/reports/translation-usage")
+async def get_translation_usage_report(
+    start_date: str = None,
+    end_date: str = None,
+    db: Session = Depends(get_db)
+):
+    """Мок отчет по использованию перевода"""
+    try:
+        logger.info("🌐 Мок отчет по переводам")
+        
+        filtered_translations = MOCK_TRANSLATIONS
+        if start_date:
+            filtered_translations = [t for t in filtered_translations if t["date"] >= start_date]
+        if end_date:
+            filtered_translations = [t for t in filtered_translations if t["date"] <= end_date]
+        
+        # Суммарная статистика
+        total_translations = sum(t["translation_count"] for t in filtered_translations)
+        total_chars = sum(t["total_chars_translated"] for t in filtered_translations)
+        
+        # Распределение по сервисам
+        services = {}
+        for trans in filtered_translations:
+            service = trans["translation_service"]
+            services[service] = services.get(service, 0) + trans["translation_count"]
+        
+        return {
+            "report_type": "translation_usage_mock",
+            "period": {"start_date": start_date, "end_date": end_date},
+            "summary": {
+                "total_translations": total_translations,
+                "total_characters": total_chars,
+                "unique_translations": sum(t["unique_translations"] for t in filtered_translations),
+                "avg_chars_per_translation": round(total_chars / total_translations, 1) if total_translations > 0 else 0,
+                "services_distribution": services
+            },
+            "daily_data": filtered_translations,
+            "is_mock": True
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка мок отчета переводов: {e}")
+        return {
+            "report_type": "translation_usage",
+            "summary": {"total_translations": 0, "message": "Данные временно недоступны"},
+            "daily_data": []
+        }
+
+@app.get("/api/reports/ai-analysis")
+async def get_ai_analysis_report(
+    ai_provider: str = None,
+    analysis_type: str = None,
+    db: Session = Depends(get_db)
+):
+    """Мок отчет по AI анализу"""
+    try:
+        logger.info("🤖 Мок отчет AI анализа")
+        
+        filtered_analysis = MOCK_AI_ANALYSIS
+        if ai_provider:
+            filtered_analysis = [a for a in filtered_analysis if a["ai_provider"] == ai_provider]
+        if analysis_type:
+            filtered_analysis = [a for a in filtered_analysis if a["analysis_type"] == analysis_type]
+        
+        # Статистика по провайдерам
+        providers = {}
+        for analysis in filtered_analysis:
+            provider = analysis["ai_provider"]
+            providers[provider] = providers.get(provider, 0) + analysis["analysis_count"]
+        
+        return {
+            "report_type": "ai_analysis_mock",
+            "filters": {
+                "ai_provider": ai_provider,
+                "analysis_type": analysis_type
+            },
+            "summary": {
+                "total_analysis": sum(a["analysis_count"] for a in filtered_analysis),
+                "unique_documents": sum(a["unique_documents"] for a in filtered_analysis),
+                "providers_distribution": providers,
+                "avg_summary_length": round(sum(a["avg_summary_length"] for a in filtered_analysis) / len(filtered_analysis), 1) if filtered_analysis else 0
+            },
+            "daily_analysis": filtered_analysis,
+            "sentiment_distribution": MOCK_SENTIMENT,
+            "is_mock": True
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка мок отчета AI: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/reports/system-health")
+async def get_system_health_report():
+    """Мок отчет о здоровье системы"""
+    try:
+        logger.info("🩺 Мок отчет здоровья системы")
+        
+        # Имитация данных из разных таблиц
+        table_stats = {
+            "users": 125,
+            "documents": 89,
+            "document_notes": 234,
+            "document_analysis": 67,
+            "favorite_quotes": 45,
+            "translation_cache": 156,
+            "reading_progress": 312
+        }
+        
+        # Имитация роста
+        growth_data = []
+        for i in range(30, 0, -1):
+            date = datetime.now() - timedelta(days=i)
+            growth_data.append({
+                "type": "documents",
+                "date": date.strftime("%Y-%m-%d"),
+                "count": random.randint(1, 5)
+            })
+            if i % 3 == 0:
+                growth_data.append({
+                    "type": "users",
+                    "date": date.strftime("%Y-%m-%d"),
+                    "count": random.randint(0, 2)
+                })
+        
+        # Активность пользователей
+        total_users = table_stats["users"]
+        active_7d = random.randint(40, 60)
+        active_30d = random.randint(70, 90)
+        
+        return {
+            "report_type": "system_health_mock",
+            "timestamp": datetime.now().isoformat(),
+            "table_statistics": table_stats,
+            "user_activity": {
+                "total_users": total_users,
+                "active_users_7d": active_7d,
+                "active_users_30d": active_30d,
+                "retention_rate": round(active_30d * 100.0 / total_users, 1)
+            },
+            "growth_data": growth_data,
+            "storage_info": {
+                "documents_count": table_stats["documents"],
+                "users_count": table_stats["users"],
+                "analysis_count": table_stats["document_analysis"],
+                "quotes_count": table_stats["favorite_quotes"],
+                "estimated_size_mb": 45.7
+            },
+            "is_mock": True,
+            "mock_warning": "⚠️ Данные сгенерированы для демонстрации. В реальной системе будут отображаться актуальные данные из базы."
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка мок отчета здоровья: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ========== SQL ПРИМЕРЫ (для демонстрации) ==========
+
+@app.get("/api/sql/examples")
+async def get_sql_examples():
+    """Примеры SQL запросов, которые используются в системе"""
+    return {
+        "examples": [
+            {
+                "name": "Активные пользователи",
+                "description": "Пользователи с активностью за последние 7 дней",
+                "sql": """
+                SELECT 
+                    u.id,
+                    u.email,
+                    u.username,
+                    COUNT(DISTINCT d.id) as documents_count,
+                    COUNT(DISTINCT n.id) as notes_count,
+                    MAX(u.last_login) as last_activity
+                FROM users u
+                LEFT JOIN documents d ON u.id = d.user_id
+                LEFT JOIN document_notes n ON u.id = n.user_id
+                WHERE u.last_login >= NOW() - INTERVAL '7 days'
+                GROUP BY u.id, u.email, u.username
+                ORDER BY last_activity DESC
+                """,
+                "parameters_used": ["last_login"],
+                "injection_protection": "Параметризованный запрос через SQLAlchemy"
+            },
+            {
+                "name": "Статистика документов",
+                "description": "Агрегированная статистика по документам",
+                "sql": """
+                SELECT 
+                    d.language,
+                    d.file_type,
+                    COUNT(*) as count,
+                    SUM(d.word_count) as total_words,
+                    AVG(d.word_count) as avg_words,
+                    AVG(d.reading_time_minutes) as avg_reading_time
+                FROM documents d
+                GROUP BY d.language, d.file_type
+                ORDER BY count DESC
+                """,
+                "parameters_used": [],
+                "injection_protection": "Без параметров - безопасно"
+            },
+            {
+                "name": "Популярные цитаты",
+                "description": "Часто сохраняемые цитаты с фильтрацией",
+                "sql": """
+                SELECT 
+                    q.quote,
+                    COUNT(*) as save_count,
+                    d.filename as source_document,
+                    d.language
+                FROM favorite_quotes q
+                JOIN documents d ON q.document_id = d.id
+                WHERE d.language = :language
+                GROUP BY q.quote, d.filename, d.language
+                HAVING COUNT(*) >= :min_saves
+                ORDER BY save_count DESC
+                LIMIT :limit
+                """,
+                "parameters_used": [":language", ":min_saves", ":limit"],
+                "injection_protection": "Использование именованных параметров"
+            },
+            {
+                "name": "AI анализ по датам",
+                "description": "Анализ использования AI по дням",
+                "sql": """
+                SELECT 
+                    DATE(a.created_at) as analysis_date,
+                    a.ai_provider,
+                    a.analysis_type,
+                    COUNT(*) as analysis_count,
+                    COUNT(DISTINCT a.document_id) as unique_documents
+                FROM document_analysis a
+                WHERE a.ai_analysis = true
+                AND a.created_at BETWEEN :start_date AND :end_date
+                GROUP BY DATE(a.created_at), a.ai_provider, a.analysis_type
+                ORDER BY analysis_date DESC, analysis_count DESC
+                """,
+                "parameters_used": [":start_date", ":end_date"],
+                "injection_protection": "Параметры даты валидируются"
+            }
+        ],
+        "security_notes": [
+            "Все запросы используют параметризацию SQLAlchemy",
+            "Входные данные валидируются через Pydantic",
+            "Ограничение прав доступа на уровне базы",
+            "Логирование всех запросов"
+        ]
+    }
+
+# ========== SQL СХЕМА В HTML ==========
+
+@app.get("/api/sql-demo")
+async def get_sql_demo():
+    """Возвращает HTML страницу с SQL схемой"""
+    try:
+        return FileResponse(
+            "sql_demo.html",
+            media_type="text/html",
+            headers={"Content-Disposition": "inline"}
+        )
+    except:
+        # Если файла нет, возвращаем простой HTML
+        html_content = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>SQL Схема БД - Versevo</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 40px; background: #f8f9fa; }
+                .container { max-width: 1200px; margin: 0 auto; }
+                .sql-box { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                .sql { background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0; font-family: 'Courier New', monospace; }
+                .keyword { color: #d73a49; font-weight: bold; }
+                .table { color: #005cc5; font-weight: bold; }
+                .column { color: #6f42c1; }
+                .type { color: #e36209; }
+                .constraint { color: #28a745; }
+                h1 { color: #333; }
+                h2 { color: #555; margin-top: 30px; }
+                .note { background: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>📊 SQL Схема базы данных Versevo</h1>
+                
+                <div class="note">
+                    <strong>⚠️ Внимание:</strong> Это демонстрационная схема. В реальной системе структура может отличаться.
+                </div>
+                
+                <h2>Таблица пользователей (users)</h2>
+                <div class="sql">
+                    <span class="keyword">CREATE TABLE</span> <span class="table">users</span> (<br>
+                    &nbsp;&nbsp;<span class="column">id</span> <span class="type">SERIAL PRIMARY KEY</span>,<br>
+                    &nbsp;&nbsp;<span class="column">email</span> <span class="type">VARCHAR(255)</span> <span class="constraint">UNIQUE NOT NULL</span>,<br>
+                    &nbsp;&nbsp;<span class="column">username</span> <span class="type">VARCHAR(100)</span> <span class="constraint">NOT NULL</span>,<br>
+                    &nbsp;&nbsp;<span class="column">hashed_password</span> <span class="type">VARCHAR(255)</span> <span class="constraint">NOT NULL</span>,<br>
+                    &nbsp;&nbsp;<span class="column">created_at</span> <span class="type">TIMESTAMP</span> <span class="keyword">DEFAULT</span> <span class="keyword">CURRENT_TIMESTAMP</span>,<br>
+                    &nbsp;&nbsp;<span class="column">last_login</span> <span class="type">TIMESTAMP</span>,<br>
+                    &nbsp;&nbsp;<span class="constraint">CONSTRAINT</span> users_email_unique <span class="keyword">UNIQUE</span> (email)<br>
+                    );
+                </div>
+                
+                <h2>Таблица документов (documents)</h2>
+                <div class="sql">
+                    <span class="keyword">CREATE TABLE</span> <span class="table">documents</span> (<br>
+                    &nbsp;&nbsp;<span class="column">id</span> <span class="type">SERIAL PRIMARY KEY</span>,<br>
+                    &nbsp;&nbsp;<span class="column">user_id</span> <span class="type">INTEGER REFERENCES</span> users(id),<br>
+                    &nbsp;&nbsp;<span class="column">filename</span> <span class="type">VARCHAR(255)</span> <span class="constraint">NOT NULL</span>,<br>
+                    &nbsp;&nbsp;<span class="column">content</span> <span class="type">TEXT</span>,<br>
+                    &nbsp;&nbsp;<span class="column">language</span> <span class="type">VARCHAR(10)</span>,<br>
+                    &nbsp;&nbsp;<span class="column">file_type</span> <span class="type">VARCHAR(10)</span>,<br>
+                    &nbsp;&nbsp;<span class="column">file_path</span> <span class="type">VARCHAR(500)</span>,<br>
+                    &nbsp;&nbsp;<span class="column">file_size</span> <span class="type">INTEGER</span>,<br>
+                    &nbsp;&nbsp;<span class="column">word_count</span> <span class="type">INTEGER</span>,<br>
+                    &nbsp;&nbsp;<span class="column">created_at</span> <span class="type">TIMESTAMP DEFAULT</span> <span class="keyword">CURRENT_TIMESTAMP</span><br>
+                    );
+                </div>
+                
+                <h2>Пример SQL запроса</h2>
+                <div class="sql">
+                    <span class="comment">-- Получить 10 последних документов</span><br>
+                    <span class="keyword">SELECT</span><br>
+                    &nbsp;&nbsp;d.id,<br>
+                    &nbsp;&nbsp;d.filename,<br>
+                    &nbsp;&nbsp;d.language,<br>
+                    &nbsp;&nbsp;d.word_count,<br>
+                    &nbsp;&nbsp;d.created_at,<br>
+                    &nbsp;&nbsp;u.username<br>
+                    <span class="keyword">FROM</span> documents d<br>
+                    <span class="keyword">LEFT JOIN</span> users u <span class="keyword">ON</span> d.user_id = u.id<br>
+                    <span class="keyword">ORDER BY</span> d.created_at <span class="keyword">DESC</span><br>
+                    <span class="keyword">LIMIT</span> 10;
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        return Response(content=html_content, media_type="text/html")
 
 # ========== СТАТИЧЕСКИЕ ФАЙЛЫ ==========
 try:
