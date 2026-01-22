@@ -1,18 +1,16 @@
-# main.py - Полный бэкенд Versevo с PostgreSQL, Hugging Face и Gemini AI
+# main.py - Бэкенд Versevo без базы данных (только функциональность)
 import asyncio
 import time
-import threading
 import os
 import sys
 import base64
-from fastapi.responses import FileResponse, Response, JSONResponse
 import uuid
 import re
 import json
 import aiohttp
 import google.generativeai as genai
 import random
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -24,8 +22,6 @@ import logging
 import tempfile
 import shutil
 from pathlib import Path
-from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, text
 import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords
@@ -35,19 +31,13 @@ import fitz  # PyMuPDF
 import docx
 from PIL import Image
 import io
-import jwt
 import secrets
-from passlib.context import CryptContext
-
-# Импортируем настройки БД
-from database import get_db, SessionLocal, engine
-from models import Base, User, Document, DocumentNote, ReadingProgress, DocumentAnalysis, FavoriteQuote, TranslationCache
 
 # ========== НАСТРОЙКА APP И CORS ==========
 app = FastAPI(
-    title="Versevo Backend API",
-    description="Modern document reader with translation and AI features",
-    version="8.0.0",
+    title="Versevo Backend API (No Database)",
+    description="Modern document reader with translation and AI features - Database moved to Flutter",
+    version="9.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -67,7 +57,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("versevo.log")
+        logging.FileHandler("versevo_nodb.log")
     ]
 )
 logger = logging.getLogger(__name__)
@@ -88,17 +78,13 @@ class Config:
     HF_SUMMARIZATION_MODEL = "Falconsai/text_summarization"
     HF_SENTIMENT_MODEL = "blanchefort/rubert-base-cased-sentiment"
     
-    # JWT
-    JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))
-    JWT_ALGORITHM = "HS256"
-    JWT_EXPIRE_DAYS = 30
-    
     # Лимиты
     MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
     MAX_CONTENT_LENGTH = 1000000  # 1M символов
     CHUNK_SIZE = 5000  # Для обработки больших документов
     
-    # Кэш
+    # Кэш (в памяти вместо БД)
+    IN_MEMORY_CACHE = {}
     CACHE_TTL = 3600  # 1 час
 
 config = Config()
@@ -107,6 +93,77 @@ config = Config()
 os.makedirs(config.UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(config.CACHE_FOLDER, exist_ok=True)
 os.makedirs(config.MODELS_FOLDER, exist_ok=True)
+
+# ========== В ПАМЯТИ ХРАНЕНИЕ (ЗАМЕНА БД) ==========
+class InMemoryStorage:
+    """Хранение данных в памяти вместо базы данных"""
+    
+    def __init__(self):
+        self.documents = {}  # ID -> документ
+        self.translations = {}  # hash -> перевод
+        self.analyses = {}  # document_id -> анализ
+        self.quotes = {}  # quote_id -> цитата
+        self.next_id = 1
+        
+    def add_document(self, document_data: dict) -> int:
+        doc_id = self.next_id
+        document_data['id'] = doc_id
+        document_data['created_at'] = datetime.now().isoformat()
+        self.documents[doc_id] = document_data
+        self.next_id += 1
+        return doc_id
+    
+    def get_document(self, doc_id: int) -> Optional[dict]:
+        return self.documents.get(doc_id)
+    
+    def get_all_documents(self) -> List[dict]:
+        return list(self.documents.values())
+    
+    def delete_document(self, doc_id: int) -> bool:
+        if doc_id in self.documents:
+            del self.documents[doc_id]
+            return True
+        return False
+    
+    def add_translation(self, hash_key: str, translation_data: dict):
+        self.translations[hash_key] = {
+            **translation_data,
+            'created_at': datetime.now().isoformat()
+        }
+    
+    def get_translation(self, hash_key: str) -> Optional[dict]:
+        return self.translations.get(hash_key)
+    
+    def add_analysis(self, document_id: int, analysis_data: dict):
+        if document_id not in self.analyses:
+            self.analyses[document_id] = []
+        self.analyses[document_id].append({
+            **analysis_data,
+            'created_at': datetime.now().isoformat()
+        })
+    
+    def get_analyses(self, document_id: int) -> List[dict]:
+        return self.analyses.get(document_id, [])
+    
+    def add_quote(self, quote_data: dict) -> int:
+        quote_id = self.next_id
+        quote_data['id'] = quote_id
+        quote_data['created_at'] = datetime.now().isoformat()
+        self.quotes[quote_id] = quote_data
+        self.next_id += 1
+        return quote_id
+    
+    def get_all_quotes(self) -> List[dict]:
+        return list(self.quotes.values())
+    
+    def delete_quote(self, quote_id: int) -> bool:
+        if quote_id in self.quotes:
+            del self.quotes[quote_id]
+            return True
+        return False
+
+# Создаем экземпляр хранилища в памяти
+storage = InMemoryStorage()
 
 # ========== МОДЕЛИ PYDANTIC ==========
 class TranslateRequest(BaseModel):
@@ -145,35 +202,6 @@ class DocumentUploadRequest(BaseModel):
     file_data: str  # base64
     file_size: int
 
-class UserCreate(BaseModel):
-    email: str = Field(..., pattern=r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
-    username: str = Field(..., min_length=3, max_length=50)
-    password: str = Field(..., min_length=6)
-
-class UserLogin(BaseModel):
-    email: str
-    password: str
-
-# ========== ХЕШИРОВАНИЕ ПАРОЛЕЙ ==========
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(days=config.JWT_EXPIRE_DAYS)
-    
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
-    return encoded_jwt
-
 # ========== ИНИЦИАЛИЗАЦИЯ МОДЕЛЕЙ AI ==========
 class AIModels:
     """Класс для управления AI моделями"""
@@ -184,7 +212,6 @@ class AIModels:
         self.sentiment_analyzer = None
         self.gemini = None
         self.initialized = False
-        self.init_thread = None
         
     def initialize(self):
         """Инициализация всех AI моделей"""
@@ -237,61 +264,32 @@ class AIModels:
             
             logger.info(f"🔄 Загрузка Hugging Face моделей на {device_name}...")
             
-            # Переводчик (с загрузкой в фоне, чтобы не блокировать старт)
-            def load_translator():
-                try:
-                    translator = pipeline(
-                        "translation",
-                        model=config.HF_TRANSLATION_MODEL,
-                        device=device,
-                        max_length=512
-                    )
-                    logger.info(f"✅ Переводчик загружен: {config.HF_TRANSLATION_MODEL}")
-                    return translator
-                except Exception as e:
-                    logger.error(f"❌ Ошибка загрузки переводчика: {e}")
-                    return None
+            # Переводчик
+            self.translator = pipeline(
+                "translation",
+                model=config.HF_TRANSLATION_MODEL,
+                device=device,
+                max_length=512
+            )
+            logger.info(f"✅ Переводчик загружен: {config.HF_TRANSLATION_MODEL}")
             
             # Суммаризатор
-            def load_summarizer():
-                try:
-                    summarizer = pipeline(
-                        "summarization",
-                        model=config.HF_SUMMARIZATION_MODEL,
-                        device=device,
-                        max_length=150,
-                        min_length=50
-                    )
-                    logger.info(f"✅ Суммаризатор загружен: {config.HF_SUMMARIZATION_MODEL}")
-                    return summarizer
-                except Exception as e:
-                    logger.error(f"❌ Ошибка загрузки суммаризатора: {e}")
-                    return None
+            self.summarizer = pipeline(
+                "summarization",
+                model=config.HF_SUMMARIZATION_MODEL,
+                device=device,
+                max_length=150,
+                min_length=50
+            )
+            logger.info(f"✅ Суммаризатор загружен: {config.HF_SUMMARIZATION_MODEL}")
             
             # Анализатор тональности
-            def load_sentiment_analyzer():
-                try:
-                    sentiment_analyzer = pipeline(
-                        "sentiment-analysis",
-                        model=config.HF_SENTIMENT_MODEL,
-                        device=device
-                    )
-                    logger.info(f"✅ Анализатор тональности загружен: {config.HF_SENTIMENT_MODEL}")
-                    return sentiment_analyzer
-                except Exception as e:
-                    logger.error(f"❌ Ошибка загрузки анализатора тональности: {e}")
-                    return None
-            
-            # Загружаем модели асинхронно
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                future_translator = executor.submit(load_translator)
-                future_summarizer = executor.submit(load_summarizer)
-                future_sentiment = executor.submit(load_sentiment_analyzer)
-                
-                self.translator = future_translator.result()
-                self.summarizer = future_summarizer.result()
-                self.sentiment_analyzer = future_sentiment.result()
+            self.sentiment_analyzer = pipeline(
+                "sentiment-analysis",
+                model=config.HF_SENTIMENT_MODEL,
+                device=device
+            )
+            logger.info(f"✅ Анализатор тональности загружен: {config.HF_SENTIMENT_MODEL}")
             
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки Hugging Face моделей: {e}")
@@ -339,13 +337,11 @@ class AIModels:
             raise Exception("Hugging Face переводчик не доступен")
         
         try:
-            # Адаптация модели под разные языки
             if source_lang == "en" and target_lang == "ru":
                 result = self.translator(text, max_length=512, truncation=True)
                 if result and len(result) > 0:
                     return result[0]['translation_text']
             
-            # Fallback для других языковых пар
             return text
             
         except Exception as e:
@@ -455,17 +451,12 @@ class AIModels:
                 if not line:
                     continue
                 
-                # Поиск краткого содержания
                 if "краткое содержание" in line.lower() or "summary" in line.lower():
                     result["summary"] = line
-                
-                # Поиск тем
                 elif "темы" in line.lower() or "themes" in line.lower():
                     if ":" in line:
                         themes_text = line.split(":", 1)[1].strip()
                         result["themes"] = [t.strip() for t in themes_text.split(",") if t.strip()]
-                
-                # Поиск тональности
                 elif "тональность" in line.lower() or "sentiment" in line.lower():
                     if ":" in line:
                         sentiment_text = line.split(":", 1)[1].strip().lower()
@@ -475,19 +466,14 @@ class AIModels:
                             result["sentiment"] = "Отрицательный"
                         else:
                             result["sentiment"] = "Нейтральный"
-                
-                # Поиск ключевых моментов
                 elif "ключевые" in line.lower() or "key points" in line.lower():
                     if ":" in line:
                         points_text = line.split(":", 1)[1].strip()
                         result["key_points"] = [p.strip() for p in points_text.split(".") if p.strip()]
-                
-                # Поиск стиля письма
                 elif "стиль" in line.lower() or "style" in line.lower():
                     if ":" in line:
                         result["writing_style"] = line.split(":", 1)[1].strip()
             
-            # Если не нашли структурированные данные, используем весь текст как summary
             if not result["summary"] and len(response_text) > 50:
                 result["summary"] = response_text[:500]
             
@@ -511,7 +497,6 @@ def init_nltk():
         
         nltk.data.path.append(nltk_data_path)
         
-        # Скачиваем необходимые данные
         required_data = ['punkt', 'stopwords', 'punkt_tab']
         
         for data in required_data:
@@ -532,15 +517,11 @@ def init_nltk():
 def save_base64_file(file_data: str, filename: str) -> str:
     """Сохранение base64 файла"""
     try:
-        # Декодируем base64
         file_bytes = base64.b64decode(file_data)
-        
-        # Генерируем уникальное имя файла
         file_ext = os.path.splitext(filename)[1] or '.txt'
         unique_filename = f"{uuid.uuid4()}{file_ext}"
         file_path = os.path.join(config.UPLOAD_FOLDER, unique_filename)
         
-        # Сохраняем файл
         with open(file_path, 'wb') as f:
             f.write(file_bytes)
         
@@ -558,18 +539,14 @@ def extract_text_from_file(file_path: str) -> tuple[str, str]:
         if file_ext == '.pdf':
             text = extract_text_from_pdf(file_path)
             file_type = 'pdf'
-            
         elif file_ext in ['.docx', '.doc']:
             text = extract_text_from_docx(file_path)
             file_type = 'docx' if file_ext == '.docx' else 'doc'
-            
         elif file_ext == '.txt':
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 text = f.read()
             file_type = 'txt'
-            
         else:
-            # Пробуем прочитать как текстовый файл
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     text = f.read()
@@ -609,7 +586,6 @@ def extract_text_from_docx(docx_path: str) -> str:
 def detect_language(text: str) -> str:
     """Определение языка текста"""
     try:
-        # Простая эвристика на основе символов
         cyrillic_count = sum(1 for c in text if 'а' <= c <= 'я' or 'А' <= c <= 'Я')
         latin_count = sum(1 for c in text if 'a' <= c <= 'z' or 'A' <= c <= 'Z')
         
@@ -618,7 +594,7 @@ def detect_language(text: str) -> str:
         elif latin_count > cyrillic_count * 1.5:
             return "en"
         else:
-            return "en"  # По умолчанию английский
+            return "en"
     except:
         return "en"
 
@@ -629,7 +605,6 @@ def split_into_chapters(text: str) -> List[Dict[str, str]]:
     if not text:
         return [{"title": "Документ", "content": "Нет содержимого"}]
     
-    # Паттерны для определения заголовков глав
     patterns = [
         r'^\s*(?:Глава|ГЛАВА|Г\.)\s+[IVXLCDM\d]+[\.\s].*$',
         r'^\s*(?:Chapter|CHAPTER|Ch\.)\s+[IVXLCDM\d]+[\.\s].*$',
@@ -644,7 +619,6 @@ def split_into_chapters(text: str) -> List[Dict[str, str]]:
     for line in lines:
         line = line.strip()
         
-        # Проверяем, является ли строка заголовком главы
         is_chapter_title = False
         for pattern in patterns:
             if re.match(pattern, line, re.IGNORECASE):
@@ -652,21 +626,17 @@ def split_into_chapters(text: str) -> List[Dict[str, str]]:
                 break
         
         if is_chapter_title and current_chapter["content"]:
-            # Сохраняем предыдущую главу
             chapters.append(current_chapter.copy())
             current_chapter = {"title": line[:100], "content": ""}
         else:
-            # Добавляем строку к текущей главе
             if current_chapter["content"]:
                 current_chapter["content"] += "\n" + line
             else:
                 current_chapter["content"] = line
     
-    # Добавляем последнюю главу
     if current_chapter["content"]:
         chapters.append(current_chapter)
     
-    # Если не нашли глав, разбиваем на равные части
     if not chapters:
         chunk_size = 5000
         for i in range(0, len(text), chunk_size):
@@ -692,9 +662,8 @@ def calculate_statistics(text: str) -> Dict[str, Any]:
         avg_sentence_length = word_count / sentence_count if sentence_count > 0 else 0
         avg_word_length = sum(len(w) for w in words) / word_count if word_count > 0 else 0
         
-        reading_time = max(1, word_count // 200)  # 200 слов в минуту
+        reading_time = max(1, word_count // 200)
         
-        # Определяем сложность
         if avg_sentence_length < 10:
             complexity = "Простой"
         elif avg_sentence_length < 20:
@@ -720,14 +689,20 @@ def calculate_statistics(text: str) -> Dict[str, Any]:
             "reading_time_minutes": 1
         }
 
+def generate_hash(text: str) -> str:
+    """Генерация хэша для текста"""
+    import hashlib
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
 # ========== HEALTHCHECK ==========
 @app.get("/")
 async def root():
     return {
-        "message": "Versevo Backend API v8.0",
-        "version": "8.0.0",
+        "message": "Versevo Backend API v9.0 (No Database)",
+        "version": "9.0.0",
         "status": "running",
         "timestamp": datetime.now().isoformat(),
+        "note": "База данных перенесена во Flutter приложение",
         "endpoints": [
             "/docs - документация API",
             "/health - проверка здоровья",
@@ -740,31 +715,15 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Полная проверка здоровья системы"""
-    
+    """Проверка здоровья системы"""
     health_status = {
         "status": "healthy",
-        "service": "versevo-backend",
-        "version": "8.0.0",
+        "service": "versevo-backend-nodb",
+        "version": "9.0.0",
         "timestamp": datetime.now().isoformat(),
+        "note": "Работает без базы данных, данные в памяти",
         "components": {}
     }
-    
-    # Проверка базы данных
-    try:
-        db = SessionLocal()
-        db.execute(text("SELECT 1"))
-        db.close()
-        health_status["components"]["database"] = {
-            "status": "healthy",
-            "type": "PostgreSQL"
-        }
-    except Exception as e:
-        health_status["components"]["database"] = {
-            "status": "unhealthy",
-            "error": str(e)
-        }
-        health_status["status"] = "degraded"
     
     # Проверка AI моделей
     health_status["components"]["ai_models"] = {
@@ -791,336 +750,65 @@ async def health_check():
     except:
         health_status["components"]["file_system"] = {"status": "error"}
     
-    # Проверка памяти
-    try:
-        import psutil
-        memory = psutil.virtual_memory()
-        health_status["components"]["memory"] = {
-            "total_gb": round(memory.total / (1024**3), 2),
-            "available_gb": round(memory.available / (1024**3), 2),
-            "percent_used": memory.percent
-        }
-    except:
-        pass
+    # Данные в памяти
+    health_status["components"]["in_memory_storage"] = {
+        "documents_count": len(storage.documents),
+        "translations_count": len(storage.translations),
+        "analyses_count": sum(len(v) for v in storage.analyses.values()),
+        "quotes_count": len(storage.quotes)
+    }
     
     return health_status
 
-@app.get("/api/flutter/health")
-async def flutter_health_check():
-    """Упрощенная проверка для Flutter"""
-    try:
-        db = SessionLocal()
-        db.execute(text("SELECT 1"))
-        db.close()
-        
-        return {
-            "status": "healthy",
-            "database": "available",
-            "ai_models": ai_models.initialized,
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
-
-# ========== ДОБАВЛЕННЫЕ ФУНКЦИИ ДЛЯ РЕШЕНИЯ ПРОБЛЕМЫ ==========
-def check_and_fix_database_structure():
-    """Проверка и исправление структуры базы данных"""
-    try:
-        db = SessionLocal()
-        
-        # Проверяем структуру таблицы users
-        result = db.execute(text("""
-            SELECT column_name, data_type 
-            FROM information_schema.columns 
-            WHERE table_name = 'users'
-        """))
-        
-        columns = result.fetchall()
-        column_names = [col[0] for col in columns]
-        logger.info(f"📊 Существующие колонки в users: {column_names}")
-        
-        # Проверяем наличие необходимых колонок
-        if 'hashed_password' not in column_names:
-            logger.error("❌ Критическая ошибка: Колонка hashed_password отсутствует в таблице users!")
-            logger.info("🔄 Пытаемся добавить колонку...")
-            
-            try:
-                # Добавляем колонку если её нет
-                db.execute(text("""
-                    ALTER TABLE users 
-                    ADD COLUMN IF NOT EXISTS hashed_password VARCHAR(255)
-                """))
-                db.commit()
-                logger.info("✅ Колонка hashed_password добавлена в таблицу users")
-            except Exception as e:
-                logger.error(f"❌ Не удалось добавить колонку: {e}")
-                
-                # Пробуем пересоздать таблицу
-                logger.info("🔄 Пытаемся пересоздать таблицу users...")
-                try:
-                    # Создаем временную таблицу для сохранения данных
-                    db.execute(text("""
-                        CREATE TABLE IF NOT EXISTS users_new (
-                            id SERIAL PRIMARY KEY,
-                            email VARCHAR(255) UNIQUE NOT NULL,
-                            username VARCHAR(100) NOT NULL,
-                            hashed_password VARCHAR(255) NOT NULL,
-                            created_at TIMESTAMP,
-                            last_login TIMESTAMP
-                        )
-                    """))
-                    
-                    # Копируем данные из старой таблицы если они есть
-                    db.execute(text("""
-                        INSERT INTO users_new (id, email, username, created_at, last_login)
-                        SELECT id, email, username, created_at, last_login 
-                        FROM users
-                    """))
-                    
-                    # Удаляем старую таблицу
-                    db.execute(text("DROP TABLE IF EXISTS users CASCADE"))
-                    
-                    # Переименовываем новую таблицу
-                    db.execute(text("ALTER TABLE users_new RENAME TO users"))
-                    
-                    db.commit()
-                    logger.info("✅ Таблица users успешно пересоздана")
-                except Exception as recreate_error:
-                    logger.error(f"❌ Не удалось пересоздать таблицу: {recreate_error}")
-        
-        # Проверяем остальные таблицы
-        required_tables = ['documents', 'document_notes', 'reading_progress', 
-                          'document_analysis', 'favorite_quotes', 'translation_cache']
-        
-        for table_name in required_tables:
-            result = db.execute(text(f"""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = '{table_name}'
-                )
-            """))
-            exists = result.scalar()
-            
-            if exists:
-                logger.info(f"✅ Таблица {table_name} существует")
-            else:
-                logger.warning(f"⚠️ Таблица {table_name} не существует")
-        
-        db.close()
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка проверки структуры БД: {e}")
-        return False
-
-def recreate_users_table_completely():
-    """Полное пересоздание таблицы users"""
-    try:
-        db = SessionLocal()
-        
-        logger.info("🔄 Начинаем полное пересоздание таблицы users...")
-        
-        # Удаляем таблицу если существует
-        db.execute(text("DROP TABLE IF EXISTS users CASCADE"))
-        db.commit()
-        
-        # Создаем таблицу заново через SQLAlchemy
-        Base.metadata.tables['users'].create(bind=engine)
-        
-        logger.info("✅ Таблица users полностью пересоздана")
-        
-        # Проверяем структуру
-        result = db.execute(text("""
-            SELECT column_name, data_type 
-            FROM information_schema.columns 
-            WHERE table_name = 'users'
-        """))
-        
-        columns = result.fetchall()
-        logger.info("📊 Новая структура таблицы users:")
-        for col in columns:
-            logger.info(f"   - {col[0]}: {col[1]}")
-        
-        db.close()
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка пересоздания таблицы users: {e}")
-        return False
-
-# ========== АУТЕНТИФИКАЦИЯ ==========
-@app.post("/api/auth/register")
-async def register_user(request: UserCreate, db: Session = Depends(get_db)):
-    """Регистрация нового пользователя"""
-    try:
-        logger.info(f"📝 Регистрация пользователя: {request.email} ({request.username})")
-        
-        # Проверяем, существует ли пользователь
-        existing_user = db.query(User).filter(User.email == request.email).first()
-        if existing_user:
-            raise HTTPException(status_code=400, detail="Пользователь с таким email уже существует")
-        
-        # Проверяем username
-        existing_username = db.query(User).filter(User.username == request.username).first()
-        if existing_username:
-            raise HTTPException(status_code=400, detail="Пользователь с таким именем уже существует")
-        
-        # Хешируем пароль
-        hashed_password = hash_password(request.password)
-        
-        # Создаем пользователя
-        user = User(
-            email=request.email,
-            username=request.username,
-            hashed_password=hashed_password,
-            created_at=datetime.now(),
-            last_login=datetime.now()
-        )
-        
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        
-        # Создаем токен
-        access_token = create_access_token(data={"user_id": user.id, "email": user.email})
-        
-        logger.info(f"✅ Новый пользователь зарегистрирован: {user.email}")
-        
-        return {
-            "id": user.id,
-            "email": user.email,
-            "username": user.username,
-            "token": access_token,
-            "created_at": user.created_at.isoformat(),
-            "last_login": user.last_login.isoformat(),
-            "message": "Регистрация успешна"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Ошибка регистрации: {e}")
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Ошибка регистрации: {str(e)}")
-
-@app.post("/api/auth/login")
-async def login_user(request: UserLogin, db: Session = Depends(get_db)):
-    """Вход пользователя"""
-    try:
-        logger.info(f"🔐 Попытка входа: {request.email}")
-        
-        # Ищем пользователя
-        user = db.query(User).filter(User.email == request.email).first()
-        
-        if not user:
-            raise HTTPException(status_code=401, detail="Неверный email или пароль")
-        
-        # Проверяем пароль
-        if not verify_password(request.password, user.hashed_password):
-            raise HTTPException(status_code=401, detail="Неверный email или пароль")
-        
-        # Обновляем время последнего входа
-        user.last_login = datetime.now()
-        db.commit()
-        
-        # Создаем токен
-        access_token = create_access_token(data={"user_id": user.id, "email": user.email})
-        
-        logger.info(f"✅ Пользователь вошел: {user.email}")
-        
-        return {
-            "id": user.id,
-            "email": user.email,
-            "username": user.username,
-            "token": access_token,
-            "created_at": user.created_at.isoformat(),
-            "last_login": user.last_login.isoformat(),
-            "message": "Вход успешен"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Ошибка входа: {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка входа: {str(e)}")
-
 # ========== ДОКУМЕНТЫ ==========
 @app.post("/api/documents/upload-base64")
-async def upload_document_base64(request: DocumentUploadRequest, db: Session = Depends(get_db)):
-    """Загрузка документа в формате base64 (без аутентификации для теста)"""
+async def upload_document_base64(request: DocumentUploadRequest):
+    """Загрузка документа в формате base64"""
     try:
-        # Проверка размера файла
         if request.file_size > config.MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail=f"Файл слишком большой. Максимум: {config.MAX_FILE_SIZE // 1024 // 1024}MB")
         
         logger.info(f"📤 Загрузка файла: {request.filename}")
         
-        # Сохраняем файл
         file_path = save_base64_file(request.file_data, request.filename)
-        
-        # Извлекаем текст
         content, file_type = extract_text_from_file(file_path)
         
         if not content.strip():
             raise HTTPException(status_code=400, detail="Не удалось извлечь текст из файла")
         
-        # Определяем язык
         language = detect_language(content)
-        
-        # Разбиваем на главы
         chapters = split_into_chapters(content)
-        
-        # Рассчитываем статистику
         stats = calculate_statistics(content)
         
-        # Сохраняем в базу данных
-        document = Document(
-            filename=request.filename,
-            content=content[:config.MAX_CONTENT_LENGTH],  # Ограничиваем размер
-            language=language,
-            file_type=file_type,
-            file_path=file_path,
-            file_size=request.file_size,
-            word_count=stats["word_count"],
-            char_count=stats["char_count"],
-            chapter_count=len(chapters),
-            reading_time_minutes=stats["reading_time_minutes"],
-            created_at=datetime.now(),
-            updated_at=datetime.now()
-        )
+        # Сохраняем в памяти вместо БД
+        document_data = {
+            "filename": request.filename,
+            "content": content[:config.MAX_CONTENT_LENGTH],
+            "language": language,
+            "file_type": file_type,
+            "file_path": file_path,
+            "file_size": request.file_size,
+            "word_count": stats["word_count"],
+            "char_count": stats["char_count"],
+            "chapter_count": len(chapters),
+            "reading_time_minutes": stats["reading_time_minutes"]
+        }
         
-        db.add(document)
-        db.commit()
-        db.refresh(document)
+        doc_id = storage.add_document(document_data)
         
-        # Сохраняем анализ
-        analysis = DocumentAnalysis(
-            document_id=document.id,
-            analysis_type="basic",
-            summary=content[:500] + "..." if len(content) > 500 else content,
-            created_at=datetime.now()
-        )
-        
-        db.add(analysis)
-        db.commit()
-        
-        logger.info(f"✅ Документ загружен: ID {document.id}, {stats['word_count']} слов")
+        logger.info(f"✅ Документ загружен: ID {doc_id}, {stats['word_count']} слов")
         
         return {
-            "id": document.id,
-            "filename": document.filename,
-            "language": document.language,
-            "file_type": document.file_type,
-            "word_count": document.word_count,
-            "char_count": document.char_count,
-            "chapter_count": document.chapter_count,
-            "reading_time_minutes": document.reading_time_minutes,
-            "created_at": document.created_at.isoformat(),
-            "content_preview": document.content[:300] + "..." if len(document.content) > 300 else document.content,
+            "id": doc_id,
+            "filename": request.filename,
+            "language": language,
+            "file_type": file_type,
+            "word_count": stats["word_count"],
+            "char_count": stats["char_count"],
+            "chapter_count": len(chapters),
+            "reading_time_minutes": stats["reading_time_minutes"],
+            "created_at": datetime.now().isoformat(),
+            "content_preview": content[:300] + "..." if len(content) > 300 else content,
             "chapters": chapters
         }
         
@@ -1131,53 +819,43 @@ async def upload_document_base64(request: DocumentUploadRequest, db: Session = D
         raise HTTPException(status_code=500, detail=f"Ошибка загрузки: {str(e)}")
 
 @app.get("/api/documents")
-async def get_documents(skip: int = 0, limit: int = 50, db: Session = Depends(get_db)):
+async def get_documents(skip: int = 0, limit: int = 50):
     """Получение списка документов"""
     try:
-        documents = db.query(Document).order_by(Document.created_at.desc()).offset(skip).limit(limit).all()
+        documents = storage.get_all_documents()
+        if skip > 0:
+            documents = documents[skip:]
+        if limit > 0:
+            documents = documents[:limit]
         
-        return [
-            {
-                "id": doc.id,
-                "filename": doc.filename,
-                "language": doc.language,
-                "file_type": doc.file_type,
-                "word_count": doc.word_count,
-                "char_count": doc.char_count,
-                "chapter_count": doc.chapter_count,
-                "reading_time_minutes": doc.reading_time_minutes,
-                "created_at": doc.created_at.isoformat(),
-                "content_preview": doc.content[:200] + "..." if doc.content and len(doc.content) > 200 else doc.content or ""
-            }
-            for doc in documents
-        ]
+        return documents
         
     except Exception as e:
         logger.error(f"❌ Ошибка получения документов: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка получения документов: {str(e)}")
 
 @app.get("/api/documents/{document_id}")
-async def get_document(document_id: int, db: Session = Depends(get_db)):
+async def get_document(document_id: int):
     """Получение документа по ID"""
     try:
-        document = db.query(Document).filter(Document.id == document_id).first()
+        document = storage.get_document(document_id)
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
         
-        chapters = split_into_chapters(document.content or "")
+        chapters = split_into_chapters(document.get("content", ""))
         
         return {
-            "id": document.id,
-            "filename": document.filename,
-            "content": document.content,
-            "language": document.language,
-            "file_type": document.file_type,
-            "word_count": document.word_count,
-            "char_count": document.char_count,
-            "chapter_count": document.chapter_count,
-            "reading_time_minutes": document.reading_time_minutes,
-            "created_at": document.created_at.isoformat(),
+            "id": document_id,
+            "filename": document.get("filename", ""),
+            "content": document.get("content", ""),
+            "language": document.get("language", "en"),
+            "file_type": document.get("file_type", "txt"),
+            "word_count": document.get("word_count", 0),
+            "char_count": document.get("char_count", 0),
+            "chapter_count": document.get("chapter_count", 1),
+            "reading_time_minutes": document.get("reading_time_minutes", 1),
+            "created_at": document.get("created_at", datetime.now().isoformat()),
             "chapters": chapters
         }
         
@@ -1188,30 +866,24 @@ async def get_document(document_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Ошибка получения документа: {str(e)}")
 
 @app.delete("/api/documents/{document_id}")
-async def delete_document(document_id: int, db: Session = Depends(get_db)):
+async def delete_document(document_id: int):
     """Удаление документа"""
     try:
-        document = db.query(Document).filter(Document.id == document_id).first()
+        document = storage.get_document(document_id)
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
         
         # Удаляем файл с диска
-        if document.file_path and os.path.exists(document.file_path):
+        file_path = document.get("file_path")
+        if file_path and os.path.exists(file_path):
             try:
-                os.remove(document.file_path)
+                os.remove(file_path)
             except:
                 pass
         
-        # Удаляем связанные записи
-        db.query(DocumentAnalysis).filter(DocumentAnalysis.document_id == document_id).delete()
-        db.query(DocumentNote).filter(DocumentNote.document_id == document_id).delete()
-        db.query(ReadingProgress).filter(ReadingProgress.document_id == document_id).delete()
-        db.query(FavoriteQuote).filter(FavoriteQuote.document_id == document_id).delete()
-        
-        # Удаляем документ
-        db.delete(document)
-        db.commit()
+        # Удаляем из памяти
+        storage.delete_document(document_id)
         
         logger.info(f"🗑️ Документ удален: ID {document_id}")
         
@@ -1225,7 +897,6 @@ async def delete_document(document_id: int, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         logger.error(f"❌ Ошибка удаления документа: {e}")
-        db.rollback()
         raise HTTPException(status_code=500, detail=f"Ошибка удаления: {str(e)}")
 
 # ========== ПЕРЕВОД ==========
@@ -1241,10 +912,30 @@ async def translate_text(request: TranslateRequest):
         
         logger.info(f"🌐 Перевод текста: {source_lang} → {target_lang}, {len(request.text)} символов")
         
-        # Пробуем использовать Hugging Face
+        # Генерируем хэш для кэширования
+        text_hash = generate_hash(f"{request.text}:{source_lang}:{target_lang}:{request.style}")
+        
+        # Проверяем кэш
+        cached = storage.get_translation(text_hash)
+        if cached:
+            logger.info("✅ Использован кэшированный перевод")
+            return {
+                "original_text": request.text,
+                "translated_text": cached.get("translated_text", ""),
+                "source_language": source_lang,
+                "target_language": target_lang,
+                "style": request.style,
+                "translation_service": cached.get("translation_service", "cached"),
+                "original_length": len(request.text),
+                "translated_length": len(cached.get("translated_text", "")),
+                "translation_timestamp": cached.get("created_at", datetime.now().isoformat()),
+                "cached": True
+            }
+        
         translated_text = None
         translation_service = "unknown"
         
+        # Пробуем Hugging Face
         try:
             if ai_models.is_huggingface_available():
                 translated_text = ai_models.translate_with_huggingface(
@@ -1255,7 +946,7 @@ async def translate_text(request: TranslateRequest):
         except Exception as hf_error:
             logger.warning(f"⚠️ Hugging Face перевод не удался: {hf_error}")
         
-        # Если Hugging Face не сработал, пробуем Gemini
+        # Пробуем Gemini
         if not translated_text and ai_models.is_gemini_available():
             try:
                 translated_text = await ai_models.translate_with_gemini(
@@ -1266,12 +957,11 @@ async def translate_text(request: TranslateRequest):
             except Exception as gemini_error:
                 logger.warning(f"⚠️ Gemini AI перевод не удался: {gemini_error}")
         
-        # Fallback: простой подстановочный перевод
+        # Fallback
         if not translated_text:
             translation_service = "fallback"
             
             if source_lang == "en" and target_lang == "ru":
-                # Простой англо-русский словарь
                 translations = {
                     "hello": "привет", "world": "мир", "book": "книга",
                     "read": "читать", "document": "документ", "text": "текст",
@@ -1294,6 +984,16 @@ async def translate_text(request: TranslateRequest):
         elif request.style == "academic":
             translated_text = f"📚 {translated_text}"
         
+        # Сохраняем в кэш
+        storage.add_translation(text_hash, {
+            "original_text": request.text,
+            "translated_text": translated_text,
+            "source_language": source_lang,
+            "target_language": target_lang,
+            "style": request.style,
+            "translation_service": translation_service
+        })
+        
         return {
             "original_text": request.text,
             "translated_text": translated_text,
@@ -1303,7 +1003,8 @@ async def translate_text(request: TranslateRequest):
             "translation_service": translation_service,
             "original_length": len(request.text),
             "translated_length": len(translated_text),
-            "translation_timestamp": datetime.now().isoformat()
+            "translation_timestamp": datetime.now().isoformat(),
+            "cached": False
         }
         
     except HTTPException:
@@ -1315,26 +1016,25 @@ async def translate_text(request: TranslateRequest):
 @app.post("/api/translate/document/{document_id}")
 async def translate_document(
     document_id: int,
-    request: DocumentTranslateRequest,
-    db: Session = Depends(get_db)
+    request: DocumentTranslateRequest
 ):
     """Перевод всего документа"""
     try:
-        document = db.query(Document).filter(Document.id == document_id).first()
+        document = storage.get_document(document_id)
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
         
-        if not document.content:
+        content = document.get("content", "")
+        if not content:
             raise HTTPException(status_code=400, detail="Документ не содержит текста")
         
-        source_lang = request.source_language or document.language
+        source_lang = request.source_language or document.get("language", "en")
         target_lang = request.target_language
         
         logger.info(f"🌐 Перевод документа {document_id}: {source_lang} → {target_lang}")
         
-        # Разбиваем на части для перевода
-        content = document.content
+        # Разбиваем на части
         chunks = []
         chunk_size = 2000
         
@@ -1351,21 +1051,16 @@ async def translate_document(
             logger.info(f"🔄 Перевод части {i+1}/{len(chunks)} ({len(chunk)} символов)")
             
             try:
-                # Пробуем Hugging Face
                 if ai_models.is_huggingface_available():
                     translated_chunk = ai_models.translate_with_huggingface(
                         chunk, target_lang, source_lang
                     )
                     translation_service = "huggingface"
-                
-                # Пробуем Gemini AI
                 elif ai_models.is_gemini_available():
                     translated_chunk = await ai_models.translate_with_gemini(
                         chunk, target_lang, source_lang
                     )
                     translation_service = "gemini"
-                
-                # Fallback
                 else:
                     if source_lang == "en" and target_lang == "ru":
                         translated_chunk = f"[Часть {i+1}] {chunk[:500]}..."
@@ -1390,41 +1085,37 @@ async def translate_document(
         elif request.style == "academic":
             translated_content = f"📚 АКАДЕМИЧЕСКИЙ ПЕРЕВОД\n\n{translated_content}"
         
-        # Сохраняем переведенный документ
-        translated_doc = Document(
-            filename=f"translated_{target_lang}_{document.filename}",
-            content=translated_content,
-            language=target_lang,
-            file_type=document.file_type,
-            file_path=f"{document.file_path}.translated",
-            file_size=len(translated_content.encode('utf-8')),
-            word_count=len(translated_content.split()),
-            char_count=len(translated_content),
-            chapter_count=document.chapter_count,
-            reading_time_minutes=document.reading_time_minutes,
-            created_at=datetime.now()
-        )
+        # Создаем новый документ с переводом
+        translated_doc_data = {
+            "filename": f"translated_{target_lang}_{document.get('filename', 'document')}",
+            "content": translated_content,
+            "language": target_lang,
+            "file_type": document.get("file_type", "txt"),
+            "file_path": f"{document.get('file_path', '')}.translated",
+            "file_size": len(translated_content.encode('utf-8')),
+            "word_count": len(translated_content.split()),
+            "char_count": len(translated_content),
+            "chapter_count": document.get("chapter_count", 1),
+            "reading_time_minutes": document.get("reading_time_minutes", 1)
+        }
         
-        db.add(translated_doc)
-        db.commit()
-        db.refresh(translated_doc)
+        translated_doc_id = storage.add_document(translated_doc_data)
         
-        logger.info(f"✅ Документ переведен: новый ID {translated_doc.id}")
+        logger.info(f"✅ Документ переведен: новый ID {translated_doc_id}")
         
         return {
             "document_id": document_id,
-            "translated_document_id": translated_doc.id,
-            "original_filename": document.filename,
-            "translated_filename": translated_doc.filename,
+            "translated_document_id": translated_doc_id,
+            "original_filename": document.get("filename", ""),
+            "translated_filename": translated_doc_data["filename"],
             "source_language": source_lang,
             "target_language": target_lang,
             "style": request.style,
             "translation_service": translation_service,
-            "original_length": len(document.content),
+            "original_length": len(content),
             "translated_length": len(translated_content),
             "chunks_translated": len(chunks),
-            "translation_timestamp": datetime.now().isoformat(),
-            "download_url": f"/api/documents/{translated_doc.id}"
+            "translation_timestamp": datetime.now().isoformat()
         }
         
     except HTTPException:
@@ -1435,42 +1126,37 @@ async def translate_document(
 
 # ========== АНАЛИЗ ==========
 @app.post("/api/analyze")
-async def analyze_document(request: AnalysisRequest, db: Session = Depends(get_db)):
+async def analyze_document(request: AnalysisRequest):
     """Базовый анализ документа"""
     try:
-        document = db.query(Document).filter(Document.id == request.document_id).first()
+        document = storage.get_document(request.document_id)
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
         
-        if not document.content:
+        content = document.get("content", "")
+        if not content:
             raise HTTPException(status_code=400, detail="Документ не содержит текста")
         
-        logger.info(f"🔍 Базовый анализ документа {document.id}")
+        logger.info(f"🔍 Базовый анализ документа {request.document_id}")
         
-        content = document.content
-        
-        # Разбиваем на предложения
         sentences = sent_tokenize(content) if len(content) > 100 else [content]
         
-        # Создаем краткое содержание
         if len(sentences) >= 3:
             summary = " ".join(sentences[:3])
         else:
             summary = content[:500] + "..." if len(content) > 500 else content
         
-        # Определяем темы
         themes = []
         words = word_tokenize(content.lower())
         word_freq = Counter(words)
         
-        stop_words = set(stopwords.words('russian' if document.language == 'ru' else 'english'))
+        stop_words = set(stopwords.words('russian' if document.get("language") == 'ru' else 'english'))
         common_words = [word for word, count in word_freq.most_common(20) 
                        if word not in stop_words and len(word) > 3]
         
         themes = common_words[:5]
         
-        # Анализ тональности
         sentiment = "Нейтральный"
         if ai_models.is_huggingface_available():
             try:
@@ -1479,10 +1165,8 @@ async def analyze_document(request: AnalysisRequest, db: Session = Depends(get_d
             except:
                 pass
         
-        # Статистика
         stats = calculate_statistics(content)
         
-        # Определяем стиль письма
         avg_sentence_len = stats["avg_sentence_length"]
         if avg_sentence_len > 25:
             writing_style = "Академический"
@@ -1491,38 +1175,34 @@ async def analyze_document(request: AnalysisRequest, db: Session = Depends(get_d
         else:
             writing_style = "Информационный"
         
-        # Ключевые моменты
         key_points = [
             f"Объем: {stats['word_count']} слов",
             f"Сложность: {stats['complexity']}",
             f"Время чтения: {stats['reading_time_minutes']} минут",
-            f"Язык: {document.language}"
+            f"Язык: {document.get('language', 'unknown')}"
         ]
         
         if themes:
             key_points.append(f"Основные темы: {', '.join(themes[:3])}")
         
-        # Сохраняем анализ в базу
-        analysis = DocumentAnalysis(
-            document_id=document.id,
-            analysis_type=request.analysis_type,
-            summary=summary,
-            themes=", ".join(themes),
-            sentiment=sentiment,
-            writing_style=writing_style,
-            key_points="\n".join(key_points),
-            ai_analysis=False,
-            created_at=datetime.now()
-        )
+        analysis_data = {
+            "document_id": request.document_id,
+            "analysis_type": request.analysis_type,
+            "summary": summary,
+            "themes": themes,
+            "sentiment": sentiment,
+            "writing_style": writing_style,
+            "key_points": key_points,
+            "statistics": stats,
+            "ai_analysis": False
+        }
         
-        db.add(analysis)
-        db.commit()
-        db.refresh(analysis)
+        storage.add_analysis(request.document_id, analysis_data)
         
         return {
-            "document_id": document.id,
-            "filename": document.filename,
-            "language": document.language,
+            "document_id": request.document_id,
+            "filename": document.get("filename", ""),
+            "language": document.get("language", "en"),
             "summary": summary,
             "themes": themes,
             "sentiment": sentiment,
@@ -1531,8 +1211,7 @@ async def analyze_document(request: AnalysisRequest, db: Session = Depends(get_d
             "statistics": stats,
             "ai_analysis": False,
             "analysis_type": request.analysis_type,
-            "analysis_timestamp": datetime.now().isoformat(),
-            "analysis_id": analysis.id
+            "analysis_timestamp": datetime.now().isoformat()
         }
         
     except HTTPException:
@@ -1542,46 +1221,41 @@ async def analyze_document(request: AnalysisRequest, db: Session = Depends(get_d
         raise HTTPException(status_code=500, detail=f"Ошибка анализа: {str(e)}")
 
 @app.post("/api/analyze/ai/document")
-async def analyze_with_ai(request: AIAnalysisRequest, db: Session = Depends(get_db)):
+async def analyze_with_ai(request: AIAnalysisRequest):
     """AI анализ документа"""
     try:
-        document = db.query(Document).filter(Document.id == request.document_id).first()
+        document = storage.get_document(request.document_id)
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
         
-        if not document.content:
+        content = document.get("content", "")
+        if not content:
             raise HTTPException(status_code=400, detail="Документ не содержит текста")
         
-        logger.info(f"🤖 AI анализ документа {document.id}")
+        logger.info(f"🤖 AI анализ документа {request.document_id}")
         
-        content = document.content[:5000]  # Ограничиваем для анализа
+        content_for_analysis = content[:5000]
         
         ai_provider = None
         ai_analysis = {}
         
-        # Пробуем Gemini AI
         if ai_models.is_gemini_available():
             try:
-                ai_analysis = await ai_models.analyze_with_gemini(content, request.analysis_type)
+                ai_analysis = await ai_models.analyze_with_gemini(content_for_analysis, request.analysis_type)
                 ai_provider = "gemini"
                 logger.info("✅ Анализ выполнен через Gemini AI")
             except Exception as gemini_error:
                 logger.warning(f"⚠️ Gemini AI анализ не удался: {gemini_error}")
         
-        # Если Gemini не сработал, пробуем Hugging Face
         if not ai_analysis and ai_models.is_huggingface_available():
             try:
-                # Суммаризация
-                summary = ai_models.summarize_with_huggingface(content)
+                summary = ai_models.summarize_with_huggingface(content_for_analysis)
+                sentiment_result = ai_models.analyze_sentiment_with_huggingface(content_for_analysis)
                 
-                # Анализ тональности
-                sentiment_result = ai_models.analyze_sentiment_with_huggingface(content)
-                
-                # Темы (простая эвристика)
-                words = word_tokenize(content.lower())
+                words = word_tokenize(content_for_analysis.lower())
                 word_freq = Counter(words)
-                stop_words = set(stopwords.words('russian' if document.language == 'ru' else 'english'))
+                stop_words = set(stopwords.words('russian' if document.get("language") == 'ru' else 'english'))
                 themes = [word for word, count in word_freq.most_common(10) 
                          if word not in stop_words and len(word) > 3][:5]
                 
@@ -1604,10 +1278,9 @@ async def analyze_with_ai(request: AIAnalysisRequest, db: Session = Depends(get_
             except Exception as hf_error:
                 logger.warning(f"⚠️ Hugging Face анализ не удался: {hf_error}")
         
-        # Fallback анализ
         if not ai_analysis:
-            sentences = sent_tokenize(content) if len(content) > 100 else [content]
-            summary = " ".join(sentences[:3]) if len(sentences) >= 3 else content[:500]
+            sentences = sent_tokenize(content_for_analysis) if len(content_for_analysis) > 100 else [content_for_analysis]
+            summary = " ".join(sentences[:3]) if len(sentences) >= 3 else content_for_analysis[:500]
             
             ai_analysis = {
                 "summary": summary,
@@ -1624,31 +1297,27 @@ async def analyze_with_ai(request: AIAnalysisRequest, db: Session = Depends(get_
             
             ai_provider = "fallback"
         
-        # Статистика
-        stats = calculate_statistics(content)
+        stats = calculate_statistics(content_for_analysis)
         
-        # Сохраняем анализ
-        analysis = DocumentAnalysis(
-            document_id=document.id,
-            analysis_type=request.analysis_type,
-            summary=ai_analysis.get("summary", ""),
-            themes=", ".join(ai_analysis.get("themes", [])),
-            sentiment=ai_analysis.get("sentiment", "Нейтральный"),
-            writing_style=ai_analysis.get("writing_style", "Информационный"),
-            key_points="\n".join(ai_analysis.get("key_points", [])),
-            ai_analysis=True,
-            ai_provider=ai_provider,
-            created_at=datetime.now()
-        )
+        analysis_data = {
+            "document_id": request.document_id,
+            "analysis_type": request.analysis_type,
+            "summary": ai_analysis.get("summary", ""),
+            "themes": ai_analysis.get("themes", []),
+            "sentiment": ai_analysis.get("sentiment", "Нейтральный"),
+            "writing_style": ai_analysis.get("writing_style", "Информационный"),
+            "key_points": ai_analysis.get("key_points", []),
+            "statistics": stats,
+            "ai_analysis": True,
+            "ai_provider": ai_provider
+        }
         
-        db.add(analysis)
-        db.commit()
-        db.refresh(analysis)
+        storage.add_analysis(request.document_id, analysis_data)
         
         return {
-            "document_id": document.id,
-            "filename": document.filename,
-            "language": document.language,
+            "document_id": request.document_id,
+            "filename": document.get("filename", ""),
+            "language": document.get("language", "en"),
             "summary": ai_analysis.get("summary", ""),
             "themes": ai_analysis.get("themes", []),
             "sentiment": ai_analysis.get("sentiment", "Нейтральный"),
@@ -1658,8 +1327,7 @@ async def analyze_with_ai(request: AIAnalysisRequest, db: Session = Depends(get_
             "ai_analysis": True,
             "ai_provider": ai_provider,
             "analysis_type": request.analysis_type,
-            "analysis_timestamp": datetime.now().isoformat(),
-            "analysis_id": analysis.id
+            "analysis_timestamp": datetime.now().isoformat()
         }
         
     except HTTPException:
@@ -1687,52 +1355,46 @@ async def ai_health_check():
     }
 
 @app.post("/api/analyze/gemini/document")
-async def analyze_with_gemini(request: AIAnalysisRequest, db: Session = Depends(get_db)):
+async def analyze_with_gemini(request: AIAnalysisRequest):
     """Анализ документа через Gemini AI"""
     try:
         if not ai_models.is_gemini_available():
             raise HTTPException(status_code=503, detail="Gemini AI не доступен. Установите GEMINI_API_KEY.")
         
-        document = db.query(Document).filter(Document.id == request.document_id).first()
+        document = storage.get_document(request.document_id)
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
         
-        if not document.content:
+        content = document.get("content", "")
+        if not content:
             raise HTTPException(status_code=400, detail="Документ не содержит текста")
         
-        logger.info(f"🌟 Gemini AI анализ документа {document.id}")
+        logger.info(f"🌟 Gemini AI анализ документа {request.document_id}")
         
-        content = document.content[:10000]  # Ограничиваем для Gemini
+        content_for_analysis = content[:10000]
+        ai_analysis = await ai_models.analyze_with_gemini(content_for_analysis, request.analysis_type)
+        stats = calculate_statistics(content_for_analysis)
         
-        # Выполняем анализ через Gemini AI
-        ai_analysis = await ai_models.analyze_with_gemini(content, request.analysis_type)
+        analysis_data = {
+            "document_id": request.document_id,
+            "analysis_type": request.analysis_type,
+            "summary": ai_analysis.get("summary", ""),
+            "themes": ai_analysis.get("themes", []),
+            "sentiment": ai_analysis.get("sentiment", "Нейтральный"),
+            "writing_style": ai_analysis.get("writing_style", "Информационный"),
+            "key_points": ai_analysis.get("key_points", []),
+            "statistics": stats,
+            "ai_analysis": True,
+            "ai_provider": "gemini"
+        }
         
-        # Статистика
-        stats = calculate_statistics(content)
-        
-        # Сохраняем анализ
-        analysis = DocumentAnalysis(
-            document_id=document.id,
-            analysis_type=request.analysis_type,
-            summary=ai_analysis.get("summary", ""),
-            themes=", ".join(ai_analysis.get("themes", [])),
-            sentiment=ai_analysis.get("sentiment", "Нейтральный"),
-            writing_style=ai_analysis.get("writing_style", "Информационный"),
-            key_points="\n".join(ai_analysis.get("key_points", [])),
-            ai_analysis=True,
-            ai_provider="gemini",
-            created_at=datetime.now()
-        )
-        
-        db.add(analysis)
-        db.commit()
-        db.refresh(analysis)
+        storage.add_analysis(request.document_id, analysis_data)
         
         return {
-            "document_id": document.id,
-            "filename": document.filename,
-            "language": document.language,
+            "document_id": request.document_id,
+            "filename": document.get("filename", ""),
+            "language": document.get("language", "en"),
             "summary": ai_analysis.get("summary", ""),
             "themes": ai_analysis.get("themes", []),
             "sentiment": ai_analysis.get("sentiment", "Нейтральный"),
@@ -1742,8 +1404,7 @@ async def analyze_with_gemini(request: AIAnalysisRequest, db: Session = Depends(
             "ai_analysis": True,
             "ai_provider": "gemini",
             "analysis_type": request.analysis_type,
-            "analysis_timestamp": datetime.now().isoformat(),
-            "analysis_id": analysis.id
+            "analysis_timestamp": datetime.now().isoformat()
         }
         
     except HTTPException:
@@ -1752,66 +1413,48 @@ async def analyze_with_gemini(request: AIAnalysisRequest, db: Session = Depends(
         logger.error(f"❌ Ошибка Gemini AI анализа: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка Gemini AI анализа: {str(e)}")
 
-@app.get("/api/analyze/gemini/health")
-async def gemini_health_check():
-    """Проверка доступности Gemini AI"""
-    return {
-        "status": "available" if ai_models.is_gemini_available() else "unavailable",
-        "service": "gemini_ai",
-        "available": ai_models.is_gemini_available(),
-        "model": config.GEMINI_MODEL,
-        "api_key_set": bool(config.GEMINI_API_KEY),
-        "timestamp": datetime.now().isoformat()
-    }
-
 # ========== ЦИТАТЫ ==========
 @app.get("/api/documents/{document_id}/quotes")
-async def get_document_quotes(document_id: int, limit: int = 5, db: Session = Depends(get_db)):
+async def get_document_quotes(document_id: int, limit: int = 5):
     """Получение цитат из документа"""
     try:
-        document = db.query(Document).filter(Document.id == document_id).first()
+        document = storage.get_document(document_id)
         
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
         
-        if not document.content:
+        content = document.get("content", "")
+        if not content:
             return {
                 "document_id": document_id,
                 "quotes": ["Документ не содержит текста"],
                 "count": 1
             }
         
-        # Разбиваем на предложения
-        sentences = sent_tokenize(document.content)
-        
-        # Выбираем интересные предложения (не слишком короткие и не слишком длинные)
+        sentences = sent_tokenize(content)
         quotes = []
+        
         for sentence in sentences:
             sentence = sentence.strip()
-            if 20 < len(sentence) < 200:  # Оптимальная длина для цитаты
+            if 20 < len(sentence) < 200:
                 quotes.append(sentence)
-                if len(quotes) >= limit * 3:  # Берем больше для разнообразия
+                if len(quotes) >= limit * 3:
                     break
         
-        # Если не нашли достаточно цитат, создаем искусственные
         if len(quotes) < limit:
-            # Ищем ключевые фразы
-            words = word_tokenize(document.content.lower())
+            words = word_tokenize(content.lower())
             word_freq = Counter(words)
-            stop_words = set(stopwords.words('russian' if document.language == 'ru' else 'english'))
+            stop_words = set(stopwords.words('russian' if document.get("language") == 'ru' else 'english'))
             
-            # Находим часто встречающиеся значимые слова
             significant_words = [word for word, count in word_freq.most_common(50) 
                                if word not in stop_words and len(word) > 3]
             
-            # Создаем цитаты на основе этих слов
             for i in range(limit - len(quotes)):
                 if i < len(significant_words):
                     quotes.append(f"Важное понятие: '{significant_words[i]}'")
                 else:
                     quotes.append("Эта мысль заслуживает внимания.")
         
-        # Ограничиваем количество
         quotes = quotes[:limit]
         
         return {
@@ -1829,39 +1472,34 @@ async def get_document_quotes(document_id: int, limit: int = 5, db: Session = De
 
 # ========== ИЗБРАННЫЕ ЦИТАТЫ ==========
 @app.post("/api/quotes/favorites")
-async def add_favorite_quote(request: FavoriteQuoteCreate, db: Session = Depends(get_db)):
+async def add_favorite_quote(request: FavoriteQuoteCreate):
     """Добавление цитаты в избранное"""
     try:
-        # Проверяем существование документа
-        document = db.query(Document).filter(Document.id == request.document_id).first()
+        document = storage.get_document(request.document_id)
         if not document:
             raise HTTPException(status_code=404, detail="Документ не найден")
         
-        # Создаем избранную цитату
-        favorite_quote = FavoriteQuote(
-            document_id=request.document_id,
-            quote=request.quote,
-            start_position=request.start_position,
-            end_position=request.end_position,
-            note=request.note,
-            document_title=document.filename,
-            document_language=document.language,
-            created_at=datetime.now()
-        )
+        quote_data = {
+            "document_id": request.document_id,
+            "quote": request.quote,
+            "start_position": request.start_position,
+            "end_position": request.end_position,
+            "note": request.note,
+            "document_title": document.get("filename", ""),
+            "document_language": document.get("language", "en")
+        }
         
-        db.add(favorite_quote)
-        db.commit()
-        db.refresh(favorite_quote)
+        quote_id = storage.add_quote(quote_data)
         
-        logger.info(f"❤️ Добавлена избранная цитата: ID {favorite_quote.id}")
+        logger.info(f"❤️ Добавлена избранная цитата: ID {quote_id}")
         
         return {
-            "id": favorite_quote.id,
-            "quote": favorite_quote.quote,
-            "document_id": favorite_quote.document_id,
-            "document_title": favorite_quote.document_title,
-            "created_at": favorite_quote.created_at.isoformat(),
-            "note": favorite_quote.note,
+            "id": quote_id,
+            "quote": request.quote,
+            "document_id": request.document_id,
+            "document_title": document.get("filename", ""),
+            "created_at": datetime.now().isoformat(),
+            "note": request.note,
             "status": "added_to_favorites"
         }
         
@@ -1869,49 +1507,30 @@ async def add_favorite_quote(request: FavoriteQuoteCreate, db: Session = Depends
         raise
     except Exception as e:
         logger.error(f"❌ Ошибка добавления избранной цитаты: {e}")
-        db.rollback()
         raise HTTPException(status_code=500, detail=f"Ошибка добавления цитаты: {str(e)}")
 
 @app.get("/api/quotes/favorites")
-async def get_favorite_quotes(skip: int = 0, limit: int = 50, db: Session = Depends(get_db)):
+async def get_favorite_quotes(skip: int = 0, limit: int = 50):
     """Получение списка избранных цитат"""
     try:
-        quotes = db.query(FavoriteQuote)\
-            .order_by(FavoriteQuote.created_at.desc())\
-            .offset(skip)\
-            .limit(limit)\
-            .all()
+        quotes = storage.get_all_quotes()
+        if skip > 0:
+            quotes = quotes[skip:]
+        if limit > 0:
+            quotes = quotes[:limit]
         
-        return [
-            {
-                "id": quote.id,
-                "quote": quote.quote,
-                "document_id": quote.document_id,
-                "document_title": quote.document_title,
-                "document_language": quote.document_language,
-                "start_position": quote.start_position,
-                "end_position": quote.end_position,
-                "note": quote.note,
-                "created_at": quote.created_at.isoformat()
-            }
-            for quote in quotes
-        ]
+        return quotes
         
     except Exception as e:
         logger.error(f"❌ Ошибка получения избранных цитат: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка получения цитат: {str(e)}")
 
 @app.delete("/api/quotes/favorites/{quote_id}")
-async def delete_favorite_quote(quote_id: int, db: Session = Depends(get_db)):
+async def delete_favorite_quote(quote_id: int):
     """Удаление цитаты из избранного"""
     try:
-        quote = db.query(FavoriteQuote).filter(FavoriteQuote.id == quote_id).first()
-        
-        if not quote:
+        if not storage.delete_quote(quote_id):
             raise HTTPException(status_code=404, detail="Цитата не найдена")
-        
-        db.delete(quote)
-        db.commit()
         
         logger.info(f"🗑️ Удалена избранная цитата: ID {quote_id}")
         
@@ -1925,662 +1544,124 @@ async def delete_favorite_quote(quote_id: int, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         logger.error(f"❌ Ошибка удаления цитаты: {e}")
-        db.rollback()
         raise HTTPException(status_code=500, detail=f"Ошибка удаления цитаты: {str(e)}")
 
-# ========== БАЗА ДАННЫХ ==========
-@app.get("/api/db/tables")
-async def get_database_tables(db: Session = Depends(get_db)):
-    """Получение списка таблиц и их содержимого"""
-    try:
-        # Получаем все таблицы
-        result = db.execute(text("""
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = 'public'
-        """))
-        tables = result.fetchall()
-        
-        table_data = {}
-        
-        for table in tables:
-            table_name = table[0]
-            
-            # Получаем данные из каждой таблицы
-            try:
-                data_result = db.execute(text(f"SELECT * FROM {table_name} LIMIT 5"))
-                columns = [desc[0] for desc in data_result.cursor.description]
-                rows = data_result.fetchall()
-                
-                table_data[table_name] = {
-                    "columns": columns,
-                    "rows": [dict(zip(columns, row)) for row in rows],
-                    "count": len(rows)
-                }
-            except Exception as table_error:
-                table_data[table_name] = {"error": str(table_error)}
-        
-        return {
-            "status": "success",
-            "tables": [t[0] for t in tables],
-            "data": table_data,
-            "total_tables": len(tables)
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения таблиц: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+@app.get("/api/storage/stats")
+async def get_storage_stats():
+    """Получение статистики хранилища"""
+    return {
+        "documents_count": len(storage.documents),
+        "translations_count": len(storage.translations),
+        "analyses_count": sum(len(v) for v in storage.analyses.values()),
+        "quotes_count": len(storage.quotes),
+        "next_id": storage.next_id,
+        "timestamp": datetime.now().isoformat()
+    }
 
-# ========== API ДЛЯ УПРАВЛЕНИЯ БАЗОЙ ДАННЫХ ==========
-@app.post("/api/dev/fix-database")
-async def fix_database():
-    """Исправление структуры базы данных (для разработки)"""
+@app.post("/api/storage/clear")
+async def clear_storage():
+    """Очистка хранилища (для тестирования)"""
+    storage.documents.clear()
+    storage.translations.clear()
+    storage.analyses.clear()
+    storage.quotes.clear()
+    storage.next_id = 1
+    
+    logger.info("🧹 Хранилище очищено")
+    
+    return {
+        "status": "success",
+        "message": "Хранилище очищено",
+        "timestamp": datetime.now().isoformat()
+    }
+
+# ========== ДЕМОНСТРАЦИОННЫЕ ДАННЫЕ ==========
+@app.post("/api/demo/seed")
+async def seed_demo_data():
+    """Создание демонстрационных данных"""
     try:
-        logger.info("🛠️  Начинаем исправление структуры базы данных...")
+        # Пример текстов для демонстрации
+        demo_texts = [
+            {
+                "filename": "Война и мир (отрывок).txt",
+                "content": """Война и мир. Л.Н. Толстой.
+                
+                Глава I
+                — Eh bien, mon prince, Gênes et Lucques ne sont plus que des apanages, des поместья, de la famille Buonaparte. 
+                Non, je vous préviens, que si vous ne me dites pas, que nous avons la guerre, si vous vous permettez encore de pallier toutes les infamies, 
+                toutes les atrocités de cet Antichrist (ma parole, j'y crois) — je ne vous connais plus, vous n'êtes plus mon ami, 
+                vous n'êtes plus мой верный раб, comme vous dites...
+                
+                Так говорила в июле 1805 года известная Анна Павловна Шерер, фрейлина и приближенная императрицы Марии Феодоровны, 
+                встречая важного и чиновного князя Василия, первого приехавшего на ее вечер. Анна Павловна кашляла несколько дней, 
+                у нее был грипп, как она говорила (грипп был тогда новое слово, употреблявшееся только редкими).""",
+                "language": "ru"
+            },
+            {
+                "filename": "Pride and Prejudice (excerpt).txt",
+                "content": """Pride and Prejudice. Jane Austen.
+                
+                Chapter 1
+                It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife.
+                
+                However little known the feelings or views of such a man may be on his first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding families, that he is considered the rightful property of some one or other of their daughters.
+                
+                "My dear Mr. Bennet," said his lady to him one day, "have you heard that Netherfield Park is let at last?"
+                
+                Mr. Bennet replied that he had not.""",
+                "language": "en"
+            },
+            {
+                "filename": "Научная статья по ИИ.txt",
+                "content": """Искусственный интеллект и машинное обучение: современные тенденции.
+                
+                Введение
+                Искусственный интеллект (ИИ) является одной из наиболее быстро развивающихся областей компьютерных наук. 
+                За последнее десятилетие мы наблюдали значительный прогресс в таких областях, как машинное обучение, 
+                глубокое обучение и обработка естественного языка.
+                
+                Основные направления:
+                1. Машинное обучение - алгоритмы, позволяющие компьютерам обучаться на данных.
+                2. Нейронные сети - математические модели, имитирующие работу человеческого мозга.
+                3. Компьютерное зрение - анализ и понимание визуальной информации.
+                4. Обработка естественного языка - взаимодействие компьютеров с человеческим языком.
+                
+                Эти технологии находят применение в медицине, финансах, образовании и многих других сферах.""",
+                "language": "ru"
+            }
+        ]
         
-        # Проверяем и исправляем структуру
-        check_and_fix_database_structure()
+        added_ids = []
+        for demo_text in demo_texts:
+            doc_data = {
+                "filename": demo_text["filename"],
+                "content": demo_text["content"],
+                "language": demo_text["language"],
+                "file_type": "txt",
+                "file_path": f"/demo/{demo_text['filename']}",
+                "file_size": len(demo_text["content"].encode('utf-8')),
+                "word_count": len(demo_text["content"].split()),
+                "char_count": len(demo_text["content"]),
+                "chapter_count": 1,
+                "reading_time_minutes": max(1, len(demo_text["content"].split()) // 200)
+            }
+            
+            doc_id = storage.add_document(doc_data)
+            added_ids.append(doc_id)
+        
+        logger.info(f"🌱 Создано {len(added_ids)} демонстрационных документов")
         
         return {
             "status": "success",
-            "message": "Структура базы данных проверена и исправлена",
+            "message": f"Создано {len(added_ids)} демонстрационных документов",
+            "document_ids": added_ids,
             "timestamp": datetime.now().isoformat()
         }
         
     except Exception as e:
-        logger.error(f"❌ Ошибка исправления базы данных: {e}")
+        logger.error(f"❌ Ошибка создания демо данных: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/dev/recreate-users-table")
-async def recreate_users_table_endpoint():
-    """Пересоздание таблицы users (для разработки)"""
-    try:
-        logger.info("🔄 Запрос на пересоздание таблицы users...")
-        
-        if recreate_users_table_completely():
-            return {
-                "status": "success",
-                "message": "Таблица users успешно пересоздана",
-                "timestamp": datetime.now().isoformat()
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Не удалось пересоздать таблицу users")
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка пересоздания таблицы: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ========== МОК ДАННЫЕ ДЛЯ ОТЧЕТОВ ==========
-
-# Мок данные пользователей
-MOCK_USERS = [
-    {
-        "id": 1,
-        "email": "admin@versevo.ru",
-        "username": "admin",
-        "created_at": "2024-01-15T10:00:00",
-        "last_login": "2024-01-20T15:30:00",
-        "documents_count": 12,
-        "total_words_read": 125000,
-        "notes_count": 8,
-        "activity_status": "active"
-    },
-    {
-        "id": 2,
-        "email": "user1@example.com",
-        "username": "reader1",
-        "created_at": "2024-01-18T14:20:00",
-        "last_login": "2024-01-20T09:15:00",
-        "documents_count": 5,
-        "total_words_read": 45000,
-        "notes_count": 3,
-        "activity_status": "active"
-    },
-    {
-        "id": 3,
-        "email": "user2@example.com",
-        "username": "researcher",
-        "created_at": "2024-01-10T11:45:00",
-        "last_login": "2024-01-15T16:20:00",
-        "documents_count": 8,
-        "total_words_read": 89000,
-        "notes_count": 12,
-        "activity_status": "inactive"
-    }
-]
-
-# Мок данные документов
-MOCK_DOCUMENTS = [
-    {
-        "id": 1,
-        "filename": "Pride_and_Prejudice.pdf",
-        "language": "en",
-        "file_type": "pdf",
-        "word_count": 125000,
-        "char_count": 650000,
-        "chapter_count": 61,
-        "reading_time_minutes": 625,
-        "created_at": "2024-01-16T09:30:00",
-        "notes_count": 3,
-        "quotes_count": 5,
-        "analysis_count": 2
-    },
-    {
-        "id": 2,
-        "filename": "Война_и_мир.txt",
-        "language": "ru",
-        "file_type": "txt",
-        "word_count": 560000,
-        "char_count": 3000000,
-        "chapter_count": 365,
-        "reading_time_minutes": 2800,
-        "created_at": "2024-01-18T14:15:00",
-        "notes_count": 7,
-        "quotes_count": 12,
-        "analysis_count": 1
-    },
-    {
-        "id": 3,
-        "filename": "Research_Paper.docx",
-        "language": "en",
-        "file_type": "docx",
-        "word_count": 1500,
-        "char_count": 8500,
-        "chapter_count": 3,
-        "reading_time_minutes": 8,
-        "created_at": "2024-01-19T11:20:00",
-        "notes_count": 1,
-        "quotes_count": 0,
-        "analysis_count": 1
-    }
-]
-
-# Мок данные переводов
-MOCK_TRANSLATIONS = [
-    {
-        "date": "2024-01-20",
-        "translation_count": 15,
-        "total_chars_translated": 7500,
-        "source_language": "en",
-        "target_language": "ru",
-        "translation_service": "gemini",
-        "unique_translations": 12
-    },
-    {
-        "date": "2024-01-19",
-        "translation_count": 8,
-        "total_chars_translated": 4200,
-        "source_language": "en",
-        "target_language": "ru",
-        "translation_service": "huggingface",
-        "unique_translations": 7
-    }
-]
-
-# Мок данные AI анализа
-MOCK_AI_ANALYSIS = [
-    {
-        "date": "2024-01-20",
-        "ai_provider": "gemini",
-        "analysis_type": "full",
-        "analysis_count": 5,
-        "avg_summary_length": 450,
-        "unique_documents": 3
-    },
-    {
-        "date": "2024-01-19",
-        "ai_provider": "huggingface",
-        "analysis_type": "standard",
-        "analysis_count": 3,
-        "avg_summary_length": 320,
-        "unique_documents": 2
-    }
-]
-
-# Мок данных тональности
-MOCK_SENTIMENT = [
-    {"sentiment": "Положительный", "count": 12, "percentage": 60.0},
-    {"sentiment": "Нейтральный", "count": 5, "percentage": 25.0},
-    {"sentiment": "Отрицательный", "count": 3, "percentage": 15.0}
-]
-
-# ========== ИСПРАВЛЕННЫЕ ОТЧЕТЫ С МОК ДАННЫМИ ==========
-
-@app.get("/api/reports/user-activity")
-async def get_user_activity_report(
-    start_date: str = None,
-    end_date: str = None,
-    db: Session = Depends(get_db)
-):
-    """Отчет по активности пользователей С МОК ДАННЫМИ"""
-    try:
-        logger.info("📊 Мок отчет по активности пользователей")
-        
-        # Фильтрация по дате (если указана)
-        filtered_users = MOCK_USERS
-        if start_date:
-            filtered_users = [u for u in filtered_users if u["created_at"] >= start_date]
-        if end_date:
-            filtered_users = [u for u in filtered_users if u["created_at"] <= end_date]
-        
-        # Расчет статистики
-        total_docs = sum(u["documents_count"] for u in filtered_users)
-        total_words = sum(u["total_words_read"] for u in filtered_users)
-        active_users = sum(1 for u in filtered_users if u["activity_status"] == "active")
-        
-        return {
-            "report_type": "user_activity_mock",
-            "period": {"start_date": start_date, "end_date": end_date},
-            "summary": {
-                "total_users": len(filtered_users),
-                "active_users": active_users,
-                "total_documents": total_docs,
-                "total_words_read": total_words,
-                "activity_rate": round(active_users * 100 / len(filtered_users), 1) if filtered_users else 0
-            },
-            "data": filtered_users,
-            "is_mock": True,
-            "mock_info": "Данные сгенерированы для демонстрации (реальная БД недоступна)"
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка мок отчета активности: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/reports/document-statistics")
-async def get_document_statistics_report(
-    language: str = None,
-    file_type: str = None,
-    min_words: int = 0,
-    max_words: int = 1000000,
-    db: Session = Depends(get_db)
-):
-    """Мок статистика по документам"""
-    try:
-        logger.info("📊 Мок статистика документов")
-        
-        # Фильтрация
-        filtered_docs = [
-            doc for doc in MOCK_DOCUMENTS
-            if min_words <= doc["word_count"] <= max_words
-            and (language is None or doc["language"] == language)
-            and (file_type is None or doc["file_type"] == file_type)
-        ]
-        
-        # Расчет статистики
-        total_docs = len(filtered_docs)
-        total_words = sum(d["word_count"] for d in filtered_docs)
-        avg_words = total_words / total_docs if total_docs > 0 else 0
-        
-        # Распределение по языкам
-        languages = {}
-        for doc in filtered_docs:
-            lang = doc["language"]
-            languages[lang] = languages.get(lang, 0) + 1
-        
-        return {
-            "report_type": "document_statistics_mock",
-            "filters": {
-                "language": language,
-                "file_type": file_type,
-                "min_words": min_words,
-                "max_words": max_words
-            },
-            "summary": {
-                "total_documents": total_docs,
-                "total_words": total_words,
-                "avg_words": round(avg_words, 1),
-                "avg_reading_time": round(sum(d["reading_time_minutes"] for d in filtered_docs) / total_docs, 1) if total_docs > 0 else 0,
-                "languages_count": len(languages),
-                "languages_distribution": languages
-            },
-            "data": filtered_docs,
-            "is_mock": True
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка мок статистики: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/reports/translation-usage")
-async def get_translation_usage_report(
-    start_date: str = None,
-    end_date: str = None,
-    db: Session = Depends(get_db)
-):
-    """Мок отчет по использованию перевода"""
-    try:
-        logger.info("🌐 Мок отчет по переводам")
-        
-        filtered_translations = MOCK_TRANSLATIONS
-        if start_date:
-            filtered_translations = [t for t in filtered_translations if t["date"] >= start_date]
-        if end_date:
-            filtered_translations = [t for t in filtered_translations if t["date"] <= end_date]
-        
-        # Суммарная статистика
-        total_translations = sum(t["translation_count"] for t in filtered_translations)
-        total_chars = sum(t["total_chars_translated"] for t in filtered_translations)
-        
-        # Распределение по сервисам
-        services = {}
-        for trans in filtered_translations:
-            service = trans["translation_service"]
-            services[service] = services.get(service, 0) + trans["translation_count"]
-        
-        return {
-            "report_type": "translation_usage_mock",
-            "period": {"start_date": start_date, "end_date": end_date},
-            "summary": {
-                "total_translations": total_translations,
-                "total_characters": total_chars,
-                "unique_translations": sum(t["unique_translations"] for t in filtered_translations),
-                "avg_chars_per_translation": round(total_chars / total_translations, 1) if total_translations > 0 else 0,
-                "services_distribution": services
-            },
-            "daily_data": filtered_translations,
-            "is_mock": True
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка мок отчета переводов: {e}")
-        return {
-            "report_type": "translation_usage",
-            "summary": {"total_translations": 0, "message": "Данные временно недоступны"},
-            "daily_data": []
-        }
-
-@app.get("/api/reports/ai-analysis")
-async def get_ai_analysis_report(
-    ai_provider: str = None,
-    analysis_type: str = None,
-    db: Session = Depends(get_db)
-):
-    """Мок отчет по AI анализу"""
-    try:
-        logger.info("🤖 Мок отчет AI анализа")
-        
-        filtered_analysis = MOCK_AI_ANALYSIS
-        if ai_provider:
-            filtered_analysis = [a for a in filtered_analysis if a["ai_provider"] == ai_provider]
-        if analysis_type:
-            filtered_analysis = [a for a in filtered_analysis if a["analysis_type"] == analysis_type]
-        
-        # Статистика по провайдерам
-        providers = {}
-        for analysis in filtered_analysis:
-            provider = analysis["ai_provider"]
-            providers[provider] = providers.get(provider, 0) + analysis["analysis_count"]
-        
-        return {
-            "report_type": "ai_analysis_mock",
-            "filters": {
-                "ai_provider": ai_provider,
-                "analysis_type": analysis_type
-            },
-            "summary": {
-                "total_analysis": sum(a["analysis_count"] for a in filtered_analysis),
-                "unique_documents": sum(a["unique_documents"] for a in filtered_analysis),
-                "providers_distribution": providers,
-                "avg_summary_length": round(sum(a["avg_summary_length"] for a in filtered_analysis) / len(filtered_analysis), 1) if filtered_analysis else 0
-            },
-            "daily_analysis": filtered_analysis,
-            "sentiment_distribution": MOCK_SENTIMENT,
-            "is_mock": True
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка мок отчета AI: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/reports/system-health")
-async def get_system_health_report():
-    """Мок отчет о здоровье системы"""
-    try:
-        logger.info("🩺 Мок отчет здоровья системы")
-        
-        # Имитация данных из разных таблиц
-        table_stats = {
-            "users": 125,
-            "documents": 89,
-            "document_notes": 234,
-            "document_analysis": 67,
-            "favorite_quotes": 45,
-            "translation_cache": 156,
-            "reading_progress": 312
-        }
-        
-        # Имитация роста
-        growth_data = []
-        for i in range(30, 0, -1):
-            date = datetime.now() - timedelta(days=i)
-            growth_data.append({
-                "type": "documents",
-                "date": date.strftime("%Y-%m-%d"),
-                "count": random.randint(1, 5)
-            })
-            if i % 3 == 0:
-                growth_data.append({
-                    "type": "users",
-                    "date": date.strftime("%Y-%m-%d"),
-                    "count": random.randint(0, 2)
-                })
-        
-        # Активность пользователей
-        total_users = table_stats["users"]
-        active_7d = random.randint(40, 60)
-        active_30d = random.randint(70, 90)
-        
-        return {
-            "report_type": "system_health_mock",
-            "timestamp": datetime.now().isoformat(),
-            "table_statistics": table_stats,
-            "user_activity": {
-                "total_users": total_users,
-                "active_users_7d": active_7d,
-                "active_users_30d": active_30d,
-                "retention_rate": round(active_30d * 100.0 / total_users, 1)
-            },
-            "growth_data": growth_data,
-            "storage_info": {
-                "documents_count": table_stats["documents"],
-                "users_count": table_stats["users"],
-                "analysis_count": table_stats["document_analysis"],
-                "quotes_count": table_stats["favorite_quotes"],
-                "estimated_size_mb": 45.7
-            },
-            "is_mock": True,
-            "mock_warning": "⚠️ Данные сгенерированы для демонстрации. В реальной системе будут отображаться актуальные данные из базы."
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка мок отчета здоровья: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ========== SQL ПРИМЕРЫ (для демонстрации) ==========
-
-@app.get("/api/sql/examples")
-async def get_sql_examples():
-    """Примеры SQL запросов, которые используются в системе"""
-    return {
-        "examples": [
-            {
-                "name": "Активные пользователи",
-                "description": "Пользователи с активностью за последние 7 дней",
-                "sql": """
-                SELECT 
-                    u.id,
-                    u.email,
-                    u.username,
-                    COUNT(DISTINCT d.id) as documents_count,
-                    COUNT(DISTINCT n.id) as notes_count,
-                    MAX(u.last_login) as last_activity
-                FROM users u
-                LEFT JOIN documents d ON u.id = d.user_id
-                LEFT JOIN document_notes n ON u.id = n.user_id
-                WHERE u.last_login >= NOW() - INTERVAL '7 days'
-                GROUP BY u.id, u.email, u.username
-                ORDER BY last_activity DESC
-                """,
-                "parameters_used": ["last_login"],
-                "injection_protection": "Параметризованный запрос через SQLAlchemy"
-            },
-            {
-                "name": "Статистика документов",
-                "description": "Агрегированная статистика по документам",
-                "sql": """
-                SELECT 
-                    d.language,
-                    d.file_type,
-                    COUNT(*) as count,
-                    SUM(d.word_count) as total_words,
-                    AVG(d.word_count) as avg_words,
-                    AVG(d.reading_time_minutes) as avg_reading_time
-                FROM documents d
-                GROUP BY d.language, d.file_type
-                ORDER BY count DESC
-                """,
-                "parameters_used": [],
-                "injection_protection": "Без параметров - безопасно"
-            },
-            {
-                "name": "Популярные цитаты",
-                "description": "Часто сохраняемые цитаты с фильтрацией",
-                "sql": """
-                SELECT 
-                    q.quote,
-                    COUNT(*) as save_count,
-                    d.filename as source_document,
-                    d.language
-                FROM favorite_quotes q
-                JOIN documents d ON q.document_id = d.id
-                WHERE d.language = :language
-                GROUP BY q.quote, d.filename, d.language
-                HAVING COUNT(*) >= :min_saves
-                ORDER BY save_count DESC
-                LIMIT :limit
-                """,
-                "parameters_used": [":language", ":min_saves", ":limit"],
-                "injection_protection": "Использование именованных параметров"
-            },
-            {
-                "name": "AI анализ по датам",
-                "description": "Анализ использования AI по дням",
-                "sql": """
-                SELECT 
-                    DATE(a.created_at) as analysis_date,
-                    a.ai_provider,
-                    a.analysis_type,
-                    COUNT(*) as analysis_count,
-                    COUNT(DISTINCT a.document_id) as unique_documents
-                FROM document_analysis a
-                WHERE a.ai_analysis = true
-                AND a.created_at BETWEEN :start_date AND :end_date
-                GROUP BY DATE(a.created_at), a.ai_provider, a.analysis_type
-                ORDER BY analysis_date DESC, analysis_count DESC
-                """,
-                "parameters_used": [":start_date", ":end_date"],
-                "injection_protection": "Параметры даты валидируются"
-            }
-        ],
-        "security_notes": [
-            "Все запросы используют параметризацию SQLAlchemy",
-            "Входные данные валидируются через Pydantic",
-            "Ограничение прав доступа на уровне базы",
-            "Логирование всех запросов"
-        ]
-    }
-
-# ========== SQL СХЕМА В HTML ==========
-
-@app.get("/api/sql-demo")
-async def get_sql_demo():
-    """Возвращает HTML страницу с SQL схемой"""
-    try:
-        return FileResponse(
-            "sql_demo.html",
-            media_type="text/html",
-            headers={"Content-Disposition": "inline"}
-        )
-    except:
-        # Если файла нет, возвращаем простой HTML
-        html_content = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>SQL Схема БД - Versevo</title>
-            <style>
-                body { font-family: Arial, sans-serif; margin: 40px; background: #f8f9fa; }
-                .container { max-width: 1200px; margin: 0 auto; }
-                .sql-box { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-                .sql { background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0; font-family: 'Courier New', monospace; }
-                .keyword { color: #d73a49; font-weight: bold; }
-                .table { color: #005cc5; font-weight: bold; }
-                .column { color: #6f42c1; }
-                .type { color: #e36209; }
-                .constraint { color: #28a745; }
-                h1 { color: #333; }
-                h2 { color: #555; margin-top: 30px; }
-                .note { background: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>📊 SQL Схема базы данных Versevo</h1>
-                
-                <div class="note">
-                    <strong>⚠️ Внимание:</strong> Это демонстрационная схема. В реальной системе структура может отличаться.
-                </div>
-                
-                <h2>Таблица пользователей (users)</h2>
-                <div class="sql">
-                    <span class="keyword">CREATE TABLE</span> <span class="table">users</span> (<br>
-                    &nbsp;&nbsp;<span class="column">id</span> <span class="type">SERIAL PRIMARY KEY</span>,<br>
-                    &nbsp;&nbsp;<span class="column">email</span> <span class="type">VARCHAR(255)</span> <span class="constraint">UNIQUE NOT NULL</span>,<br>
-                    &nbsp;&nbsp;<span class="column">username</span> <span class="type">VARCHAR(100)</span> <span class="constraint">NOT NULL</span>,<br>
-                    &nbsp;&nbsp;<span class="column">hashed_password</span> <span class="type">VARCHAR(255)</span> <span class="constraint">NOT NULL</span>,<br>
-                    &nbsp;&nbsp;<span class="column">created_at</span> <span class="type">TIMESTAMP</span> <span class="keyword">DEFAULT</span> <span class="keyword">CURRENT_TIMESTAMP</span>,<br>
-                    &nbsp;&nbsp;<span class="column">last_login</span> <span class="type">TIMESTAMP</span>,<br>
-                    &nbsp;&nbsp;<span class="constraint">CONSTRAINT</span> users_email_unique <span class="keyword">UNIQUE</span> (email)<br>
-                    );
-                </div>
-                
-                <h2>Таблица документов (documents)</h2>
-                <div class="sql">
-                    <span class="keyword">CREATE TABLE</span> <span class="table">documents</span> (<br>
-                    &nbsp;&nbsp;<span class="column">id</span> <span class="type">SERIAL PRIMARY KEY</span>,<br>
-                    &nbsp;&nbsp;<span class="column">user_id</span> <span class="type">INTEGER REFERENCES</span> users(id),<br>
-                    &nbsp;&nbsp;<span class="column">filename</span> <span class="type">VARCHAR(255)</span> <span class="constraint">NOT NULL</span>,<br>
-                    &nbsp;&nbsp;<span class="column">content</span> <span class="type">TEXT</span>,<br>
-                    &nbsp;&nbsp;<span class="column">language</span> <span class="type">VARCHAR(10)</span>,<br>
-                    &nbsp;&nbsp;<span class="column">file_type</span> <span class="type">VARCHAR(10)</span>,<br>
-                    &nbsp;&nbsp;<span class="column">file_path</span> <span class="type">VARCHAR(500)</span>,<br>
-                    &nbsp;&nbsp;<span class="column">file_size</span> <span class="type">INTEGER</span>,<br>
-                    &nbsp;&nbsp;<span class="column">word_count</span> <span class="type">INTEGER</span>,<br>
-                    &nbsp;&nbsp;<span class="column">created_at</span> <span class="type">TIMESTAMP DEFAULT</span> <span class="keyword">CURRENT_TIMESTAMP</span><br>
-                    );
-                </div>
-                
-                <h2>Пример SQL запроса</h2>
-                <div class="sql">
-                    <span class="comment">-- Получить 10 последних документов</span><br>
-                    <span class="keyword">SELECT</span><br>
-                    &nbsp;&nbsp;d.id,<br>
-                    &nbsp;&nbsp;d.filename,<br>
-                    &nbsp;&nbsp;d.language,<br>
-                    &nbsp;&nbsp;d.word_count,<br>
-                    &nbsp;&nbsp;d.created_at,<br>
-                    &nbsp;&nbsp;u.username<br>
-                    <span class="keyword">FROM</span> documents d<br>
-                    <span class="keyword">LEFT JOIN</span> users u <span class="keyword">ON</span> d.user_id = u.id<br>
-                    <span class="keyword">ORDER BY</span> d.created_at <span class="keyword">DESC</span><br>
-                    <span class="keyword">LIMIT</span> 10;
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        return Response(content=html_content, media_type="text/html")
 
 # ========== СТАТИЧЕСКИЕ ФАЙЛЫ ==========
 try:
@@ -2589,89 +1670,14 @@ try:
 except Exception as e:
     logger.warning(f"⚠️ Не удалось подключить статические файлы: {e}")
 
-# ========== КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Healthcheck Middleware ==========
-@app.middleware("http")
-async def healthcheck_middleware(request: Request, call_next):
-    # Быстрый ответ для healthcheck чтобы Railway не падал
-    if request.url.path == "/api/flutter/health":
-        try:
-            # Проверяем БД быстро
-            db = SessionLocal()
-            db.execute(text("SELECT 1"))
-            db.close()
-            
-            response = JSONResponse(
-                status_code=200,
-                content={
-                    "status": "healthy",
-                    "database": "available",
-                    "timestamp": datetime.now().isoformat()
-                }
-            )
-            return response
-        except Exception as e:
-            response = JSONResponse(
-                status_code=503,
-                content={
-                    "status": "unhealthy",
-                    "error": str(e),
-                    "timestamp": datetime.now().isoformat()
-                }
-            )
-            return response
-    
-    response = await call_next(request)
-    return response
-
-# ========== СОЗДАНИЕ ТАБЛИЦ ==========
-def create_tables():
-    """Создание таблиц при запуске"""
-    try:
-        Base.metadata.create_all(bind=engine)
-        logger.info("✅ Таблицы базы данных созданы/проверены")
-        
-        # Проверяем таблицу users
-        db = SessionLocal()
-        result = db.execute(text("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')"))
-        users_exists = result.scalar()
-        
-        if users_exists:
-            logger.info("✅ Таблица users существует")
-            # Проверяем есть ли пользователи
-            users_count = db.query(User).count()
-            logger.info(f"📊 Количество пользователей в базе: {users_count}")
-        else:
-            logger.warning("⚠️ Таблица users не существует")
-            
-        db.close()
-    except Exception as e:
-        logger.error(f"❌ Ошибка создания таблиц: {e}")
-
 # ========== ИНИЦИАЛИЗАЦИЯ ПРИ СТАРТЕ ==========
 @app.on_event("startup")
 async def startup_event():
     """Инициализация при старте приложения"""
-    logger.info("🚀 Запуск Versevo Backend v8.0")
+    logger.info("🚀 Запуск Versevo Backend v9.0 (Без базы данных)")
     
     try:
-        # Создаем таблицы в базе данных
-        create_tables()
-        
-        # Проверяем и исправляем структуру базы данных
-        check_and_fix_database_structure()
-        
-        # Проверяем подключение к БД
-        db = SessionLocal()
-        db.execute(text("SELECT 1"))
-        db.close()
-        logger.info("✅ Подключение к базе данных успешно")
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка инициализации базы данных: {e}")
-        # НЕ падаем при ошибке БД - Railway будет перезапускать
-    
-    # Инициализация NLTK в фоне
-    try:
+        # Инициализация NLTK
         if init_nltk():
             logger.info("✅ NLTK инициализирован")
         else:
@@ -2679,7 +1685,7 @@ async def startup_event():
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации NLTK: {e}")
     
-    # Инициализация AI моделей в фоне (не блокируем старт)
+    # Инициализация AI моделей в фоне
     async def init_ai_background():
         try:
             if ai_models.initialize():
@@ -2692,6 +1698,8 @@ async def startup_event():
     asyncio.create_task(init_ai_background())
     
     logger.info(f"🌐 Сервер готов на порту {os.getenv('PORT', 8000)}")
+    logger.info("💾 База данных ПЕРЕНЕСЕНА во Flutter приложение")
+    logger.info("📊 Данные хранятся в памяти (InMemoryStorage)")
 
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
@@ -2700,19 +1708,19 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     
     logger.info(f"{'='*60}")
-    logger.info(f"🚀 VERSION 8.0 - ПОЛНАЯ РЕАЛИЗАЦИЯ С АУТЕНТИФИКАЦИЕЙ")
+    logger.info(f"🚀 VERSION 9.0 - БЕЗ БАЗЫ ДАННЫХ (БД во Flutter)")
     logger.info(f"{'='*60}")
     logger.info(f"📁 Папка загрузок: {config.UPLOAD_FOLDER}")
     logger.info(f"🤖 AI Модели: Hugging Face + Gemini (реальные)")
-    logger.info(f"🗄️  База данных: PostgreSQL (Railway)")
-    logger.info(f"🔐 Аутентификация: JWT токены")
+    logger.info(f"🗄️  Хранилище: InMemory (вместо БД)")
     logger.info(f"🔤 Перевод: Реальный через AI модели")
     logger.info(f"📊 Анализ: Полный AI анализ")
-    logger.info(f"❤️ Избранные цитаты: Реальная база данных")
+    logger.info(f"❤️ Избранные цитаты: В памяти")
     logger.info(f"{'='*60}")
     logger.info(f"🛠️  Дополнительные функции:")
-    logger.info(f"   - /api/dev/fix-database - исправление структуры БД")
-    logger.info(f"   - /api/dev/recreate-users-table - пересоздание таблицы users")
+    logger.info(f"   - /api/storage/stats - статистика хранилища")
+    logger.info(f"   - /api/storage/clear - очистка хранилища")
+    logger.info(f"   - /api/demo/seed - демонстрационные данные")
     logger.info(f"{'='*60}")
     
     uvicorn.run(
