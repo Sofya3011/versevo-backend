@@ -1,4 +1,4 @@
-# main.py - Бэкенд Versevo без базы данных (только функциональность)
+# main.py - Бэкенд Versevo без базы данных (с добавленными эндпоинтами)
 import asyncio
 import time
 import os
@@ -103,6 +103,7 @@ class InMemoryStorage:
         self.translations = {}  # hash -> перевод
         self.analyses = {}  # document_id -> анализ
         self.quotes = {}  # quote_id -> цитата
+        self.users = {}  # user_id -> пользователь (для совместимости)
         self.next_id = 1
         
     def add_document(self, document_data: dict) -> int:
@@ -161,6 +162,14 @@ class InMemoryStorage:
             del self.quotes[quote_id]
             return True
         return False
+    
+    def add_user(self, user_data: dict) -> int:
+        user_id = self.next_id
+        user_data['id'] = user_id
+        user_data['created_at'] = datetime.now().isoformat()
+        self.users[user_id] = user_data
+        self.next_id += 1
+        return user_id
 
 # Создаем экземпляр хранилища в памяти
 storage = InMemoryStorage()
@@ -201,6 +210,15 @@ class DocumentUploadRequest(BaseModel):
     filename: str
     file_data: str  # base64
     file_size: int
+
+class UserCreate(BaseModel):
+    email: str = Field(..., pattern=r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6)
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
 
 # ========== ИНИЦИАЛИЗАЦИЯ МОДЕЛЕЙ AI ==========
 class AIModels:
@@ -706,6 +724,7 @@ async def root():
         "endpoints": [
             "/docs - документация API",
             "/health - проверка здоровья",
+            "/api/flutter/health - проверка для Flutter",
             "/api/documents - управление документами",
             "/api/translate - перевод",
             "/api/analyze - анализ",
@@ -715,7 +734,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Проверка здоровья системы"""
+    """Полная проверка здоровья системы"""
     health_status = {
         "status": "healthy",
         "service": "versevo-backend-nodb",
@@ -759,6 +778,110 @@ async def health_check():
     }
     
     return health_status
+
+# ========== ДОБАВЛЕННЫЕ ЭНДПОИНТЫ ДЛЯ Flutter ==========
+@app.get("/api/flutter/health")
+async def flutter_health_check():
+    """Упрощенная проверка для Flutter (возвращает всегда здоров)"""
+    return {
+        "status": "healthy",
+        "database": "moved_to_flutter",
+        "ai_models": ai_models.initialized,
+        "timestamp": datetime.now().isoformat(),
+        "message": "База данных перенесена во Flutter приложение"
+    }
+
+@app.get("/api/db/tables")
+async def get_database_tables():
+    """Получение информации о таблицах (возвращает пустые данные)"""
+    return {
+        "status": "success",
+        "note": "База данных перенесена во Flutter приложение",
+        "tables": [],
+        "data": {},
+        "total_tables": 0
+    }
+
+@app.get("/api/sql/examples")
+async def get_sql_examples():
+    """Примеры SQL запросов для Flutter"""
+    return {
+        "examples": [
+            {
+                "name": "Активные пользователи",
+                "sql": "SELECT * FROM users WHERE last_login >= NOW() - INTERVAL '7 days'",
+                "description": "Пользователи активные за последние 7 дней"
+            },
+            {
+                "name": "Статистика документов",
+                "sql": "SELECT language, COUNT(*) as count, AVG(word_count) as avg_words FROM documents GROUP BY language",
+                "description": "Статистика документов по языкам"
+            }
+        ],
+        "note": "Эти запросы выполняются в Flutter приложении с локальной MySQL"
+    }
+
+@app.post("/api/dev/fix-database")
+async def fix_database():
+    """Заглушка для совместимости"""
+    return {
+        "status": "success",
+        "message": "База данных перенесена во Flutter приложение",
+        "timestamp": datetime.now().isoformat()
+    }
+
+# ========== ОТЧЕТЫ (МОК ДАННЫЕ) ==========
+
+@app.get("/api/reports/user-activity")
+async def get_user_activity_report(start_date: str = None, end_date: str = None):
+    """Мок отчет по активности пользователей"""
+    mock_users = [
+        {
+            "id": 1,
+            "email": "alexey.ivanov@mail.ru",
+            "username": "Алексей Иванов",
+            "created_at": "2026-01-05T14:20:00",
+            "last_login": "2026-01-20T15:30:00",
+            "documents_count": 3,
+            "notes_count": 2,
+            "activity_status": "active"
+        },
+        {
+            "id": 2,
+            "email": "maria.smirnova@gmail.com",
+            "username": "Мария Смирнова",
+            "created_at": "2026-01-07T10:15:00",
+            "last_login": "2026-01-20T11:45:00",
+            "documents_count": 2,
+            "notes_count": 1,
+            "activity_status": "active"
+        }
+    ]
+    
+    return {
+        "report_type": "user_activity_mock",
+        "summary": {
+            "total_users": 2,
+            "active_users": 2,
+            "total_documents": 5
+        },
+        "data": mock_users,
+        "is_mock": True
+    }
+
+@app.get("/api/reports/document-statistics")
+async def get_document_statistics_report():
+    """Мок статистика по документам"""
+    return {
+        "report_type": "document_statistics_mock",
+        "summary": {
+            "total_documents": len(storage.documents),
+            "total_words": sum(d.get("word_count", 0) for d in storage.documents.values()),
+            "languages_distribution": {"ru": 2, "en": 1}
+        },
+        "data": list(storage.documents.values()),
+        "is_mock": True
+    }
 
 # ========== ДОКУМЕНТЫ ==========
 @app.post("/api/documents/upload-base64")
@@ -1576,6 +1699,53 @@ async def clear_storage():
         "timestamp": datetime.now().isoformat()
     }
 
+# ========== АУТЕНТИФИКАЦИЯ (для совместимости) ==========
+@app.post("/api/auth/register")
+async def register_user(request: UserCreate):
+    """Регистрация пользователя (заглушка)"""
+    user_data = {
+        "email": request.email,
+        "username": request.username,
+        "hashed_password": f"hashed_{request.password}",
+        "created_at": datetime.now().isoformat(),
+        "last_login": datetime.now().isoformat()
+    }
+    
+    user_id = storage.add_user(user_data)
+    
+    return {
+        "id": user_id,
+        "email": request.email,
+        "username": request.username,
+        "token": f"mock_token_{user_id}",
+        "created_at": datetime.now().isoformat(),
+        "last_login": datetime.now().isoformat(),
+        "message": "Регистрация успешна (mock)"
+    }
+
+@app.post("/api/auth/login")
+async def login_user(request: UserLogin):
+    """Вход пользователя (заглушка)"""
+    # Ищем пользователя
+    user = None
+    for u in storage.users.values():
+        if u.get("email") == request.email:
+            user = u
+            break
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Неверный email или пароль")
+    
+    return {
+        "id": user["id"],
+        "email": user["email"],
+        "username": user["username"],
+        "token": f"mock_token_{user['id']}",
+        "created_at": user.get("created_at", datetime.now().isoformat()),
+        "last_login": datetime.now().isoformat(),
+        "message": "Вход успешен (mock)"
+    }
+
 # ========== ДЕМОНСТРАЦИОННЫЕ ДАННЫЕ ==========
 @app.post("/api/demo/seed")
 async def seed_demo_data():
@@ -1611,24 +1781,6 @@ async def seed_demo_data():
                 
                 Mr. Bennet replied that he had not.""",
                 "language": "en"
-            },
-            {
-                "filename": "Научная статья по ИИ.txt",
-                "content": """Искусственный интеллект и машинное обучение: современные тенденции.
-                
-                Введение
-                Искусственный интеллект (ИИ) является одной из наиболее быстро развивающихся областей компьютерных наук. 
-                За последнее десятилетие мы наблюдали значительный прогресс в таких областях, как машинное обучение, 
-                глубокое обучение и обработка естественного языка.
-                
-                Основные направления:
-                1. Машинное обучение - алгоритмы, позволяющие компьютерам обучаться на данных.
-                2. Нейронные сети - математические модели, имитирующие работу человеческого мозга.
-                3. Компьютерное зрение - анализ и понимание визуальной информации.
-                4. Обработка естественного языка - взаимодействие компьютеров с человеческим языком.
-                
-                Эти технологии находят применение в медицине, финансах, образовании и многих других сферах.""",
-                "language": "ru"
             }
         ]
         
@@ -1669,6 +1821,25 @@ try:
     logger.info(f"✅ Статические файлы подключены: {config.UPLOAD_FOLDER}")
 except Exception as e:
     logger.warning(f"⚠️ Не удалось подключить статические файлы: {e}")
+
+# ========== МИДЛВАР ДЛЯ Flutter healthcheck ==========
+@app.middleware("http")
+async def add_flutter_healthcheck_middleware(request: Request, call_next):
+    if request.url.path == "/api/flutter/health":
+        response = JSONResponse(
+            status_code=200,
+            content={
+                "status": "healthy",
+                "database": "moved_to_flutter",
+                "ai_models": ai_models.initialized,
+                "timestamp": datetime.now().isoformat(),
+                "message": "База данных перенесена во Flutter приложение"
+            }
+        )
+        return response
+    
+    response = await call_next(request)
+    return response
 
 # ========== ИНИЦИАЛИЗАЦИЯ ПРИ СТАРТЕ ==========
 @app.on_event("startup")
@@ -1721,6 +1892,11 @@ if __name__ == "__main__":
     logger.info(f"   - /api/storage/stats - статистика хранилища")
     logger.info(f"   - /api/storage/clear - очистка хранилища")
     logger.info(f"   - /api/demo/seed - демонстрационные данные")
+    logger.info(f"{'='*60}")
+    logger.info(f"🌐 Эндпоинты для Flutter:")
+    logger.info(f"   - GET /api/flutter/health - проверка здоровья")
+    logger.info(f"   - GET /api/db/tables - информация о таблицах")
+    logger.info(f"   - GET /api/sql/examples - примеры SQL")
     logger.info(f"{'='*60}")
     
     uvicorn.run(
