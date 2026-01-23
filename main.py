@@ -30,7 +30,14 @@ class TranslateRequest(BaseModel):
     target_language: str = "ru"
     source_language: Optional[str] = None
     style: str = "artistic"
+class LoginRequest(BaseModel):
+    email: str
+    password: str
 
+class RegisterRequest(BaseModel):
+    email: str
+    username: str
+    password: str
 class AnalysisRequest(BaseModel):
     document_id: int
     analysis_type: str = "general"
@@ -1461,6 +1468,312 @@ async def analyze_document(request: AnalysisRequest):
     except Exception as e:
         logger.error(f"❌ Ошибка базового анализа: {e}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+# ========== АУТЕНТИФИКАЦИЯ ==========
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class RegisterRequest(BaseModel):
+    email: str
+    username: str
+    password: str
+
+@app.post("/api/auth/login")
+async def login_user(request: LoginRequest):
+    """Логин пользователя"""
+    try:
+        # В демо-режиме всегда успешный вход
+        logger.info(f"🔐 Вход пользователя: {request.email}")
+        
+        # Проверяем минимальную валидацию
+        if not request.email or "@" not in request.email:
+            raise HTTPException(status_code=400, detail="Invalid email format")
+        
+        if not request.password or len(request.password) < 1:
+            raise HTTPException(status_code=400, detail="Password required")
+        
+        # Возвращаем успешный ответ
+        return {
+            "status": "success",
+            "message": "Login successful",
+            "token": f"demo_token_{int(datetime.now().timestamp())}",
+            "user": {
+                "id": 1,
+                "email": request.email,
+                "username": request.email.split("@")[0],
+                "created_at": datetime.now().isoformat(),
+            },
+            "timestamp": datetime.now().isoformat(),
+            "demo_mode": True  # Указываем, что это демо-режим
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка логина: {e}")
+        raise HTTPException(status_code=500, detail=f"Login error: {str(e)}")
+
+@app.post("/api/auth/register")
+async def register_user(request: RegisterRequest):
+    """Регистрация пользователя"""
+    try:
+        logger.info(f"📝 Регистрация: {request.email} ({request.username})")
+        
+        # Валидация
+        if not request.email or "@" not in request.email:
+            raise HTTPException(status_code=400, detail="Invalid email format")
+        
+        if not request.username or len(request.username) < 2:
+            raise HTTPException(status_code=400, detail="Username must be at least 2 characters")
+        
+        if not request.password or len(request.password) < 1:
+            raise HTTPException(status_code=400, detail="Password required")
+        
+        # Возвращаем успешный ответ
+        return {
+            "status": "success",
+            "message": "Registration successful",
+            "token": f"demo_token_{int(datetime.now().timestamp())}",
+            "user": {
+                "id": 2,  # ID увеличивается
+                "email": request.email,
+                "username": request.username,
+                "created_at": datetime.now().isoformat(),
+            },
+            "timestamp": datetime.now().isoformat(),
+            "demo_mode": True
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка регистрации: {e}")
+        raise HTTPException(status_code=500, detail=f"Registration error: {str(e)}")
+
+@app.get("/api/auth/check")
+async def check_auth(token: str
+# ========== ЦИТАТЫ ИЗ ДОКУМЕНТА ==========
+def _similarity(s1: str, s2: str) -> float:
+    """Вычисление схожести строк (упрощенное)"""
+    # Используем последовательности слов для сравнения
+    words1 = set(s1.split())
+    words2 = set(s2.split())
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    intersection = words1.intersection(words2)
+    union = words1.union(words2)
+    
+    return len(intersection) / len(union)
+
+@app.get("/api/documents/{document_id}/quotes")
+async def get_document_quotes(document_id: int, limit: int = 5):
+    """Получение цитат из документа"""
+    try:
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        doc = documents_store[document_id]
+        content = doc["content"]
+        
+        if not content or len(content.strip()) < 10:
+            return {
+                "document_id": document_id,
+                "quotes": ["Текст документа пустой или слишком короткий"],
+                "count": 1,
+                "ai_analysis": False,
+                "fallback": True
+            }
+        
+        # Извлекаем предложения
+        sentences = re.split(r'(?<=[.!?])\s+', content)
+        quotes = []
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            # Берем только содержательные предложения
+            if 30 < len(sentence) < 250:
+                quotes.append(sentence)
+                if len(quotes) >= limit * 2:  # Берем больше для фильтрации
+                    break
+        
+        # Фильтруем похожие цитаты
+        unique_quotes = []
+        seen_content = set()
+        
+        for quote in quotes:
+            # Нормализуем цитату (убираем лишние пробелы, приводим к нижнему регистру)
+            normalized = ' '.join(quote.lower().split())
+            
+            # Проверяем, нет ли похожей цитаты
+            is_similar = False
+            for seen in seen_content:
+                # Если цитаты похожи более чем на 70%, пропускаем
+                if _similarity(normalized, seen) > 0.7:
+                    is_similar = True
+                    break
+            
+            if not is_similar and len(unique_quotes) < limit:
+                unique_quotes.append(quote)
+                seen_content.add(normalized)
+        
+        # Если не нашли достаточно цитат, добавляем запасные
+        if len(unique_quotes) < limit:
+            fallback_quotes = [
+                "Каждая книга открывает новые горизонты.",
+                "Чтение — это диалог с автором через время и пространство.",
+                "Слова имеют силу менять восприятие мира.",
+                "Литература хранит мудрость поколений.",
+                "Текст — это мост между мыслью и её воплощением.",
+            ]
+            
+            # Добавляем недостающие цитаты
+            for i in range(limit - len(unique_quotes)):
+                if i < len(fallback_quotes):
+                    unique_quotes.append(fallback_quotes[i])
+        
+        return {
+            "document_id": document_id,
+            "quotes": unique_quotes[:limit],
+            "count": len(unique_quotes[:limit]),
+            "ai_analysis": False,
+            "fallback": False,
+            "extracted_from": f"{len(sentences)} предложений"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения цитат: {e}")
+        return {
+            "document_id": document_id,
+            "quotes": [
+                "Цитаты временно недоступны",
+                "Попробуйте обновить страницу",
+                "Ошибка обработки текста"
+            ],
+            "count": 3,
+            "ai_analysis": False,
+            "fallback": True,
+            "error": str(e)[:100]
+        }
+# ========== АУТЕНТИФИКАЦИЯ ==========
+@app.post("/api/auth/login")
+async def login_user(request: LoginRequest):
+    """Логин пользователя"""
+    try:
+        # В демо-режиме всегда успешный вход
+        logger.info(f"🔐 Вход пользователя: {request.email}")
+        
+        # Проверяем минимальную валидацию
+        if not request.email or "@" not in request.email:
+            raise HTTPException(status_code=400, detail="Invalid email format")
+        
+        if not request.password or len(request.password) < 1:
+            raise HTTPException(status_code=400, detail="Password required")
+        
+        # Возвращаем успешный ответ
+        return {
+            "status": "success",
+            "message": "Login successful",
+            "token": f"demo_token_{int(datetime.now().timestamp())}",
+            "user": {
+                "id": 1,
+                "email": request.email,
+                "username": request.email.split("@")[0],
+                "created_at": datetime.now().isoformat(),
+            },
+            "timestamp": datetime.now().isoformat(),
+            "demo_mode": True  # Указываем, что это демо-режим
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка логина: {e}")
+        raise HTTPException(status_code=500, detail=f"Login error: {str(e)}")
+
+@app.post("/api/auth/register")
+async def register_user(request: RegisterRequest):
+    """Регистрация пользователя"""
+    try:
+        logger.info(f"📝 Регистрация: {request.email} ({request.username})")
+        
+        # Валидация
+        if not request.email or "@" not in request.email:
+            raise HTTPException(status_code=400, detail="Invalid email format")
+        
+        if not request.username or len(request.username) < 2:
+            raise HTTPException(status_code=400, detail="Username must be at least 2 characters")
+        
+        if not request.password or len(request.password) < 1:
+            raise HTTPException(status_code=400, detail="Password required")
+        
+        # Возвращаем успешный ответ
+        return {
+            "status": "success",
+            "message": "Registration successful",
+            "token": f"demo_token_{int(datetime.now().timestamp())}",
+            "user": {
+                "id": 2,  # ID увеличивается
+                "email": request.email,
+                "username": request.username,
+                "created_at": datetime.now().isoformat(),
+            },
+            "timestamp": datetime.now().isoformat(),
+            "demo_mode": True
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка регистрации: {e}")
+        raise HTTPException(status_code=500, detail=f"Registration error: {str(e)}")
+
+@app.get("/api/auth/check")
+async def check_auth(token: str):
+    """Проверка токена"""
+    try:
+        # В демо-режиме всегда успешная проверка
+        if token and token.startswith("demo_token_"):
+            return {
+                "status": "success",
+                "valid": True,
+                "demo_mode": True,
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            return {
+                "status": "error",
+                "valid": False,
+                "message": "Invalid token format",
+                "timestamp": datetime.now().isoformat()
+            }
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки токена: {e}")
+        raise HTTPException(status_code=500, detail=f"Auth check failed: {str(e)}")
+
+# ========== УДАЛЕНИЕ ДОКУМЕНТА ==========
+@app.delete("/api/documents/{document_id}")
+async def delete_document(document_id: int):
+    """Удаление документа"""
+    try:
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        # Удаляем файл с диска
+        doc = documents_store[document_id]
+        if os.path.exists(doc["file_path"]):
+            try:
+                os.remove(doc["file_path"])
+            except:
+                pass
+        
+        # Удаляем из хранилища
+        del documents_store[document_id]
+        
+        logger.info(f"🗑️ Документ удален: ID {document_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Document {document_id} deleted",
+            "deleted_id": document_id
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка удаления документа: {e}")
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
 
 # ========== ЦИТАТЫ ИЗ ДОКУМЕНТА ==========
 def _similarity(s1: str, s2: str) -> float:
@@ -1567,6 +1880,24 @@ async def get_document_quotes(document_id: int, limit: int = 5):
             "error": str(e)[:100]
         }
 
+# ========== ВЫХОД ИЗ СИСТЕМЫ ==========
+@app.post("/api/auth/logout")
+async def logout_user():
+    """Выход пользователя"""
+    try:
+        logger.info("👋 Выход пользователя из системы")
+        
+        # В демо-режиме просто возвращаем успех
+        return {
+            "status": "success",
+            "message": "Logout successful",
+            "timestamp": datetime.now().isoformat(),
+            "demo_mode": True
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка выхода: {e}")
+        raise HTTPException(status_code=500, detail=f"Logout failed: {str(e)}")
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
     import uvicorn
