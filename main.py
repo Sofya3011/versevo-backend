@@ -54,7 +54,10 @@ class AnalysisType(str, Enum):
     STANDARD = "standard"
     DETAILED = "detailed"
     FULL = "full"
-
+class ChatRequest(BaseModel):
+    document_id: int
+    question: str
+    language: str = "ru"
 # ========== СОЗДАЕМ APP ==========
 app = FastAPI(
     title="Versevo Backend API",
@@ -523,7 +526,69 @@ try:
 except ImportError:
     NLTK_AVAILABLE = False
     logger.warning("⚠️ NLTK не установлен, часть анализа будет ограничена")
-
+# ========== AI ЧАТ ПО ДОКУМЕНТУ ==========
+def _generate_chat_answer(document: dict, question: str) -> str:
+    """Генерация ответа на вопрос по документу"""
+    content = document.get("content", "")
+    title = document.get("filename", "документ")
+    q = question.lower()
+    
+    if not content or len(content.strip()) < 10:
+        return f"Документ «{title}» пуст или недоступен для чтения."
+    
+    words = content.split()
+    word_count = len(words)
+    sentences = re.split(r'(?<=[.!?])\s+', content)
+    
+    # Определяем тип вопроса
+    if any(w in q for w in ['о чём', 'о чем', 'суть', 'содержание', 'кратко']):
+        key = [s.strip() for s in sentences if 30 < len(s.strip()) < 300][:4]
+        if key:
+            return (f"📄 Документ «{title}» — {word_count} слов.\n\n"
+                    f"Краткое содержание:\n\n" + 
+                    "\n\n".join(f"{i+1}. {s}" for i, s in enumerate(key)))
+        return f"📄 Документ «{title}» содержит {word_count} слов.\n\n{content[:400]}..."
+    
+    if any(w in q for w in ['тезис', 'главн', 'основн', 'темы', 'иде']):
+        key = [s.strip() for s in sentences if 40 < len(s.strip()) < 250][:6]
+        if len(key) >= 2:
+            return (f"📌 Основные тезисы «{title}»:\n\n" +
+                    "\n\n".join(f"{i+1}. {s}" for i, s in enumerate(key)))
+    
+    if any(w in q for w in ['персонаж', 'герой', 'кто', 'люди', 'человек']):
+        sample = content[:3000]
+        names = re.findall(r'\b[А-Я][а-я]+\b', sample)
+        unique = list(dict.fromkeys(n for n in names 
+                     if len(n) > 1 and n not in ['Это','Что','Как','Для','Они','Мы','Вы','Она','Он','Глава']))
+        if unique:
+            return f"👥 В документе «{title}» упоминаются: {', '.join(unique[:10])}."
+    
+    if any(w in q for w in ['найди', 'найти', 'поиск', 'абзац', 'где']):
+        search = re.sub(r'(найди|найти|поиск|абзац|про|где|мне|пожалуйста)\s*', '', question, flags=re.IGNORECASE).strip()
+        if len(search) > 2:
+            idx = content.lower().find(search.lower())
+            if idx != -1:
+                start = max(0, idx - 150)
+                end = min(len(content), idx + len(search) + 250)
+                return f"🔍 По запросу «{search}»:\n\n...{content[start:end]}..."
+            return f"🔍 По запросу «{search}» ничего не найдено."
+    
+    if any(w in q for w in ['жанр', 'стиль', 'как написан']):
+        avg_len = word_count / len(sentences) if sentences else 0
+        style = 'Литературный / Академический' if avg_len > 25 else \
+                'Художественный / Описательный' if avg_len > 15 else \
+                'Разговорный / Информационный'
+        return (f"📝 Стиль «{title}»: {style}\n"
+                f"Средняя длина предложения: {avg_len:.1f} слов\n"
+                f"Всего предложений: {len(sentences)}\n"
+                f"Объём: {word_count} слов")
+    
+    return (f"📖 Документ «{title}» — {word_count} слов.\n\n"
+            f"Чтобы получить точный ответ, попробуйте:\n"
+            f"• «О чём этот документ?»\n"
+            f"• «Выдели основные тезисы»\n"
+            f"• «Какие персонажи упоминаются?»\n"
+            f"• «Найди абзац про...»")
 def get_hf_analysis_pipeline(task: str):
     """Получить pipeline для задачи анализа (ленивая загрузка)"""
     if task not in HF_ANALYSIS_PIPELINES:
@@ -882,7 +947,64 @@ async def get_document(document_id: int):
         "created_at": doc["created_at"],
         "chapters": doc["chapters"],
     }
+# ========== AI ЧАТ ==========
+class ChatRequest(BaseModel):
+    document_id: int
+    question: str
+    language: str = "ru"
 
+@app.post("/api/chat/ask")
+async def chat_ask(request: ChatRequest):
+    """Ответ на вопрос по документу"""
+    try:
+        document_id = request.document_id
+        
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        doc = documents_store[document_id]
+        answer = _generate_chat_answer(doc, request.question)
+        
+        # Если доступен HuggingFace, пробуем улучшить ответ
+        if HUGGING_FACE_ENABLED and len(doc.get("content", "")) > 100:
+            try:
+                sentiment_pipeline = get_hf_analysis_pipeline("sentiment")
+                if sentiment_pipeline and any(w in request.question.lower() for w in ['тональность', 'настроение', 'эмоциональн']):
+                    sample = doc["content"][:512]
+                    sr = sentiment_pipeline(sample)
+                    if sr:
+                        label = sr[0].get("label", "NEUTRAL")
+                        score = sr[0].get("score", 0.5)
+                        sentiment_map = {
+                            "POSITIVE": "позитивная",
+                            "LABEL_2": "позитивная",
+                            "NEGATIVE": "негативная",
+                            "LABEL_0": "негативная",
+                            "NEUTRAL": "нейтральная",
+                            "LABEL_1": "нейтральная"
+                        }
+                        sentiment = sentiment_map.get(label, "нейтральная")
+                        answer += f"\n\nАнализ тональности: {sentiment} (уверенность: {score:.0%})"
+            except:
+                pass
+        
+        return {
+            "answer": answer,
+            "document_id": document_id,
+            "question": request.question,
+            "ai_used": HUGGING_FACE_ENABLED,
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Ошибка AI чата: {e}")
+        return {
+            "answer": "Произошла ошибка при обработке вопроса. Попробуйте ещё раз.",
+            "document_id": request.document_id,
+            "question": request.question,
+            "error": str(e)[:200],
+        }
 # ========== ПЕРЕВОД ==========
 @app.post("/api/translate/text")
 async def translate_text(request: TranslateRequest):
