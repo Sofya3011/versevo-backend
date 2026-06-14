@@ -174,12 +174,6 @@ class LocalTranslator:
         else:
             result = text
         result = self._apply_style(result, style)
-        if source_lang == 'en' and target_lang == 'ru':
-            result = f"[ПЕРЕВОД] {result}"
-        elif source_lang == 'ru' and target_lang == 'en':
-            result = f"[TRANSLATION] {result}"
-        else:
-            result = f"[{source_lang}→{target_lang}] {result}"
         return result
 
 # ========== HF ПЕРЕВОДЧИК (как в рабочем коде) ==========
@@ -219,7 +213,8 @@ class HuggingFaceTranslator:
                     logger.info(f"🔄 Загрузка модели перевода {key} ({cfg['model']})...")
                     self.translation_pipelines[key] = pipeline(
                         "translation", model=cfg['model'],
-                        device=device, max_length=cfg['max_length']
+                        device=device, max_length=cfg['max_length'],
+                        clean_up_tokenization_spaces=True
                     )
                     logger.info(f"✅ Модель перевода {key} загружена")
                 else:
@@ -237,9 +232,6 @@ class HuggingFaceTranslator:
         if key not in supported_pairs:
             logger.warning(f"⚠️ Неподдерживаемая пара переводов: {key}")
             return self.fallback_translator.translate(text, source_lang, target_lang, style)
-        if not is_valid_text(text):
-            logger.warning(f"⚠️ Текст содержит бинарные данные, HF пропущен")
-            return self.fallback_translator.translate(text, source_lang, target_lang, style)
         try:
             pipeline = self._get_translation_pipeline(source_lang, target_lang)
             if pipeline is None:
@@ -250,7 +242,7 @@ class HuggingFaceTranslator:
                 text = text[:1000]
                 logger.info(f"📝 Текст усечен с {original_len} до {len(text)} символов")
             logger.info(f"🔄 Перевод {len(text)} символов: {source_lang} → {target_lang}")
-            result = pipeline(text, max_length=400, truncation=True)
+            result = pipeline(text, max_length=400)
             if result and len(result) > 0:
                 translated_text = result[0].get('translation_text', text)
                 logger.info(f"✅ Перевод завершен: {len(text)} → {len(translated_text)} символов")
