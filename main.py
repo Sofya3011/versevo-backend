@@ -186,7 +186,6 @@ class HuggingFaceTranslator:
 
     def _init_translation_models(self):
         try:
-            from transformers import pipeline
             import torch
             device = 0 if torch.cuda.is_available() else -1
             device_name = "CUDA" if torch.cuda.is_available() else "CPU"
@@ -199,29 +198,26 @@ class HuggingFaceTranslator:
             logger.error(f"❌ Ошибка инициализации переводчика: {e}")
             self.model_configs = {}
 
-    def _get_translation_pipeline(self, source_lang: str, target_lang: str):
+    def _get_model(self, source_lang: str, target_lang: str):
         key = f"{source_lang}-{target_lang}"
-        if key not in self.translation_pipelines:
-            return None
+        if key not in self.model_configs:
+            return None, None
+        import torch
+        device = 0 if torch.cuda.is_available() else -1
+        cfg = self.model_configs[key]
         if self.translation_pipelines[key] is None:
             try:
-                from transformers import pipeline
-                import torch
-                device = 0 if torch.cuda.is_available() else -1
-                if key in self.model_configs:
-                    cfg = self.model_configs[key]
-                    logger.info(f"🔄 Загрузка модели перевода {key} ({cfg['model']})...")
-                    self.translation_pipelines[key] = pipeline(
-                        "translation", model=cfg['model'],
-                        device=device, max_length=cfg['max_length'],
-                        clean_up_tokenization_spaces=True
-                    )
-                    logger.info(f"✅ Модель перевода {key} загружена")
-                else:
-                    return None
+                from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+                logger.info(f"🔄 Загрузка модели {key} ({cfg['model']})...")
+                tokenizer = AutoTokenizer.from_pretrained(cfg['model'])
+                model = AutoModelForSeq2SeqLM.from_pretrained(cfg['model'])
+                if device >= 0:
+                    model = model.to(device)
+                logger.info(f"✅ Модель {key} загружена")
+                self.translation_pipelines[key] = (tokenizer, model)
             except Exception as e:
-                logger.error(f"❌ Ошибка загрузки модели перевода {key}: {e}")
-                return None
+                logger.error(f"❌ Ошибка загрузки модели {key}: {e}")
+                self.translation_pipelines[key] = (None, None)
         return self.translation_pipelines[key]
 
     def translate(self, text: str, source_lang: str, target_lang: str, style: str = "artistic") -> str:
@@ -233,24 +229,28 @@ class HuggingFaceTranslator:
             logger.warning(f"⚠️ Неподдерживаемая пара переводов: {key}")
             return self.fallback_translator.translate(text, source_lang, target_lang, style)
         try:
-            pipeline = self._get_translation_pipeline(source_lang, target_lang)
-            if pipeline is None:
-                logger.warning(f"⚠️ Pipeline перевода {key} не загружен")
+            tokenizer, model = self._get_model(source_lang, target_lang)
+            if tokenizer is None or model is None:
+                logger.warning(f"⚠️ Модель {key} не загружена")
                 return self.fallback_translator.translate(text, source_lang, target_lang, style)
             if len(text) > 1000:
                 original_len = len(text)
                 text = text[:1000]
                 logger.info(f"📝 Текст усечен с {original_len} до {len(text)} символов")
             logger.info(f"🔄 Перевод {len(text)} символов: {source_lang} → {target_lang}")
-            result = pipeline(text, max_length=400)
-            if result and len(result) > 0:
-                translated_text = result[0].get('translation_text', text)
-                logger.info(f"✅ Перевод завершен: {len(text)} → {len(translated_text)} символов")
-                translated_text = self.fallback_translator._apply_style(translated_text, style)
-                return translated_text
-            else:
-                logger.warning(f"⚠️ Переводчик вернул пустой результат для {key}")
+            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+            if hasattr(model, 'device'):
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            import torch
+            with torch.no_grad():
+                outputs = model.generate(**inputs, max_length=400)
+            translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            logger.info(f"✅ Перевод завершен: {len(text)} → {len(translated_text)} символов")
+            if not translated_text.strip():
+                logger.warning(f"⚠️ Модель вернула пустой результат для {key}")
                 return self.fallback_translator.translate(text, source_lang, target_lang, style)
+            translated_text = self.fallback_translator._apply_style(translated_text, style)
+            return translated_text
         except Exception as e:
             logger.error(f"❌ Ошибка перевода {key}: {e}")
             return self.fallback_translator.translate(text, source_lang, target_lang, style)
@@ -258,8 +258,8 @@ class HuggingFaceTranslator:
     def is_available(self, source_lang: str, target_lang: str) -> bool:
         key = f"{source_lang}-{target_lang}"
         if key in self.model_configs:
-            pipeline = self._get_translation_pipeline(source_lang, target_lang)
-            return pipeline is not None
+            tokenizer, model = self._get_model(source_lang, target_lang)
+            return tokenizer is not None and model is not None
         return False
 
 # ========== ИНИЦИАЛИЗАЦИЯ (как в рабочем коде — eager) ==========
