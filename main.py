@@ -27,6 +27,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def is_valid_text(text: str, min_ratio: float = 0.8) -> bool:
+    """Проверяет, что строка — это настоящий текст, а не бинарный мусор"""
+    if not text or len(text.strip()) < 10:
+        return False
+    printable = sum(1 for c in text if c.isprintable() or c in '\n\r\t')
+    return (printable / max(len(text), 1)) >= min_ratio
+
 # ========== МОДЕЛИ ==========
 class TranslateRequest(BaseModel):
     text: str
@@ -229,6 +236,9 @@ class HuggingFaceTranslator:
         key = f"{source_lang}-{target_lang}"
         if key not in supported_pairs:
             logger.warning(f"⚠️ Неподдерживаемая пара переводов: {key}")
+            return self.fallback_translator.translate(text, source_lang, target_lang, style)
+        if not is_valid_text(text):
+            logger.warning(f"⚠️ Текст содержит бинарные данные, HF пропущен")
             return self.fallback_translator.translate(text, source_lang, target_lang, style)
         try:
             pipeline = self._get_translation_pipeline(source_lang, target_lang)
@@ -596,19 +606,12 @@ async def upload_document_base64(request: dict):
         with open(file_path, "wb") as f:
             f.write(content_bytes)
         content_str = extract_text_from_file(file_path, ext)
+        if content_str and not is_valid_text(content_str):
+            logger.warning(f"⚠️ Извлечённый текст из {filename} похож на бинарные данные, отбрасываю")
+            content_str = ""
         if not content_str or content_str.strip() == "":
-            logger.warning(f"⚠️ Не удалось извлечь текст из {filename}, пробуем прочитать как raw текст")
-            try:
-                with open(file_path, "rb") as f:
-                    raw = f.read()
-                try:
-                    content_str = raw.decode("utf-8", errors="replace")
-                except Exception:
-                    content_str = raw.decode("latin-1", errors="replace")
-                if not content_str.strip():
-                    content_str = f"Документ: {filename}\nТип: {ext}\n\nСодержимое недоступно для автоматического извлечения."
-            except Exception:
-                content_str = f"Документ: {filename}\nТип: {ext}\n\nСодержимое недоступно для автоматического извлечения."
+            logger.warning(f"⚠️ Не удалось извлечь текст из {filename}")
+            content_str = f"Документ: {filename}\nТип: {ext}\n\nСодержимое недоступно для автоматического извлечения."
         language = detect_language_safe(content_str)
         chapters = detect_chapters(content_str)
         word_count = len(content_str.split())
@@ -893,6 +896,10 @@ def _perform_ai_analysis(text: str) -> Dict[str, Any]:
     if not HUGGING_FACE_ENABLED or not text or len(text.strip()) < 50:
         result["fallback"] = True
         return result
+    if not is_valid_text(text):
+        logger.warning("⚠️ AI анализ пропущен: текст содержит бинарные данные")
+        result["fallback"] = True
+        return result
     try:
         sample_text = text[:2000]
         sentiment_pipe = get_hf_analysis_pipeline("sentiment")
@@ -1125,7 +1132,7 @@ async def chat_ask(request: ChatRequest):
             raise HTTPException(status_code=404, detail="Document not found")
         doc = documents_store[did]
         answer = _generate_chat_answer(doc, request.question)
-        if HUGGING_FACE_ENABLED and len(doc.get("content", "")) > 100:
+        if HUGGING_FACE_ENABLED and len(doc.get("content", "")) > 100 and is_valid_text(doc.get("content", "")):
             try:
                 pipe = get_hf_analysis_pipeline("sentiment")
                 if pipe and any(w in request.question.lower() for w in ['тональность', 'настроение', 'эмоциональн']):
