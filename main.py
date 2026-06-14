@@ -354,27 +354,132 @@ def extract_text_from_file(file_path: str, file_type: str) -> str:
             try:
                 import fitz
                 doc = fitz.open(file_path)
-                text = [page.get_text() for page in doc]
+                pages = []
+                for page in doc:
+                    t = page.get_text().strip()
+                    if t:
+                        pages.append(t)
                 doc.close()
-                return "\n\n".join(text) if text else ""
-            except:
-                return ""
+                if pages:
+                    return "\n\n".join(pages)
+            except Exception:
+                pass
+            try:
+                from pdfminer.high_level import extract_text as pdfminer_extract
+                t = pdfminer_extract(file_path)
+                if t and t.strip():
+                    return t.strip()
+            except Exception:
+                pass
+            return ""
         elif file_type in ['docx', 'doc']:
             try:
                 import docx
                 doc = docx.Document(file_path)
                 paras = [p.text for p in doc.paragraphs if p.text.strip()]
-                return "\n\n".join(paras) if paras else ""
-            except:
+                if paras:
+                    return "\n\n".join(paras)
+                tables = []
+                for table in doc.tables:
+                    for row in table.rows:
+                        cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                        if cells:
+                            tables.append(" | ".join(cells))
+                if tables:
+                    return "\n\n".join(tables)
+                return ""
+            except Exception:
                 return ""
         elif file_type == 'txt':
             try:
                 with open(file_path, "r", encoding='utf-8', errors='ignore') as f:
                     return f.read()
-            except:
+            except Exception:
+                pass
+            try:
+                import chardet
+                with open(file_path, "rb") as f:
+                    raw = f.read()
+                    detected = chardet.detect(raw)
+                    enc = detected.get("encoding", "utf-8") or "utf-8"
+                    return raw.decode(enc, errors="replace")
+            except Exception:
+                pass
+            try:
+                with open(file_path, "r", encoding='cp1251', errors='replace') as f:
+                    return f.read()
+            except Exception:
+                return ""
+        elif file_type == 'epub':
+            try:
+                import zipfile
+                with zipfile.ZipFile(file_path, 'r') as z:
+                    html_files = [f for f in z.namelist() if f.endswith(('.xhtml', '.html', '.htm'))]
+                    if not html_files:
+                        html_files = [f for f in z.namelist() if '.' not in f.split('/')[-1] or f.endswith(('.xhtml', '.html', '.htm'))]
+                    html_files.sort()
+                    from html.parser import HTMLParser
+                    class TextExtractor(HTMLParser):
+                        def __init__(self):
+                            super().__init__()
+                            self.text_parts = []
+                        def handle_data(self, data):
+                            stripped = data.strip()
+                            if stripped:
+                                self.text_parts.append(stripped)
+                    texts = []
+                    for hf in html_files:
+                        try:
+                            content = z.read(hf)
+                            try:
+                                decoded = content.decode('utf-8')
+                            except UnicodeDecodeError:
+                                decoded = content.decode('utf-8', errors='replace')
+                            parser = TextExtractor()
+                            parser.feed(decoded)
+                            chunk = ' '.join(parser.text_parts)
+                            if chunk.strip():
+                                texts.append(chunk.strip())
+                        except Exception:
+                            pass
+                    if texts:
+                        return "\n\n".join(texts)
+                    return ""
+            except Exception:
+                pass
+            try:
+                import ebooklib
+                from ebooklib import epub
+                book = epub.read_epub(file_path)
+                texts = []
+                for item in book.get_items():
+                    if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                        content = item.get_content()
+                        try:
+                            decoded = content.decode('utf-8')
+                        except UnicodeDecodeError:
+                            decoded = content.decode('utf-8', errors='replace')
+                        from html.parser import HTMLParser
+                        class TE(HTMLParser):
+                            def __init__(self):
+                                super().__init__()
+                                self.parts = []
+                            def handle_data(self, d):
+                                s = d.strip()
+                                if s:
+                                    self.parts.append(s)
+                        parser = TE()
+                        parser.feed(decoded)
+                        chunk = ' '.join(parser.parts)
+                        if chunk.strip():
+                            texts.append(chunk.strip())
+                if texts:
+                    return "\n\n".join(texts)
+                return ""
+            except Exception:
                 return ""
         return ""
-    except:
+    except Exception:
         return ""
 
 def detect_language_safe(text: str) -> str:
@@ -492,19 +597,31 @@ async def upload_document_base64(request: dict):
             f.write(content_bytes)
         content_str = extract_text_from_file(file_path, ext)
         if not content_str or content_str.strip() == "":
-            content_str = f"Документ: {filename}\nТип: {ext}\n\nСодержимое недоступно для автоматического извлечения."
+            logger.warning(f"⚠️ Не удалось извлечь текст из {filename}, пробуем прочитать как raw текст")
+            try:
+                with open(file_path, "rb") as f:
+                    raw = f.read()
+                try:
+                    content_str = raw.decode("utf-8", errors="replace")
+                except Exception:
+                    content_str = raw.decode("latin-1", errors="replace")
+                if not content_str.strip():
+                    content_str = f"Документ: {filename}\nТип: {ext}\n\nСодержимое недоступно для автоматического извлечения."
+            except Exception:
+                content_str = f"Документ: {filename}\nТип: {ext}\n\nСодержимое недоступно для автоматического извлечения."
         language = detect_language_safe(content_str)
         chapters = detect_chapters(content_str)
         word_count = len(content_str.split())
         char_count = len(content_str)
         reading_time = max(1, word_count // 200)
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
         doc = {
             "id": current_doc_id, "filename": filename,
             "original_filename": filename, "content": content_str,
             "language": language, "file_type": ext, "file_path": file_path,
             "file_id": file_id, "word_count": word_count,
             "char_count": char_count, "chapter_count": len(chapters),
-            "reading_time_minutes": reading_time,
+            "reading_time_minutes": reading_time, "file_size": file_size,
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(), "chapters": chapters,
         }
@@ -517,6 +634,7 @@ async def upload_document_base64(request: dict):
             "word_count": doc["word_count"], "char_count": doc["char_count"],
             "chapter_count": doc["chapter_count"],
             "reading_time_minutes": doc["reading_time_minutes"],
+            "file_size": doc["file_size"],
             "created_at": doc["created_at"],
             "content_preview": doc["content"][:300] + "..." if len(doc["content"]) > 300 else doc["content"],
         }
@@ -533,7 +651,9 @@ async def get_documents():
         "word_count": d["word_count"], "char_count": d["char_count"],
         "chapter_count": d["chapter_count"],
         "reading_time_minutes": d["reading_time_minutes"],
+        "file_size": d.get("file_size", 0),
         "created_at": d["created_at"],
+        "updated_at": d.get("updated_at", d["created_at"]),
     } for d in sorted(docs, key=lambda x: x["created_at"], reverse=True)]
 
 @app.get("/api/documents/{document_id}")
@@ -547,7 +667,10 @@ async def get_document(document_id: int):
         "word_count": d["word_count"], "char_count": d["char_count"],
         "chapter_count": d["chapter_count"],
         "reading_time_minutes": d["reading_time_minutes"],
-        "created_at": d["created_at"], "chapters": d["chapters"],
+        "file_size": d.get("file_size", 0),
+        "created_at": d["created_at"],
+        "updated_at": d.get("updated_at", d["created_at"]),
+        "chapters": d["chapters"],
     }
 
 @app.delete("/api/documents/{document_id}")
@@ -607,16 +730,48 @@ async def translate_document(document_id: int, request: dict):
             raise HTTPException(status_code=404, detail="Document not found")
         doc = documents_store[document_id]
         target_lang = request.get("target_language", "ru")
+        source_lang = request.get("source_language") or doc.get("language", "auto")
         logger.info(f"🔄 Перевод документа {document_id} ({doc['filename']}) на {target_lang}")
+
+        content = doc.get("content", "")
+        if not content or len(content.strip()) < 10:
+            raise HTTPException(status_code=400, detail="Документ пуст или не содержит текста для перевода")
+
+        chunk_size = 1000
+        chunks = [content[i:i + chunk_size] for i in range(0, len(content), chunk_size)]
+        translated_chunks = []
+        hf = _get_hf_translator()
+        local = _get_local_translator()
+
+        for i, chunk in enumerate(chunks):
+            if not chunk.strip():
+                continue
+            logger.info(f"🔄 Перевод чанка {i + 1}/{len(chunks)} ({len(chunk)} символов)")
+            use_hf = hf.is_available(source_lang if source_lang != "auto" else "en", target_lang)
+            if use_hf:
+                translated = hf.translate(chunk, source_lang if source_lang != "auto" else detect_language_safe(chunk), target_lang)
+            else:
+                translated = local.translate(chunk, source_lang if source_lang != "auto" else detect_language_safe(chunk), target_lang)
+            translated_chunks.append(translated)
+
+        translated_content = " ".join(translated_chunks)
         new_id = current_doc_id + 1
         import copy
         td = copy.deepcopy(doc)
         td["id"] = new_id
         td["filename"] = f"[{target_lang.upper()}] {doc['filename']}"
         td["language"] = target_lang
+        td["content"] = translated_content
         td["created_at"] = datetime.now().isoformat()
+        td["updated_at"] = datetime.now().isoformat()
+        chapters = detect_chapters(translated_content)
+        td["chapters"] = chapters
+        td["chapter_count"] = len(chapters)
+        td["word_count"] = len(translated_content.split())
+        td["char_count"] = len(translated_content)
         documents_store[new_id] = td
         current_doc_id = new_id + 1
+        logger.info(f"✅ Документ {document_id} переведён на {target_lang} -> ID {new_id} ({len(translated_content)} символов)")
         return {"status": "success", "translated_document_id": new_id, "message": "Документ переведен"}
     except HTTPException:
         raise
