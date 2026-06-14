@@ -42,6 +42,7 @@ Pillow==10.3.0
 python-magic==0.4.27
 
 # === UTILS & TASK QUEUE ===
+deep-translator==1.11.4
 celery==5.3.5
 redis==5.0.2
 boto3==1.34.7
