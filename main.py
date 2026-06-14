@@ -614,6 +614,31 @@ async def translate_text(request: TranslateRequest):
         logger.error(f"❌ Translate error: {e}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
+@app.post("/api/translate/document/{document_id}")
+async def translate_document(document_id: int, request: dict):
+    global current_doc_id
+    try:
+        if document_id not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        doc = documents_store[document_id]
+        target_lang = request.get("target_language", "ru")
+        logger.info(f"🔄 Перевод документа {document_id} ({doc['filename']}) на {target_lang}")
+        new_id = current_doc_id + 1
+        import copy
+        translated_doc = copy.deepcopy(doc)
+        translated_doc["id"] = new_id
+        translated_doc["filename"] = f"[{target_lang.upper()}] {doc['filename']}"
+        translated_doc["language"] = target_lang
+        translated_doc["created_at"] = datetime.now().isoformat()
+        documents_store[new_id] = translated_doc
+        current_doc_id = new_id + 1
+        return {"status": "success", "translated_document_id": new_id, "message": "Документ переведен"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Translate document error: {e}")
+        raise HTTPException(status_code=500, detail=f"Document translation failed: {str(e)}")
+
 # ========== БАЗОВЫЙ АНАЛИЗ ==========
 def _perform_basic_analysis(text: str) -> Dict[str, Any]:
     result = {"summary": "", "themes": [], "sentiment": "Нейтральный",
@@ -812,6 +837,40 @@ async def analyze_with_ai(request: AIAnalysisRequest):
             "analysis_timestamp": datetime.now().isoformat(),
         }
 
+# ========== GEMINI AI АНАЛИЗ (заглушка) ==========
+@app.post("/api/analyze/gemini/document")
+async def analyze_with_gemini(request: AIAnalysisRequest):
+    try:
+        did = request.document_id
+        if did not in documents_store:
+            raise HTTPException(status_code=404, detail="Document not found")
+        doc = documents_store[did]
+        content = doc.get("content", "")
+        basic = _perform_basic_analysis(content)
+        return {
+            "document_id": did, "filename": doc["filename"], "language": doc["language"],
+            "summary": basic["summary"], "themes": basic["themes"],
+            "sentiment": basic["sentiment"], "writing_style": "Информационный",
+            "key_points": basic["key_points"], "entities": [],
+            "statistics": basic["statistics"],
+            "language_features": basic["language_features"],
+            "ai_analysis": False, "fallback": True,
+            "models_used": [],
+            "analysis_timestamp": datetime.now().isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Gemini analysis error: {e}")
+        return {
+            "document_id": request.document_id,
+            "summary": "Ошибка Gemini-анализа.", "themes": [],
+            "sentiment": "Не определена", "writing_style": "Не определен",
+            "key_points": ["Ошибка Gemini-анализа"], "entities": [],
+            "ai_analysis": False, "fallback": True,
+            "analysis_timestamp": datetime.now().isoformat(),
+        }
+
 # ========== ЧАТ ==========
 @app.post("/api/chat/ask")
 async def chat_ask(request: ChatRequest):
@@ -895,18 +954,17 @@ async def login_user(request: LoginRequest):
         if not request.password or len(request.password) < 1:
             raise HTTPException(status_code=400, detail="Password required")
 
+        now = datetime.now().isoformat()
         return {
+            "id": 1,
+            "email": request.email,
+            "username": request.email.split("@")[0],
+            "token": f"demo_token_{int(datetime.now().timestamp())}",
+            "created_at": now,
             "status": "success",
             "message": "Login successful",
-            "token": f"demo_token_{int(datetime.now().timestamp())}",
-            "user": {
-                "id": 1,
-                "email": request.email,
-                "username": request.email.split("@")[0],
-                "created_at": datetime.now().isoformat(),
-            },
-            "timestamp": datetime.now().isoformat(),
-            "demo_mode": True
+            "timestamp": now,
+            "demo_mode": True,
         }
 
     except HTTPException:
@@ -929,18 +987,17 @@ async def register_user(request: RegisterRequest):
         if not request.password or len(request.password) < 1:
             raise HTTPException(status_code=400, detail="Password required")
 
+        now = datetime.now().isoformat()
         return {
+            "id": 2,
+            "email": request.email,
+            "username": request.username,
+            "token": f"demo_token_{int(datetime.now().timestamp())}",
+            "created_at": now,
             "status": "success",
             "message": "Registration successful",
-            "token": f"demo_token_{int(datetime.now().timestamp())}",
-            "user": {
-                "id": 2,
-                "email": request.email,
-                "username": request.username,
-                "created_at": datetime.now().isoformat(),
-            },
-            "timestamp": datetime.now().isoformat(),
-            "demo_mode": True
+            "timestamp": now,
+            "demo_mode": True,
         }
 
     except HTTPException:
@@ -970,9 +1027,120 @@ async def check_auth(token: str):
         logger.error(f"❌ Ошибка проверки токена: {e}")
         raise HTTPException(status_code=500, detail=f"Auth check failed: {str(e)}")
 
+@app.get("/api/auth/me")
+async def get_current_user(authorization: str = ""):
+    try:
+        token = authorization.replace("Bearer ", "").strip() if authorization else ""
+        if not token or not token.startswith("demo_token_"):
+            raise HTTPException(status_code=401, detail="Токен недействителен")
+        return {
+            "id": 1,
+            "email": "user@versevo.app",
+            "username": "user",
+            "token": token,
+            "created_at": datetime.now().isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения пользователя: {e}")
+        raise HTTPException(status_code=500, detail=f"Auth error: {str(e)}")
+
 @app.post("/api/auth/logout")
 async def logout_user():
     return {"status": "success", "message": "Logout successful"}
+
+# ========== ОТЧЁТЫ (mock) ==========
+@app.get("/api/reports/mock/system-health")
+async def report_system_health():
+    return {
+        "report_type": "system_health", "timestamp": datetime.now().isoformat(),
+        "summary": {
+            "total_users": 125, "active_users_7d": 58,
+            "active_users_30d": 92, "retention_rate": 73.6,
+        },
+        "table_statistics": {
+            "users": 125, "documents": 89, "document_notes": 234,
+            "document_analysis": 67, "favorite_quotes": 45,
+        },
+        "is_mock": True,
+    }
+
+@app.get("/api/reports/mock/user-activity")
+async def report_user_activity():
+    return {
+        "report_type": "user_activity", "timestamp": datetime.now().isoformat(),
+        "summary": {
+            "total_users": 3, "active_users": 2, "total_documents": 25,
+            "total_words_read": 258000, "activity_rate": 66.7,
+        },
+        "data": [
+            {"id": 1, "email": "admin@versevo.ru", "username": "admin",
+             "documents_count": 12, "activity_status": "active"},
+            {"id": 2, "email": "user@example.com", "username": "user1",
+             "documents_count": 8, "activity_status": "active"},
+            {"id": 3, "email": "inactive@test.com", "username": "old_user",
+             "documents_count": 5, "activity_status": "inactive"},
+        ],
+        "is_mock": True,
+    }
+
+@app.get("/api/reports/mock/document-statistics")
+async def report_document_statistics():
+    return {
+        "report_type": "document_statistics", "timestamp": datetime.now().isoformat(),
+        "summary": {
+            "total_documents": 3, "total_words": 686500,
+            "avg_words": 228833.3, "languages_count": 2,
+        },
+        "data": [
+            {"filename": "Pride_and_Prejudice.pdf", "language": "en",
+             "word_count": 125000, "reading_time_minutes": 625},
+            {"filename": "Voyna_i_mir.txt", "language": "ru",
+             "word_count": 560000, "reading_time_minutes": 2800},
+            {"filename": "Les_Miserables.pdf", "language": "fr",
+             "word_count": 530000, "reading_time_minutes": 2650},
+        ],
+        "is_mock": True,
+    }
+
+@app.get("/api/reports/mock/translation-usage")
+async def report_translation_usage():
+    return {
+        "report_type": "translation_usage", "timestamp": datetime.now().isoformat(),
+        "summary": {
+            "total_translations": 23, "total_characters": 11700,
+            "unique_translations": 19,
+        },
+        "daily_data": [
+            {"date": "2024-01-20", "translation_count": 15, "translation_service": "gemini"},
+            {"date": "2024-01-21", "translation_count": 8, "translation_service": "gemini"},
+            {"date": "2024-01-22", "translation_count": 0, "translation_service": "none"},
+            {"date": "2024-01-23", "translation_count": 12, "translation_service": "openai"},
+        ],
+        "is_mock": True,
+    }
+
+@app.get("/api/reports/mock/ai-analysis")
+async def report_ai_analysis():
+    return {
+        "report_type": "ai_analysis", "timestamp": datetime.now().isoformat(),
+        "summary": {"total_analysis": 8, "unique_documents": 5},
+        "sentiment_distribution": [
+            {"sentiment": "Положительный", "percentage": 60.0},
+            {"sentiment": "Нейтральный", "percentage": 25.0},
+            {"sentiment": "Отрицательный", "percentage": 15.0},
+        ],
+        "is_mock": True,
+    }
+
+@app.get("/api/quotes/favorites")
+async def get_favorite_quotes():
+    return []
+
+@app.post("/api/quotes/favorites")
+async def add_favorite_quote(request: dict):
+    return {"status": "success", "message": "Цитата добавлена в избранное"}
 
 # ========== ЦИТАТЫ ==========
 @app.get("/api/documents/{document_id}/quotes")
