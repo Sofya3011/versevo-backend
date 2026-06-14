@@ -151,14 +151,7 @@ class LocalTranslator:
         return result
 
     def _apply_style(self, text: str, style: str) -> str:
-        if style == "artistic":
-            return f"🎨 {text}"
-        elif style == "formal":
-            return f"📄 {text}"
-        elif style == "academic":
-            return f"📚 {text}"
-        else:
-            return text
+        return text
 
     def translate(self, text: str, source_lang: str, target_lang: str, style: str = "artistic") -> str:
         if source_lang == target_lang:
@@ -202,12 +195,28 @@ class HuggingFaceTranslator:
             logger.error(f"❌ Ошибка инициализации переводчика: {e}")
 
     def _do_google_translate(self, text: str, source: str, target: str) -> str:
-        if self._google_translator:
-            try:
-                t = self._google_translator(source=source, target=target)
-                return t.translate(text)
-            except Exception as e:
-                logger.warning(f"⚠️ Google Translate error: {e}")
+        if not self._google_translator:
+            return ""
+        try:
+            t = self._google_translator(source=source, target=target)
+            result = t.translate(text)
+            if result and len(result) > 0:
+                return result
+        except Exception as e:
+            logger.warning(f"⚠️ Google Translate error: {e}")
+        if len(text) > 4000:
+            chunks = _split_sentences(text, 3000)
+            parts = []
+            for chunk in chunks:
+                try:
+                    t = self._google_translator(source=source, target=target)
+                    r = t.translate(chunk)
+                    if r:
+                        parts.append(r)
+                except Exception:
+                    pass
+            if parts:
+                return ' '.join(parts)
         return ""
 
     def translate(self, text: str, source_lang: str, target_lang: str, style: str = "artistic") -> str:
@@ -218,17 +227,27 @@ class HuggingFaceTranslator:
         if key not in supported_pairs:
             logger.warning(f"⚠️ Неподдерживаемая пара переводов: {key}")
             return self.fallback_translator.translate(text, source_lang, target_lang, style)
-        if len(text) > 1000:
-            original_len = len(text)
-            text = text[:1000]
-            logger.info(f"📝 Текст усечен с {original_len} до {len(text)} символов")
         logger.info(f"🔄 Перевод {len(text)} символов: {source_lang} → {target_lang}")
         try:
-            result = self._do_google_translate(text, source_lang, target_lang)
-            if result:
-                logger.info(f"✅ Перевод через Google API: {len(text)} → {len(result)} символов")
-                result = self.fallback_translator._apply_style(result, style)
-                return result
+            if len(text) <= 3000:
+                result = self._do_google_translate(text, source_lang, target_lang)
+                if result:
+                    logger.info(f"✅ Перевод: {len(text)} → {len(result)} символов")
+                    result = self.fallback_translator._apply_style(result, style)
+                    return result
+            else:
+                chunks = _split_sentences(text, 2000)
+                translated_parts = []
+                for i, chunk in enumerate(chunks):
+                    r = self._do_google_translate(chunk, source_lang, target_lang)
+                    if r:
+                        translated_parts.append(r)
+                    else:
+                        translated_parts.append(self.fallback_translator.translate(chunk, source_lang, target_lang, style))
+                if translated_parts:
+                    result = ' '.join(translated_parts)
+                    result = self.fallback_translator._apply_style(result, style)
+                    return result
         except Exception as e:
             logger.warning(f"⚠️ Google Translate error: {e}")
         logger.warning(f"⚠️ Использую fallback перевод для {key}")
@@ -466,18 +485,49 @@ def detect_language_safe(text: str) -> str:
     latin = sum(1 for c in text if 'a' <= c <= 'z' or 'A' <= c <= 'Z')
     return "ru" if cyrillic > latin * 1.5 else "en"
 
+def _split_sentences(text: str, max_chars: int = 1500) -> List[str]:
+    """Разбивает текст на части по границам предложений, не превышая max_chars"""
+    if len(text) <= max_chars:
+        return [text]
+    result = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        if end < len(text):
+            cut = text.rfind('. ', start, end)
+            if cut < start:
+                cut = text.rfind('! ', start, end)
+            if cut < start:
+                cut = text.rfind('? ', start, end)
+            if cut < start:
+                cut = text.rfind('\n\n', start, end)
+            if cut < start:
+                cut = end
+            else:
+                cut += 1
+        else:
+            cut = end
+        chunk = text[start:cut].strip()
+        if chunk:
+            result.append(chunk)
+        start = cut
+    if not result:
+        result = [text[:max_chars]]
+    return result
+
 def detect_chapters(text: str) -> List[Dict]:
     chapters = []
     if not text:
         return [{'title': 'Документ', 'content': 'Нет содержимого'}]
     text = re.sub(r'\n{3,}', '\n\n', text.strip())
     patterns = [
-        r'^\s*(?:ГЛАВА|Глава|Г\.)\s+[IVXLCDM\d]+[\.\s].*$',
-        r'^\s*(?:CHAPTER|Chapter|Ch\.)\s+[IVXLCDM\d]+[\.\s].*$',
-        r'^\s*[IVXLCDM\d]+[\.\)]\s+.*$',
-        r'^\s*\d+[\.\)]\s+.*$',
-        r'^\s*[A-Z][A-Z\s]{2,}[\.\?!]?$',
+        r'^\s*(?:(?:ГЛАВА|Глава|Гл\.?|CHAPTER|Chapter|Ch\.?|SECTION|Section|Sec\.?|РАЗДЕЛ|Раздел|PART|Part|ЧАСТЬ|Часть)\s*[\.:\s]*\s*[IVXLCDM\d]+[\.,:\s]*.*)$',
+        r'^\s*(?:[IVXLCDM]+[\.\)]\s+.*)$',
+        r'^\s*\d+[\.\)]\s+[A-ZА-Я].*$',
+        r'^\s*\d{1,2}\.\d{1,2}\s+.*$',
+        r'^\s*[A-ZА-Я][A-ZА-Я\s]{2,}[\.\?!]?$',
         r'^\s*.+\n[-=]{3,}$',
+        r'^\s*PROLOGUE|Prologue|EPILOGUE|Epilogue|FOREWORD|Foreword|INTRODUCTION|Introduction|ПРОЛОГ|Пролог|ЭПИЛОГ|Эпилог|ВВЕДЕНИЕ|Введение|ПРЕДИСЛОВИЕ|Предисловие$',
     ]
     paragraphs = text.split('\n\n')
     current_chapter = None
@@ -490,7 +540,7 @@ def detect_chapters(text: str) -> List[Dict]:
         if is_title:
             if current_chapter is not None and chapter_content:
                 chapters.append({'title': current_chapter, 'content': '\n\n'.join(chapter_content)})
-            current_chapter = paragraph[:100]
+            current_chapter = paragraph[:120]
             chapter_content = []
         else:
             if current_chapter is None:
@@ -707,24 +757,39 @@ async def translate_document(document_id: int, request: dict):
         if not content or len(content.strip()) < 10:
             raise HTTPException(status_code=400, detail="Документ пуст или не содержит текста для перевода")
 
-        chunk_size = 1000
-        chunks = [content[i:i + chunk_size] for i in range(0, len(content), chunk_size)]
-        translated_chunks = []
-        hf = _get_hf_translator()
-        local = _get_local_translator()
+        paragraphs = content.split('\n\n')
+        translated_paragraphs = []
+        hf = hf_translator
+        local = local_translator
+        total = len(paragraphs)
 
-        for i, chunk in enumerate(chunks):
-            if not chunk.strip():
+        for i, para in enumerate(paragraphs):
+            para = para.strip()
+            if not para:
+                translated_paragraphs.append('')
                 continue
-            logger.info(f"🔄 Перевод чанка {i + 1}/{len(chunks)} ({len(chunk)} символов)")
-            use_hf = hf.is_available(source_lang if source_lang != "auto" else "en", target_lang)
-            if use_hf:
-                translated = hf.translate(chunk, source_lang if source_lang != "auto" else detect_language_safe(chunk), target_lang)
+            if len(para) <= 2000:
+                logger.info(f"🔄 Перевод абзаца {i + 1}/{total} ({len(para)} символов)")
+                use_hf = hf.is_available(source_lang if source_lang != "auto" else "en", target_lang)
+                if use_hf:
+                    translated = hf.translate(para, source_lang if source_lang != "auto" else detect_language_safe(para), target_lang)
+                else:
+                    translated = local.translate(para, source_lang if source_lang != "auto" else detect_language_safe(para), target_lang)
+                translated_paragraphs.append(translated)
             else:
-                translated = local.translate(chunk, source_lang if source_lang != "auto" else detect_language_safe(chunk), target_lang)
-            translated_chunks.append(translated)
+                chunks = _split_sentences(para, 1500)
+                para_translated = []
+                for j, chunk in enumerate(chunks):
+                    logger.info(f"🔄 Перевод абзаца {i + 1}/{total}, часть {j + 1}/{len(chunks)} ({len(chunk)} символов)")
+                    use_hf = hf.is_available(source_lang if source_lang != "auto" else "en", target_lang)
+                    if use_hf:
+                        translated = hf.translate(chunk, source_lang if source_lang != "auto" else detect_language_safe(chunk), target_lang)
+                    else:
+                        translated = local.translate(chunk, source_lang if source_lang != "auto" else detect_language_safe(chunk), target_lang)
+                    para_translated.append(translated)
+                translated_paragraphs.append(' '.join(para_translated))
 
-        translated_content = " ".join(translated_chunks)
+        translated_content = '\n\n'.join(translated_paragraphs)
         new_id = current_doc_id + 1
         import copy
         td = copy.deepcopy(doc)
