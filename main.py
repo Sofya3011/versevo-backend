@@ -1,3 +1,9 @@
+"""Versevo Backend API v5.2 — Оптимизированная версия
+- Ленивая загрузка transformers/torch/nltk — старт за <1 сек
+- Все модели HuggingFace загружаются только при первом запросе
+- Добавлен /api/warmup для Railway
+"""
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -52,7 +58,7 @@ class ChatRequest(BaseModel):
     language: str = "ru"
 
 # ========== APP ==========
-app = FastAPI(title="Versevo Backend API", version="5.1.0")
+app = FastAPI(title="Versevo Backend API", version="5.2.0")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
@@ -70,21 +76,14 @@ PORT = int(os.getenv("PORT", 8080))
 documents_store = {}
 current_doc_id = 1
 
-# Флаги ленивой инициализации
-_hf_loaded = False
-_nltk_loaded = False
-_hf_translator = None
-_local_translator = None
+# Глобальные экземпляры переводчиков (ленивая инициализация)
+hf_translator = None
+local_translator = None
 
 # ========== ЛОКАЛЬНЫЙ ПЕРЕВОДЧИК (лёгкий, без зависимостей) ==========
-def _get_local_translator():
-    global _local_translator
-    if _local_translator is None:
-        _local_translator = _LocalTranslator()
-    return _local_translator
-
-class _LocalTranslator:
+class LocalTranslator:
     def __init__(self):
+        logger.info("🌍 Инициализация локального переводчика (fallback)")
         self.translation_dict = {
             'en-ru': {
                 'hello': 'привет', 'world': 'мир', 'book': 'книга',
@@ -113,9 +112,14 @@ class _LocalTranslator:
             }
         }
 
+    def _apply_style(self, text: str, style: str = "artistic") -> str:
+        if style == "artistic" or not text:
+            return text
+        return text
+
     def translate(self, text: str, source_lang: str, target_lang: str, style: str = "artistic") -> str:
         if source_lang == target_lang:
-            return text
+            return self._apply_style(text, style)
         if len(text) > 800:
             text = text[:800] + "..."
         key = f"{source_lang}-{target_lang}"
@@ -133,23 +137,26 @@ class _LocalTranslator:
             result = ' '.join(translated)
             result = re.sub(r'\s+([.,!?;:])', r'\1', result)
             result = re.sub(r'\s+', ' ', result).strip()
-            return result
-        return text
+            return self._apply_style(result, style)
+        return self._apply_style(text, style)
 
-# ========== HF ПЕРЕВОДЧИК (ленивая загрузка) ==========
-def _get_hf_translator():
-    global _hf_translator
-    if _hf_translator is None:
-        _hf_translator = _HFTranslator()
-    return _hf_translator
 
-class _HFTranslator:
+def _get_local_translator():
+    global local_translator
+    if local_translator is None:
+        local_translator = LocalTranslator()
+    return local_translator
+
+# ========== НАСТОЯЩИЙ ПЕРЕВОДЧИК HUGGING FACE (ленивая загрузка) ==========
+class HuggingFaceTranslator:
     def __init__(self):
-        self._pipelines = {}
-        self._model_configs = {
-            'en-ru': {'model': 'Helsinki-NLP/opus-mt-en-ru', 'max_length': 400},
-            'ru-en': {'model': 'Helsinki-NLP/opus-mt-ru-en', 'max_length': 400},
+        logger.info("🌍 Инициализация настоящего переводчика Hugging Face")
+        self.translation_pipelines = {
+            'en-ru': None,
+            'ru-en': None,
         }
+        self.fallback_translator = _get_local_translator()
+        self.model_configs = {}
         self._loaded = False
 
     def _ensure_loaded(self):
@@ -158,56 +165,111 @@ class _HFTranslator:
         try:
             from transformers import pipeline
             import torch
-            self._device = 0 if torch.cuda.is_available() else -1
+            device = 0 if torch.cuda.is_available() else -1
+            device_name = "CUDA" if torch.cuda.is_available() else "CPU"
+            self.model_configs = {
+                'en-ru': {
+                    'model': 'Helsinki-NLP/opus-mt-en-ru',
+                    'description': 'Перевод English → Russian',
+                    'max_length': 400
+                },
+                'ru-en': {
+                    'model': 'Helsinki-NLP/opus-mt-ru-en',
+                    'description': 'Перевод Russian → English',
+                    'max_length': 400
+                }
+            }
+            self._device = device
             self._loaded = True
-            logger.info("HF translator ready")
+            logger.info(f"✅ Переводчик Hugging Face готов (устройство: {device_name})")
         except ImportError:
-            logger.warning("transformers not installed, using local translator only")
+            logger.warning("⚠️ transformers не установлен, используется только локальный переводчик")
+            self._loaded = False
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации переводчика: {e}")
             self._loaded = False
 
-    def _get_pipeline(self, key: str):
-        if key in self._pipelines:
-            return self._pipelines[key]
-        self._ensure_loaded()
-        if not self._loaded or key not in self._model_configs:
+    def _get_translation_pipeline(self, source_lang: str, target_lang: str):
+        key = f"{source_lang}-{target_lang}"
+        if key not in self.translation_pipelines:
             return None
-        try:
-            from transformers import pipeline
-            cfg = self._model_configs[key]
-            logger.info(f"Loading translation model {cfg['model']}...")
-            self._pipelines[key] = pipeline(
-                "translation", model=cfg['model'],
-                device=self._device, max_length=cfg['max_length']
-            )
-            logger.info(f"Model {cfg['model']} loaded")
-            return self._pipelines[key]
-        except Exception as e:
-            logger.error(f"Failed to load translation model: {e}")
-            return None
+        if self.translation_pipelines[key] is None:
+            self._ensure_loaded()
+            if not self._loaded:
+                return None
+            try:
+                from transformers import pipeline
+                if key in self.model_configs:
+                    model_config = self.model_configs[key]
+                    logger.info(f"🔄 Загрузка модели перевода {key} ({model_config['model']})...")
+                    self.translation_pipelines[key] = pipeline(
+                        "translation",
+                        model=model_config['model'],
+                        device=self._device,
+                        max_length=model_config['max_length']
+                    )
+                    logger.info(f"✅ Модель перевода {key} загружена")
+                else:
+                    return None
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки модели перевода {key}: {e}")
+                return None
+        return self.translation_pipelines[key]
 
     def translate(self, text: str, source_lang: str, target_lang: str, style: str = "artistic") -> str:
         if source_lang == target_lang:
-            return text
+            return self.fallback_translator._apply_style(text, style)
+
+        supported_pairs = ['en-ru', 'ru-en']
         key = f"{source_lang}-{target_lang}"
-        pipe = self._get_pipeline(key)
-        if pipe is None:
-            return _get_local_translator().translate(text, source_lang, target_lang, style)
+
+        if key not in supported_pairs:
+            logger.warning(f"⚠️ Неподдерживаемая пара переводов: {key}")
+            return self.fallback_translator.translate(text, source_lang, target_lang, style)
+
         try:
+            pipeline = self._get_translation_pipeline(source_lang, target_lang)
+            if pipeline is None:
+                logger.warning(f"⚠️ Pipeline перевода {key} не загружен, используется fallback")
+                return self.fallback_translator.translate(text, source_lang, target_lang, style)
+
             if len(text) > 1000:
+                original_len = len(text)
                 text = text[:1000]
-            result = pipe(text, max_length=400, truncation=True)
+                logger.info(f"📝 Текст усечен с {original_len} до {len(text)} символов")
+
+            logger.info(f"🔄 Перевод {len(text)} символов: {source_lang} → {target_lang}")
+            result = pipeline(text, max_length=400, truncation=True)
+
             if result and len(result) > 0:
-                return result[0].get('translation_text', text)
+                translated_text = result[0].get('translation_text', text)
+                logger.info(f"✅ Перевод завершен: {len(text)} → {len(translated_text)} символов")
+                translated_text = self.fallback_translator._apply_style(translated_text, style)
+                return translated_text
+            else:
+                logger.warning(f"⚠️ Переводчик вернул пустой результат для {key}")
+                return self.fallback_translator.translate(text, source_lang, target_lang, style)
+
         except Exception as e:
-            logger.error(f"HF translate error: {e}")
-        return _get_local_translator().translate(text, source_lang, target_lang, style)
+            logger.error(f"❌ Ошибка перевода {key}: {e}")
+            return self.fallback_translator.translate(text, source_lang, target_lang, style)
 
     def is_available(self, source_lang: str, target_lang: str) -> bool:
         key = f"{source_lang}-{target_lang}"
-        if key not in self._model_configs:
+        if key not in ['en-ru', 'ru-en']:
             return False
         self._ensure_loaded()
-        return self._loaded and self._get_pipeline(key) is not None
+        if not self._loaded or key not in self.model_configs:
+            return False
+        pipeline = self._get_translation_pipeline(source_lang, target_lang)
+        return pipeline is not None
+
+
+def _get_hf_translator():
+    global hf_translator
+    if hf_translator is None:
+        hf_translator = HuggingFaceTranslator()
+    return hf_translator
 
 # ========== HF АНАЛИЗ (ленивая загрузка) ==========
 _hf_analysis_ready = False
@@ -231,13 +293,13 @@ def _ensure_hf_analysis():
             for task, cfg in models.items()
         }
         _hf_analysis_ready = True
-        logger.info("HF analysis initialized (lazy loading)")
+        logger.info("🧠 HF analysis initialized (lazy loading)")
         return True
     except ImportError:
-        logger.warning("transformers not available for analysis")
+        logger.warning("⚠️ transformers not available for analysis")
         return False
     except Exception as e:
-        logger.error(f"HF analysis init error: {e}")
+        logger.error(f"❌ HF analysis init error: {e}")
         return False
 
 def _get_hf_analysis_pipeline(task: str):
@@ -252,7 +314,7 @@ def _get_hf_analysis_pipeline(task: str):
         import torch
         device = 0 if torch.cuda.is_available() else -1
         cfg = _hf_analysis_pipelines[task]
-        logger.info(f"Loading analysis model {cfg['model_name']}...")
+        logger.info(f"🔄 Loading analysis model {cfg['model_name']}...")
         if task == "summarization":
             pipe = pipeline("summarization", model=cfg["model_name"],
                           tokenizer=cfg["model_name"], device=device,
@@ -263,10 +325,10 @@ def _get_hf_analysis_pipeline(task: str):
         else:
             pipe = pipeline(cfg["task"], model=cfg["model_name"], device=device)
         _hf_analysis_pipelines[task]["pipeline"] = pipe
-        logger.info(f"Model {cfg['model_name']} loaded")
+        logger.info(f"✅ Model {cfg['model_name']} loaded")
         return pipe
     except Exception as e:
-        logger.error(f"Failed to load analysis model {task}: {e}")
+        logger.error(f"❌ Failed to load analysis model {task}: {e}")
         return None
 
 # ========== NLTK (ленивая загрузка) ==========
@@ -287,8 +349,10 @@ def _ensure_nltk():
         except LookupError:
             nltk.download('stopwords', quiet=True)
         _nltk_available = True
+        logger.info("📚 NLTK загружен")
         return True
     except ImportError:
+        logger.warning("⚠️ nltk not installed")
         return False
 
 # ========== УТИЛИТЫ ==========
@@ -371,8 +435,8 @@ def detect_chapters(text: str) -> List[Dict]:
 @app.get("/")
 async def root():
     return {
-        "message": "Versevo Backend API v5.1",
-        "version": "5.1.0",
+        "message": "Versevo Backend API v5.2",
+        "version": "5.2.0",
         "status": "running",
         "timestamp": datetime.now().isoformat(),
     }
@@ -383,13 +447,12 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "versevo-backend",
-        "version": "5.1.0",
+        "version": "5.2.0",
         "timestamp": datetime.now().isoformat(),
     }
 
 @app.get("/api/warmup")
 async def warmup():
-    """Для Railway: держит контейнер в памяти, не даёт заснуть."""
     return {"status": "warm", "timestamp": datetime.now().isoformat()}
 
 # ========== AI HEALTH ==========
@@ -411,33 +474,50 @@ async def upload_document_base64(request: dict):
     try:
         filename = request.get("filename", "unknown.txt")
         file_data = request.get("file_data", "")
+
         if not file_data:
             raise HTTPException(status_code=400, detail="No file data provided")
+
         content_bytes = base64.b64decode(file_data)
         file_id = str(uuid.uuid4())
         ext = filename.split('.')[-1].lower() if '.' in filename else 'txt'
         file_path = f"{UPLOAD_FOLDER}/{file_id}.{ext}"
+
         os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
         with open(file_path, "wb") as f:
             f.write(content_bytes)
+
         content_str = extract_text_from_file(file_path, ext)
+
         if not content_str or content_str.strip() == "":
-            content_str = f"Документ: {filename}\nТип: {ext}\n\nСодержимое недоступно."
+            content_str = f"Документ: {filename}\nТип: {ext}\n\nСодержимое недоступно для автоматического извлечения."
+
         language = detect_language_safe(content_str)
         chapters = detect_chapters(content_str)
+
         word_count = len(content_str.split())
         char_count = len(content_str)
         reading_time = max(1, word_count // 200)
+
         doc = {
-            "id": current_doc_id, "filename": filename, "content": content_str,
-            "language": language, "file_type": ext, "file_path": file_path,
-            "file_id": file_id, "word_count": word_count, "char_count": char_count,
-            "chapter_count": len(chapters), "reading_time_minutes": reading_time,
-            "created_at": datetime.now().isoformat(), "updated_at": datetime.now().isoformat(),
+            "id": current_doc_id, "filename": filename,
+            "original_filename": filename,
+            "content": content_str, "language": language,
+            "file_type": ext, "file_path": file_path,
+            "file_id": file_id, "word_count": word_count,
+            "char_count": char_count, "chapter_count": len(chapters),
+            "reading_time_minutes": reading_time,
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
             "chapters": chapters,
         }
+
         documents_store[current_doc_id] = doc
         current_doc_id += 1
+
+        logger.info(f"✅ Документ загружен: {filename} (ID: {doc['id']}, слов: {word_count})")
+
         return {
             "id": doc["id"], "filename": doc["filename"],
             "language": doc["language"], "file_type": doc["file_type"],
@@ -445,9 +525,11 @@ async def upload_document_base64(request: dict):
             "chapter_count": doc["chapter_count"],
             "reading_time_minutes": doc["reading_time_minutes"],
             "created_at": doc["created_at"],
+            "content_preview": doc["content"][:300] + "..." if len(doc["content"]) > 300 else doc["content"],
         }
+
     except Exception as e:
-        logger.error(f"Upload error: {e}")
+        logger.error(f"❌ Upload error: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.get("/api/documents")
@@ -495,24 +577,41 @@ async def translate_text(request: TranslateRequest):
     try:
         if not request.text or len(request.text.strip()) == 0:
             raise HTTPException(status_code=400, detail="Text is empty")
+
         source_lang = request.source_language
         if not source_lang or source_lang == "auto":
             source_lang = detect_language_safe(request.text)
+
         target_lang = request.target_language
+
         hf = _get_hf_translator()
-        used_hf = hf.is_available(source_lang, target_lang)
-        if used_hf:
-            translated = hf.translate(request.text, source_lang, target_lang, request.style)
+        use_huggingface = hf.is_available(source_lang, target_lang)
+
+        if use_huggingface:
+            logger.info(f"🔄 Используем Hugging Face перевод: {source_lang} → {target_lang}")
+            translated_text = hf.translate(request.text, source_lang, target_lang, request.style)
+            translation_service = "huggingface"
         else:
-            translated = _get_local_translator().translate(request.text, source_lang, target_lang, request.style)
+            logger.info(f"🔄 Используем fallback перевод: {source_lang} → {target_lang}")
+            translated_text = _get_local_translator().translate(request.text, source_lang, target_lang, request.style)
+            translation_service = "fallback"
+
         return {
-            "translated_text": translated,
+            "original_text": request.text,
+            "translated_text": translated_text,
             "source_language": source_lang,
             "target_language": target_lang,
-            "translation_service": "huggingface" if used_hf else "fallback",
+            "style": request.style,
+            "translation_service": translation_service,
+            "original_length": len(request.text),
+            "translated_length": len(translated_text),
+            "huggingface_used": use_huggingface,
         }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Translate error: {e}")
+        logger.error(f"❌ Translate error: {e}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
 # ========== БАЗОВЫЙ АНАЛИЗ ==========
@@ -623,7 +722,7 @@ async def analyze_with_ai(request: AIAnalysisRequest):
                         ai["ai_analysis"] = True
                         ai["fallback"] = False
                 except Exception as e:
-                    logger.warning(f"Sentiment error: {e}")
+                    logger.warning(f"⚠️ Sentiment error: {e}")
             if len(content.split()) > 150:
                 summ_pipe = _get_hf_analysis_pipeline("summarization")
                 if summ_pipe:
@@ -638,7 +737,7 @@ async def analyze_with_ai(request: AIAnalysisRequest):
                                 ai["ai_analysis"] = True
                                 ai["fallback"] = False
                     except Exception as e:
-                        logger.warning(f"Summarization error: {e}")
+                        logger.warning(f"⚠️ Summarization error: {e}")
             ner_pipe = _get_hf_analysis_pipeline("ner")
             if ner_pipe:
                 try:
@@ -668,7 +767,7 @@ async def analyze_with_ai(request: AIAnalysisRequest):
                         ai["ai_analysis"] = True
                         ai["fallback"] = False
                 except Exception as e:
-                    logger.warning(f"NER error: {e}")
+                    logger.warning(f"⚠️ NER error: {e}")
         wc = len(content.split())
         sc = len(re.split(r'[.!?]+', content))
         ws = "Академический" if wc > 5000 else "Литературный" if sc > 0 and wc / sc > 25 else "Информационный"
@@ -702,7 +801,7 @@ async def analyze_with_ai(request: AIAnalysisRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"AI analysis error: {e}")
+        logger.error(f"❌ AI analysis error: {e}")
         return {
             "document_id": request.document_id,
             "summary": "Ошибка AI-анализа. Используйте базовый анализ.",
@@ -787,36 +886,89 @@ async def chat_ask(request: ChatRequest):
 # ========== АУТЕНТИФИКАЦИЯ ==========
 @app.post("/api/auth/login")
 async def login_user(request: LoginRequest):
-    if not request.email or "@" not in request.email:
-        raise HTTPException(status_code=400, detail="Invalid email")
-    if not request.password:
-        raise HTTPException(status_code=400, detail="Password required")
-    return {
-        "status": "success",
-        "token": f"demo_token_{int(datetime.now().timestamp())}",
-        "user": {"id": 1, "email": request.email, "username": request.email.split("@")[0]},
-        "demo_mode": True,
-    }
+    try:
+        logger.info(f"🔐 Вход пользователя: {request.email}")
+
+        if not request.email or "@" not in request.email:
+            raise HTTPException(status_code=400, detail="Invalid email format")
+
+        if not request.password or len(request.password) < 1:
+            raise HTTPException(status_code=400, detail="Password required")
+
+        return {
+            "status": "success",
+            "message": "Login successful",
+            "token": f"demo_token_{int(datetime.now().timestamp())}",
+            "user": {
+                "id": 1,
+                "email": request.email,
+                "username": request.email.split("@")[0],
+                "created_at": datetime.now().isoformat(),
+            },
+            "timestamp": datetime.now().isoformat(),
+            "demo_mode": True
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Ошибка логина: {e}")
+        raise HTTPException(status_code=500, detail=f"Login error: {str(e)}")
 
 @app.post("/api/auth/register")
 async def register_user(request: RegisterRequest):
-    if not request.email or "@" not in request.email:
-        raise HTTPException(status_code=400, detail="Invalid email")
-    if not request.username or len(request.username) < 2:
-        raise HTTPException(status_code=400, detail="Username too short")
-    if not request.password:
-        raise HTTPException(status_code=400, detail="Password required")
-    return {
-        "status": "success",
-        "token": f"demo_token_{int(datetime.now().timestamp())}",
-        "user": {"id": 2, "email": request.email, "username": request.username},
-        "demo_mode": True,
-    }
+    try:
+        logger.info(f"📝 Регистрация: {request.email} ({request.username})")
+
+        if not request.email or "@" not in request.email:
+            raise HTTPException(status_code=400, detail="Invalid email format")
+
+        if not request.username or len(request.username) < 2:
+            raise HTTPException(status_code=400, detail="Username must be at least 2 characters")
+
+        if not request.password or len(request.password) < 1:
+            raise HTTPException(status_code=400, detail="Password required")
+
+        return {
+            "status": "success",
+            "message": "Registration successful",
+            "token": f"demo_token_{int(datetime.now().timestamp())}",
+            "user": {
+                "id": 2,
+                "email": request.email,
+                "username": request.username,
+                "created_at": datetime.now().isoformat(),
+            },
+            "timestamp": datetime.now().isoformat(),
+            "demo_mode": True
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Ошибка регистрации: {e}")
+        raise HTTPException(status_code=500, detail=f"Registration error: {str(e)}")
 
 @app.get("/api/auth/check")
 async def check_auth(token: str):
-    valid = token and token.startswith("demo_token_")
-    return {"status": "success" if valid else "error", "valid": valid, "demo_mode": True}
+    try:
+        if token and token.startswith("demo_token_"):
+            return {
+                "status": "success",
+                "valid": True,
+                "demo_mode": True,
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            return {
+                "status": "error",
+                "valid": False,
+                "message": "Invalid token format",
+                "timestamp": datetime.now().isoformat()
+            }
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки токена: {e}")
+        raise HTTPException(status_code=500, detail=f"Auth check failed: {str(e)}")
 
 @app.post("/api/auth/logout")
 async def logout_user():
@@ -852,5 +1004,5 @@ async def get_document_quotes(document_id: int, limit: int = 5):
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Versevo API v5.1 on port {PORT}")
+    logger.info(f"🚀 Starting Versevo API v5.2 on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info", access_log=True)
