@@ -1,0 +1,40 @@
+name: versevo_app
+description: "VERSEVO Production App"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.9.0 <4.0.0'
+  flutter: '>=3.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mysql_client: ^0.0.27
+  cupertino_icons: ^1.0.6
+  bloc: ^8.1.4
+  flutter_bloc: ^8.1.6
+  equatable: ^2.0.5
+  dio: ^5.4.0
+  http: ^1.2.1
+  shared_preferences: ^2.2.5
+  sqflite: ^2.3.0
+  path: ^1.9.0
+  google_fonts: ^6.1.0
+  file_picker: ^8.1.4
+  crypto: ^3.0.3
+  image_picker: ^1.0.4
+  path_provider: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  bloc_test: ^9.1.5
+  mockito: ^5.4.2
+
+flutter:
+  uses-material-design: true
+  # assets:
+  #   - assets/images/
+  #   - assets/icons/
