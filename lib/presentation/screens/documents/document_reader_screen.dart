@@ -2276,15 +2276,18 @@ class _DocumentReaderScreenState extends State<DocumentReaderScreen> {
                                         color: isActive ? _buttonColor.withValues(alpha: 0.4) : _textColor.withValues(alpha: 0.08),
                                       ),
                                     ),
-                                    child: Text(
-                                      lh == 1.2 ? 'Плотный' :
-                                      lh == 1.5 ? 'Средний' :
-                                      lh == 1.8 ? 'Обычный' :
-                                      lh == 2.0 ? 'Просторный' : 'Широкий',
-                                      style: GoogleFonts.inter(
-                                        fontSize: 10,
-                                        fontWeight: FontWeight.w600,
-                                        color: isActive ? _buttonColor : _textColor.withValues(alpha: 0.6),
+                                    child: FittedBox(
+                                      fit: BoxFit.scaleDown,
+                                      child: Text(
+                                        lh == 1.2 ? 'Плотный' :
+                                        lh == 1.5 ? 'Средний' :
+                                        lh == 1.8 ? 'Обычный' :
+                                        lh == 2.0 ? 'Свободный' : 'Широкий',
+                                        style: GoogleFonts.inter(
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w600,
+                                          color: isActive ? _buttonColor : _textColor.withValues(alpha: 0.6),
+                                        ),
                                       ),
                                     ),
                                   ),

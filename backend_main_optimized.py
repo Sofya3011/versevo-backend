@@ -1112,13 +1112,26 @@ def _generate_chat_answer(document: dict, question: str) -> str:
         return "Пожалуйста! Если будут ещё вопросы — обращайтесь."
     if any(w in q for w in ['пока', 'до свидан', 'бай']):
         return "До свидания! Если понадобится помощь — я здесь."
-    if any(w in q for w in ['помощь', 'помоги', 'хелп', 'help']):
-        return (f"Вот что я умею с документом «{title}»:\n"
-                f"• О чём этот документ? — краткое содержание\n"
-                f"• Выдели основные тезисы — главные мысли\n"
-                f"• Какие персонажи упоминаются? — имена\n"
-                f"• Найди абзац про... — поиск по тексту\n"
-                f"• Какой стиль? — анализ написания")
+
+    snippet = content[:min(1200, len(content))]
+    prompt = (
+        f"Ты полезный AI-ассистент по документу «{title}». Ответь на русском языке кратко и по делу.\n\n"
+        f"Контекст документа (первые 1200 слов):\n{snippet}\n\n"
+        f"Вопрос: {question}\n\nОтвет:"
+    )
+    ai_answer = _call_hf_api(prompt, max_tokens=350)
+    if ai_answer:
+        cleaned = ai_answer
+        for prefix in ['Ответ:', 'ответ:', 'Assistant:', 'assistant:']:
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):].strip()
+        lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
+        cleaned = '\n'.join(lines)
+        if len(cleaned) > 800:
+            cleaned = cleaned[:800]
+        if cleaned:
+            return cleaned
+
     if any(w in q for w in ['статист', 'слов', 'сколько', 'объем', 'объём']):
         avg_len = wc / len(sentences) if sentences else 0
         return (f"📊 Статистика «{title}»:\n\n"
@@ -1126,21 +1139,11 @@ def _generate_chat_answer(document: dict, question: str) -> str:
                 f"Предложений: {len(sentences)}\n"
                 f"Средняя длина предложения: {avg_len:.1f} слов\n"
                 f"Время чтения: {max(1, wc // 200)} мин")
-
     if any(w in q for w in ['о чём', 'о чем', 'суть', 'содержание', 'кратко']):
         key = [s.strip() for s in sentences if 30 < len(s.strip()) < 300][:4]
         if key:
             return f"📄 Документ «{title}» — {wc} слов.\n\nКраткое содержание:\n\n" + "\n\n".join(f"{i+1}. {s}" for i, s in enumerate(key))
         return f"📄 Документ «{title}» содержит {wc} слов.\n\n{content[:400]}..."
-    if any(w in q for w in ['тезис', 'главн', 'основн', 'темы', 'иде']):
-        key = [s.strip() for s in sentences if 40 < len(s.strip()) < 250][:6]
-        if len(key) >= 2:
-            return f"📌 Основные тезисы «{title}»:\n\n" + "\n\n".join(f"{i+1}. {s}" for i, s in enumerate(key))
-    if any(w in q for w in ['персонаж', 'герой', 'кто', 'люди', 'человек']):
-        names = re.findall(r'\b[А-Я][а-я]+\b', content[:3000])
-        unique = list(dict.fromkeys(n for n in names if len(n) > 1 and n not in ['Это','Что','Как','Для','Они','Мы','Вы','Она','Он','Глава']))
-        if unique:
-            return f"👥 В документе «{title}» упоминаются: {', '.join(unique[:10])}."
     if any(w in q for w in ['найди', 'найти', 'поиск', 'абзац', 'где']):
         search = re.sub(r'(найди|найти|поиск|абзац|про|где|мне|пожалуйста)\s*', '', question, flags=re.IGNORECASE).strip()
         if len(search) > 2:
@@ -1150,29 +1153,6 @@ def _generate_chat_answer(document: dict, question: str) -> str:
                 end = min(len(content), idx + len(search) + 250)
                 return f"🔍 По запросу «{search}»:\n\n...{content[start:end]}..."
             return f"🔍 По запросу «{search}» ничего не найдено."
-    if any(w in q for w in ['жанр', 'стиль', 'как написан']):
-        avg_len = wc / len(sentences) if sentences else 0
-        style = 'Литурный / Академический' if avg_len > 25 else 'Художественный / Описательный' if avg_len > 15 else 'Разговорный / Информационный'
-        return f"📝 Стиль «{title}»: {style}\nСредняя длина предложения: {avg_len:.1f} слов\nВсего предложений: {len(sentences)}\nОбъём: {wc} слов"
-
-    snippet = content[:600]
-    prompt = (
-        f"Ты полезный ассистент. Ответь на русском языке естественно и по делу.\n\n"
-        f"Контекст документа «{title}» (первые 600 слов):\n{snippet}\n\n"
-        f"Вопрос: {question}\n\nОтвет:"
-    )
-    ai_answer = _call_hf_api(prompt, max_tokens=250)
-    if ai_answer:
-        cleaned = ai_answer
-        for prefix in ['Ответ:', 'ответ:', 'Assistant:', 'assistant:']:
-            if cleaned.startswith(prefix):
-                cleaned = cleaned[len(prefix):].strip()
-        lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
-        cleaned = '\n'.join(lines)
-        if len(cleaned) > 500:
-            cleaned = cleaned[:500]
-        if cleaned:
-            return cleaned
 
     return (f"📖 Документ «{title}» — {wc} слов.\n\n"
             f"Попробуйте задать вопрос конкретнее:\n"
