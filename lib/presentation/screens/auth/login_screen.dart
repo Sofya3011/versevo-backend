@@ -290,6 +290,77 @@ class _LoginScreenState extends State<LoginScreen> {
                                 ),
                               ),
                             ],
+                            const SizedBox(height: 20),
+                            Row(
+                              children: [
+                                const Expanded(
+                                  child: Divider(
+                                    color: Colors.white24,
+                                  ),
+                                ),
+                                Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                  ),
+                                  child: Text(
+                                    'или',
+                                    style: GoogleFonts.inter(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.7,
+                                      ),
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                ),
+                                const Expanded(
+                                  child: Divider(
+                                    color: Colors.white24,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 20),
+                            SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton.icon(
+                                onPressed: state is AuthLoading
+                                    ? null
+                                    : () {
+                                        context
+                                            .read<AuthBloc>()
+                                            .add(AuthGoogleLoginEvent());
+                                      },
+                                icon: Image.asset(
+                                  'assets/google_logo.png',
+                                  height: 20,
+                                  errorBuilder: (context, error, stack) =>
+                                      const Icon(
+                                    Icons.g_mobiledata,
+                                    color: Colors.white,
+                                    size: 24,
+                                  ),
+                                ),
+                                label: Text(
+                                  'Войти через Google',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                style: OutlinedButton.styleFrom(
+                                  side: BorderSide(
+                                    color: Colors.white.withValues(alpha: 0.4),
+                                  ),
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 14,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14),
+                                  ),
+                                  foregroundColor: Colors.white,
+                                ),
+                              ),
+                            ),
                             const SizedBox(height: 28),
                             Text(
                               'Нет аккаунта?',

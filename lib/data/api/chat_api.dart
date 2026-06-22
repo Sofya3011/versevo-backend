@@ -7,14 +7,28 @@ class ChatApi {
   final Dio _hfDio;
   static const String _hfApiKey = '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';
 
-  ChatApi() : _dio = ApiClient.getInstance().dio, _hfDio = Dio(BaseOptions(
-    connectTimeout: const Duration(seconds: 120),
-    receiveTimeout: const Duration(seconds: 180),
-    headers: {
-      'Authorization': 'Bearer $_hfApiKey',
-      'Content-Type': 'application/json',
-    },
-  )) {
+  /// Models that work reliably on HF free Inference API
+  /// flan-t5-xl (3B) — best balance of capability & availability
+  /// flan-t5-large (780M) — reliable fallback
+  /// flan-t5-base (250M) — last resort
+  static const _models = [
+    'google/flan-t5-xl',
+    'google/flan-t5-large',
+    'google/flan-t5-base',
+  ];
+
+  String? _cachedContent;
+
+  ChatApi()
+      : _dio = ApiClient.getInstance().dio,
+        _hfDio = Dio(BaseOptions(
+          connectTimeout: const Duration(seconds: 120),
+          receiveTimeout: const Duration(seconds: 180),
+          headers: {
+            'Authorization': 'Bearer $_hfApiKey',
+            'Content-Type': 'application/json',
+          },
+        )) {
     _dio.options.connectTimeout = const Duration(seconds: 10);
     _dio.options.receiveTimeout = const Duration(seconds: 20);
   }
@@ -23,50 +37,115 @@ class ChatApi {
     required int documentId,
     required String question,
     String? documentContent,
+    List<Map<String, String>> conversationHistory = const [],
   }) async {
-    String? answer;
-
+    // 1. Try backend first — best connectivity to HF API
     try {
-      final response = await _dio.post(
-        '/api/chat/ask',
-        data: {
-          'document_id': documentId,
-          'question': question,
-        },
-        options: Options(
-          sendTimeout: const Duration(seconds: 15),
-          receiveTimeout: const Duration(seconds: 30),
-        ),
-      ).timeout(const Duration(seconds: 35), onTimeout: () {
-        throw TimeoutException('Сервер не отвечает. Попробуйте позже.');
+      final response = await _dio
+          .post(
+            '/api/chat/ask',
+            data: {
+              'document_id': documentId,
+              'question': question,
+              'history': conversationHistory,
+            },
+            options: Options(
+              sendTimeout: const Duration(seconds: 15),
+              receiveTimeout: const Duration(seconds: 30),
+            ),
+          )
+          .timeout(const Duration(seconds: 35), onTimeout: () {
+        throw TimeoutException('backed timeout');
       });
 
       if (response.statusCode == 200 && response.data is Map) {
         final data = response.data as Map<String, dynamic>;
-        answer = data['answer']?.toString() ?? '';
+        final answer = data['answer']?.toString() ?? '';
         if (answer.isNotEmpty && !_isTemplateResponse(answer)) return answer;
       }
     } catch (_) {}
 
+    // 2. Fallback: fetch content and call HF directly
     if (documentContent == null || documentContent.isEmpty) {
-      documentContent = await _fetchDocumentContent(documentId);
+      if (_cachedContent != null) {
+        documentContent = _cachedContent;
+      } else {
+        documentContent = await _fetchDocumentContent(documentId);
+        _cachedContent = documentContent;
+      }
     }
 
-    answer = await _askWithFallback(documentContent, question);
-    if (answer != null && answer.isNotEmpty) return answer;
+    final cleanContent = _stripImages(documentContent ?? '');
+    final contextChunk = _extractRelevantContext(cleanContent, question);
 
-    return _smartFallback(question);
+    final hfAnswer = await _askHuggingFace(contextChunk, question, conversationHistory);
+    if (hfAnswer != null && hfAnswer.isNotEmpty) return hfAnswer;
+
+    // 3. If both fail — deep document analysis fallback
+    return _deepFallback(cleanContent, question);
+  }
+
+  String _extractRelevantContext(String content, String question) {
+    if (content.length <= 1500) return content;
+
+    final paragraphs = content.split('\n\n').where((p) => p.trim().length > 20).toList();
+    if (paragraphs.isEmpty) return content.substring(0, 1500);
+
+    final keywords = question
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^\w\sа-яё]'), '')
+        .split(RegExp(r'\s+'))
+        .where((w) => w.length > 2)
+        .toList();
+
+    if (keywords.isEmpty) return content.substring(0, 1500);
+
+    final scored = <int>[];
+    for (int i = 0; i < paragraphs.length; i++) {
+      final lower = paragraphs[i].toLowerCase();
+      int score = 0;
+      for (final kw in keywords) {
+        if (lower.contains(kw)) score += kw.length;
+      }
+      if (score > 0) scored.add(i);
+    }
+
+    if (scored.isEmpty) return content.substring(0, 1500);
+
+    final included = <int>{};
+    for (final idx in scored) {
+      included.add(idx);
+      if (idx > 0) included.add(idx - 1);
+      if (idx < paragraphs.length - 1) included.add(idx + 1);
+    }
+
+    final selected = included.toList()..sort();
+    final buffer = StringBuffer();
+    int chars = 0;
+    for (final idx in selected) {
+      final add = paragraphs[idx];
+      if (chars + add.length > 1500) break;
+      buffer.writeln(add);
+      buffer.writeln();
+      chars += add.length;
+    }
+
+    final result = buffer.toString().trim();
+    if (result.length < 200) return content.substring(0, 1500);
+    return result;
   }
 
   Future<String?> _fetchDocumentContent(int documentId) async {
     try {
-      final response = await _dio.get(
-        '/api/documents/$documentId',
-        options: Options(
-          sendTimeout: const Duration(seconds: 60),
-          receiveTimeout: const Duration(seconds: 90),
-        ),
-      ).timeout(const Duration(seconds: 120));
+      final response = await _dio
+          .get(
+            '/api/documents/$documentId',
+            options: Options(
+              sendTimeout: const Duration(seconds: 60),
+              receiveTimeout: const Duration(seconds: 90),
+            ),
+          )
+          .timeout(const Duration(seconds: 120));
 
       if (response.statusCode == 200 && response.data is Map) {
         final data = response.data as Map<String, dynamic>;
@@ -79,18 +158,48 @@ class ChatApi {
     return null;
   }
 
-  Future<String?> _askWithFallback(String? content, String question) async {
-    String? hfAnswer;
+  Future<String?> _askHuggingFace(
+    String contextChunk,
+    String question,
+    List<Map<String, String>> history,
+  ) async {
+    for (final model in _models) {
+      try {
+        final prompt = _buildPrompt(contextChunk, question, history);
+        final response = await _callHF(model, prompt);
+        if (response == null || response.isEmpty) continue;
+        final cleaned = _cleanFlanResult(response, prompt);
+        if (cleaned.length > 5) return cleaned;
+      } catch (e) {
+        print('HF chat error [$model]: $e');
+      }
+    }
+    return null;
+  }
 
-    if (content != null && content.isNotEmpty) {
-      hfAnswer = await _askHuggingFace(content, question);
-      if (hfAnswer != null && hfAnswer.isNotEmpty) return hfAnswer;
+  /// Simple prompt that flan-t5 models understand reliably
+  String _buildPrompt(
+    String contextChunk,
+    String question,
+    List<Map<String, String>> history,
+  ) {
+    final buf = StringBuffer();
+
+    buf.writeln('Ответь на вопрос по тексту документа на русском языке.');
+    buf.writeln('Анализируй текст: выдели главные темы, тезисы, факты, персонажей, статистику если есть.');
+    buf.writeln('Если информации недостаточно, чётко скажи чего именно не хватает.');
+    buf.writeln();
+
+    if (contextChunk.isNotEmpty) {
+      buf.writeln('Текст документа:');
+      buf.writeln(contextChunk);
+      buf.writeln();
     }
 
-    hfAnswer = await _askHuggingFace('', question);
-    if (hfAnswer != null && hfAnswer.isNotEmpty) return hfAnswer;
+    buf.writeln('Вопрос: $question');
+    buf.writeln('Ответ:');
 
-    return null;
+    return buf.toString();
   }
 
   String _stripImages(String text) {
@@ -100,61 +209,31 @@ class ChatApi {
     text = text.replaceAll(RegExp(r'!\[([^\]]*)\]\(([^)]*)\)'), '');
     text = text.replaceAll(RegExp(r'!\s*\[([^\]]*)\]\s*\(([^)]*)\)'), '');
     text = text.replaceAll(RegExp(r'data:image/[a-zA-Z]+(?:;base64)?,[^\s\)]+', caseSensitive: false), '');
-    text = text.replaceAll(RegExp(r'\S+\.(png|jpg|jpeg|gif|svg|webp|bmp|ico|tiff?)(\?[^\s]*)?', caseSensitive: false), '');
+    text = text.replaceAll(
+        RegExp(r'\S+\.(png|jpg|jpeg|gif|svg|webp|bmp|ico|tiff?)(\?[^\s]*)?', caseSensitive: false), '');
     text = text.replaceAll(RegExp(r'\[image:[^\]]*\]', caseSensitive: false), '');
     text = text.replaceAll(RegExp(r'\(image:[^)]*\)', caseSensitive: false), '');
     text = text.replaceAll(RegExp(r'^\s*image\.(png|jpg|jpeg|gif)\s*$', caseSensitive: false, multiLine: true), '');
     return text.trim();
   }
 
-  Future<String?> _askHuggingFace(String content, String question) async {
-    content = _stripImages(content);
-
-    if (content.length > 800) content = content.substring(0, 800);
-
-    const models = [
-      'google/flan-t5-base',
-      'google/flan-t5-small',
-      'google/flan-t5-large',
-    ];
-
-    for (final model in models) {
-      try {
-        final prompt = content.isNotEmpty
-            ? 'Ты полезный ассистент. Ответь на русском языке естественно.\n\n'
-                'Контекст: $content\n\n'
-                'Вопрос: $question\n\n'
-                'Ответ:'
-            : 'Ты полезный ассистент. Ответь на русском языке естественно.\n\n'
-                'Вопрос: $question\n\n'
-                'Ответ:';
-
-        final response = await _callHF(model, prompt, maxTokens: 300);
-        if (response == null || response.isEmpty) continue;
-
-        final cleaned = _cleanResult(response, prompt);
-        if (cleaned.length > 3) return cleaned;
-      } catch (e) {
-        print('HF chat error [$model]: $e');
-      }
-    }
-
-    return null;
-  }
-
-  Future<String?> _callHF(String model, String prompt, {int maxTokens = 300}) async {
-    for (int attempt = 0; attempt < 8; attempt++) {
+  Future<String?> _callHF(String model, String prompt) async {
+    for (int attempt = 0; attempt < 6; attempt++) {
       try {
         final response = await _hfDio.post(
           'https://api-inference.huggingface.co/models/$model',
           data: {
             'inputs': prompt,
             'parameters': {
-              'max_new_tokens': maxTokens,
+              'max_new_tokens': 350,
               'temperature': 0.7,
               'do_sample': true,
             },
           },
+          options: Options(
+            sendTimeout: const Duration(seconds: 60),
+            receiveTimeout: const Duration(seconds: 120),
+          ),
         );
 
         if (response.statusCode == 503) {
@@ -193,12 +272,13 @@ class ChatApi {
     return null;
   }
 
-  String _cleanResult(String raw, String prompt) {
+  String _cleanFlanResult(String raw, String prompt) {
     var result = raw.trim();
     int idx = result.indexOf(prompt);
     if (idx >= 0) {
       result = result.substring(idx + prompt.length).trim();
     }
+
     const prefixes = ['Ответ:', 'ответ:', 'Assistant:', 'assistant:'];
     for (final p in prefixes) {
       if (result.startsWith(p)) {
@@ -206,21 +286,13 @@ class ChatApi {
         break;
       }
     }
+
     result = result.split('\n').where((l) => l.trim().isNotEmpty).join('\n').trim();
-    if (result.length > 500) result = result.substring(0, 500);
+    if (result.length > 2000) result = result.substring(0, 2000);
     return result;
   }
 
-  bool _isTemplateResponse(String text) {
-    final lower = text.toLowerCase();
-    return lower.contains('чтобы получить точный ответ') ||
-        lower.contains('попробуйте:') ||
-        lower.contains('найди абзац про') ||
-        lower.contains('выдели основные тезисы') ||
-        (lower.contains('документ') && lower.contains('слов') && lower.contains('попробуйте'));
-  }
-
-  String _smartFallback(String question) {
+  String _deepFallback(String content, String question) {
     final q = question.toLowerCase().trim();
 
     if (q.contains('привет') || q.contains('здравств') || q.contains('хай') || q == 'hello' || q == 'hi') {
@@ -232,16 +304,102 @@ class ChatApi {
     if (q.contains('спасиб') || q.contains('благодар')) {
       return 'Пожалуйста! Если будут ещё вопросы — обращайся.';
     }
-    if (q.contains('как дела') || q.contains('норм')) {
-      return 'У меня всё отлично! Готов помочь с анализом документов. Что будем смотреть?';
-    }
     if (q.contains('пока') || q.contains('до свидан')) {
       return 'До свидания! Если понадобится помощь — я здесь.';
     }
-    if (q.contains('что ты умеешь') || q.contains('как ты работаешь')) {
-      return 'Я умею:\n• Отвечать на вопросы по тексту документа\n• Выделять главные темы и идеи\n• Пересказывать содержание\n• Анализировать тон и стиль\n• Находить ключевые моменты\n\nПросто задай вопрос по документу!';
+
+    if (content.isEmpty) {
+      return 'Документ пуст или недоступен для чтения. Сначала загрузите документ.';
     }
 
-    return 'Я не нашёл информации в тексте документа по вашему вопросу. Попробуйте переформулировать или спросить о конкретном содержании документа.';
+    final sentences = content
+        .split(RegExp(r'(?<=[.!?])\s+'))
+        .map((s) => s.trim())
+        .where((s) => s.length > 20)
+        .toList();
+    final words = content.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).toList();
+    final wordCount = words.length;
+
+    if (q.contains('о чём') || q.contains('о чем') || q.contains('суть') || q.contains('содержание') || q.contains('кратко') || q.contains('главн') || q.contains('тезис') || q.contains('иде')) {
+      final keySentences = sentences.where((s) => s.length > 40 && s.length < 400).take(5).toList();
+      if (keySentences.isNotEmpty) {
+        return '📄 Документ ($wordCount слов, ${sentences.length} предложений)\n\n'
+            'Ключевые фрагменты:\n\n'
+            '${keySentences.asMap().entries.map((e) => '${e.key + 1}. ${e.value}').join('\n\n')}';
+      }
+      return '📄 Документ содержит $wordCount слов, ${sentences.length} предложений. Задайте более конкретный вопрос.';
+    }
+
+    if (q.contains('тема') || q.contains('персонаж') || q.contains('герой') || q.contains('упомин')) {
+      final keywords = q
+          .replaceAll(RegExp(r'какие|каких|кто|главные|основные'), '')
+          .split(RegExp(r'\s+'))
+          .where((w) => w.length > 3)
+          .toList();
+      final keySentences = sentences.where((s) {
+        final lower = s.toLowerCase();
+        return keywords.any((kw) => lower.contains(kw));
+      }).take(4).toList();
+
+      if (keySentences.isNotEmpty) {
+        return 'По вашему запросу:\n\n${keySentences.asMap().entries.map((e) => '${e.key + 1}. ${e.value}').join('\n\n')}';
+      }
+      return 'В тексте документа не удалось найти информацию по вашему запросу. Попробуйте уточнить вопрос.';
+    }
+
+    if (q.contains('статист') || q.contains('слов') || q.contains('сколько') || q.contains('объем') || q.contains('объём')) {
+      final avgLen = sentences.isNotEmpty ? wordCount / sentences.length : 0;
+      return '📊 Статистика документа:\n\n'
+          '• Слов: $wordCount\n'
+          '• Предложений: ${sentences.length}\n'
+          '• Средняя длина: ${avgLen.toStringAsFixed(1)} слов\n'
+          '• Время чтения: ${(wordCount / 200).ceil()} мин';
+    }
+
+    if ((q.contains('найди') || q.contains('найти') || q.contains('поиск') || q.contains('абзац') || q.contains('где')) && q.length > 6) {
+      final search = q
+          .replaceAll(RegExp(r'(найди|найти|поиск|абзац|про|где|мне|пожалуйста)'), '')
+          .trim();
+      if (search.length > 2) {
+        final idx = content.toLowerCase().indexOf(search);
+        if (idx != -1) {
+          final start = (idx - 150).clamp(0, content.length);
+          final end = (idx + search.length + 250).clamp(0, content.length);
+          return '🔍 По запросу «$search»:\n\n...${content.substring(start, end)}...';
+        }
+        return '🔍 По запросу «$search» ничего не найдено.';
+      }
+    }
+
+    if (q.contains('перескаж') || q.contains('резюм') || q.contains(' summary') || q.contains('кратк')) {
+      final firstSentences = sentences.take(5).toList();
+      if (firstSentences.isNotEmpty) {
+        return 'Краткое содержание:\n\n${firstSentences.map((s) => '• $s').join('\n')}';
+      }
+    }
+
+    final questionWords = q.split(RegExp(r'\s+')).where((w) => w.length > 3).toList();
+    final matching = sentences.where((s) {
+      final lower = s.toLowerCase();
+      return questionWords.any((w) => lower.contains(w));
+    }).take(4).toList();
+
+    if (matching.isNotEmpty) {
+      return 'По вашему вопросу:\n\n${matching.asMap().entries.map((e) => '${e.key + 1}. ${e.value}').join('\n\n')}';
+    }
+
+    return 'По вашему вопросу не удалось найти информацию в тексте документа. '
+        'Попробуйте:\n'
+        '• «О чём этот документ?»\n'
+        '• «Выдели основные тезисы»\n'
+        '• «Найди абзац про ...»\n'
+        '• «Какая статистика?»';
+  }
+
+  bool _isTemplateResponse(String text) {
+    final lower = text.toLowerCase();
+    return lower.contains('попробуйте задать вопрос конкретнее') ||
+        lower.contains('не удалось найти информацию') ||
+        lower.contains('не найдено');
   }
 }

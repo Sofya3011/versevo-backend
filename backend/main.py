@@ -12,6 +12,7 @@ import re
 import json
 import requests as http_requests
 from datetime import datetime
+import jwt as pyjwt
 from collections import Counter
 from enum import Enum
 
@@ -49,10 +50,15 @@ class AnalysisType(str, Enum):
     DETAILED = "detailed"
     FULL = "full"
 
+class ChatHistoryItem(BaseModel):
+    role: str = "user"
+    content: str = ""
+
 class ChatRequest(BaseModel):
     document_id: int
     question: str
     language: str = "ru"
+    history: List[ChatHistoryItem] = []
 
 # ===== APP =====
 app = FastAPI(title="Versevo Backend API", version="5.1.0")
@@ -453,9 +459,9 @@ def _similarity(s1: str, s2: str) -> float:
 
 # ===== CHAT =====
 _HF_API_KEY = os.getenv("HF_API_KEY", "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")
-_HF_MODELS = ["google/flan-t5-base", "google/flan-t5-small"]
+_HF_MODELS = ["google/flan-t5-xl", "google/flan-t5-large", "google/flan-t5-base"]
 
-def _call_hf_api(prompt: str, max_tokens: int = 300) -> str:
+def _call_hf_api(prompt: str, max_tokens: int = 350) -> str:
     for model in _HF_MODELS:
         for attempt in range(3):
             try:
@@ -463,7 +469,7 @@ def _call_hf_api(prompt: str, max_tokens: int = 300) -> str:
                     f"https://api-inference.huggingface.co/models/{model}",
                     headers={"Authorization": f"Bearer {_HF_API_KEY}", "Content-Type": "application/json"},
                     json={"inputs": prompt, "parameters": {"max_new_tokens": max_tokens, "temperature": 0.7, "do_sample": True}},
-                    timeout=30,
+                    timeout=60,
                 )
                 if resp.status_code == 503:
                     import time; time.sleep(2 + attempt * 2)
@@ -479,36 +485,121 @@ def _call_hf_api(prompt: str, max_tokens: int = 300) -> str:
                 break
     return ""
 
-def _generate_chat_answer(document: dict, question: str) -> str:
+def _extract_relevant_context(content: str, question: str, max_chars: int = 1500) -> str:
+    clean = re.sub(r'<[iI][mM][gG]\b[^>]*>', '', content)
+    clean = re.sub(r'!\[([^\]]*)\]\(([^)]*)\)', '', clean)
+    if len(clean) <= max_chars:
+        return clean
+    paragraphs = [p.strip() for p in clean.split('\n\n') if len(p.strip()) > 20]
+    if not paragraphs:
+        return clean[:max_chars]
+    keywords = [w.lower() for w in re.sub(r'[^\w\sа-яё]', '', question).split() if len(w) > 2]
+    if not keywords:
+        return clean[:max_chars]
+    scored = []
+    for i, para in enumerate(paragraphs):
+        lower = para.lower()
+        score = sum(len(kw) for kw in keywords if kw in lower)
+        if score > 0:
+            scored.append(i)
+    if not scored:
+        return clean[:max_chars]
+    included = set()
+    for idx in scored:
+        included.add(idx)
+        if idx > 0: included.add(idx - 1)
+        if idx < len(paragraphs) - 1: included.add(idx + 1)
+    selected = sorted(included)
+    result_parts = []
+    chars = 0
+    for idx in selected:
+        if chars + len(paragraphs[idx]) > max_chars:
+            break
+        result_parts.append(paragraphs[idx])
+        chars += len(paragraphs[idx])
+    result = '\n\n'.join(result_parts)
+    if len(result) < 200:
+        return clean[:max_chars]
+    return result
+
+def _build_chat_prompt(document: dict, question: str, history: list) -> str:
     content = document.get("content", "")
-    title = document.get("filename", "документ")
+    context_chunk = _extract_relevant_context(content, question)
+    lines = []
+    lines.append("Ответь на вопрос по тексту документа на русском языке.")
+    lines.append("Анализируй текст: выдели главные темы, тезисы, факты, персонажей, статистику если есть.")
+    lines.append("Если информации недостаточно, чётко скажи чего именно не хватает.")
+    lines.append("")
+    if context_chunk:
+        lines.append("Текст документа:")
+        lines.append(context_chunk)
+        lines.append("")
+    for msg in history[-4:]:
+        role = "Пользователь" if msg.get("role") == "user" else "Ассистент"
+        lines.append(f"{role}: {msg.get('content', '')}")
+    lines.append("")
+    lines.append(f"Вопрос: {question}")
+    lines.append("Ответ:")
+    return "\n".join(lines)
+
+def _deep_fallback(content: str, question: str) -> str:
     q = question.lower().strip()
+    if q in ['привет', 'здравствуй', 'хай', 'hello', 'hi'] or any(w in q for w in ['привет', 'здравствуй', 'хай']):
+        return "Привет! Я AI-ассистент для анализа документов. Могу ответить на вопросы по тексту, помочь с пересказом или выделить главные мысли."
+    if any(w in q for w in ['кто ты', 'что ты', 'ты кто']):
+        return "Я AI-ассистент для работы с документами. Могу анализировать текст, отвечать на вопросы по содержанию, выделять ключевые моменты."
+    if any(w in q for w in ['спасибо', 'благодар', 'спс']):
+        return "Пожалуйста! Если будут ещё вопросы — обращайтесь."
     if not content or len(content.strip()) < 10:
-        return f"Документ «{title}» пуст или недоступен для чтения."
+        return "Документ пуст или недоступен для чтения."
     words = content.split()
     word_count = len(words)
-    sentences = re.split(r'(?<=[.!?])\s+', content)
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', content) if len(s.strip()) > 20]
+    if any(w in q for w in ['о чём', 'о чем', 'суть', 'содержание', 'кратко', 'главн', 'тезис', 'иде']):
+        key = sentences[:5] if len(sentences) > 5 else sentences
+        if key:
+            return "📄 Документ ({} слов, {} предл.)\n\nКлючевые фрагменты:\n\n{}".format(
+                word_count, len(sentences),
+                "\n\n".join(f"{i+1}. {s}" for i, s in enumerate(key)))
+        return f"📄 Документ содержит {word_count} слов."
+    if any(w in q for w in ['статист', 'слов', 'сколько', 'объем', 'объём']):
+        avg = word_count / len(sentences) if sentences else 0
+        return f"📊 Статистика:\n• Слов: {word_count}\n• Предложений: {len(sentences)}\n• Средняя длина: {avg:.1f} слов\n• Время чтения: {max(1, word_count // 200)} мин"
+    if any(w in q for w in ['найди', 'найти', 'поиск', 'абзац', 'где']) and len(q) > 6:
+        search = re.sub(r'(найди|найти|поиск|абзац|про|где|мне|пожалуйста)\s*', '', q, flags=re.IGNORECASE).strip()
+        if len(search) > 2:
+            idx = content.lower().find(search)
+            if idx != -1:
+                start = max(0, idx - 150)
+                end = min(len(content), idx + len(search) + 250)
+                return f"🔍 По запросу «{search}»:\n\n...{content[start:end]}..."
+            return f"🔍 По запросу «{search}» ничего не найдено."
+    kw = [w for w in q.split() if len(w) > 3]
+    if kw:
+        matching = [s for s in sentences if any(k in s.lower() for k in kw)][:4]
+        if matching:
+            return "По вашему вопросу:\n\n" + "\n\n".join(f"{i+1}. {s}" for i, s in enumerate(matching))
+    return ("По вашему вопросу не удалось найти информацию в тексте. "
+            "Попробуйте:\n• «О чём этот документ?»\n• «Выдели основные тезисы»\n"
+            "• «Найди абзац про ...»\n• «Какая статистика?»")
+
+def _generate_chat_answer(document: dict, question: str, history: list = None) -> str:
+    if history is None:
+        history = []
+    content = document.get("content", "")
+    q = question.lower().strip()
 
     if any(w in q for w in ['привет', 'здравствуй', 'хай', 'hello', 'hi']):
-        return f"Привет! Я AI-ассистент по документу «{title}». Задайте любой вопрос по содержанию — постараюсь помочь!"
-    if any(w in q for w in ['кто ты', 'что ты', 'ты кто', 'что ты умеешь', 'как ты работаешь']):
-        return (f"Я AI-ассистент для работы с документом «{title}».\n\n"
-                f"• Отвечаю на вопросы по тексту\n"
-                f"• Выделяю ключевые тезисы и темы\n"
-                f"• Нахожу нужные абзацы\n"
-                f"• Анализирую стиль и тональность\n\n"
-                f"Просто спросите!")
+        return "Привет! Я AI-ассистент. Задайте любой вопрос по документу."
     if any(w in q for w in ['спасибо', 'благодар', 'спс', 'сенкс']):
-        return "Пожалуйста! Если будут ещё вопросы — обращайтесь."
+        return "Пожалуйста! Обращайтесь."
     if any(w in q for w in ['пока', 'до свидан', 'бай']):
-        return "До свидания! Если понадобится помощь — я здесь."
+        return "До свидания!"
 
-    snippet = content[:min(1200, len(content))]
-    prompt = (
-        f"Ты полезный AI-ассистент по документу «{title}». Ответь на русском языке кратко и по делу.\n\n"
-        f"Контекст документа (первые 1200 слов):\n{snippet}\n\n"
-        f"Вопрос: {question}\n\nОтвет:"
-    )
+    if not content or len(content.strip()) < 10:
+        return "Документ пуст или недоступен для чтения."
+
+    prompt = _build_chat_prompt(document, question, history)
     ai_answer = _call_hf_api(prompt, max_tokens=350)
     if ai_answer:
         cleaned = ai_answer
@@ -517,40 +608,12 @@ def _generate_chat_answer(document: dict, question: str) -> str:
                 cleaned = cleaned[len(prefix):].strip()
         lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
         cleaned = '\n'.join(lines)
-        if len(cleaned) > 800:
-            cleaned = cleaned[:800]
-        if cleaned:
+        if len(cleaned) > 2000:
+            cleaned = cleaned[:2000]
+        if cleaned and len(cleaned) > 5:
             return cleaned
 
-    if any(w in q for w in ['статист', 'слов', 'сколько', 'объем', 'объём']):
-        avg_len = word_count / len(sentences) if sentences else 0
-        return (f"📊 Статистика «{title}»:\n\n"
-                f"Слов: {word_count}\n"
-                f"Предложений: {len(sentences)}\n"
-                f"Средняя длина предложения: {avg_len:.1f} слов\n"
-                f"Время чтения: {max(1, word_count // 200)} мин")
-    if any(w in q for w in ['о чём', 'о чем', 'суть', 'содержание', 'кратко']):
-        key = [s.strip() for s in sentences if 30 < len(s.strip()) < 300][:4]
-        if key:
-            return (f"📄 Документ «{title}» — {word_count} слов.\n\nКраткое содержание:\n\n" +
-                    "\n\n".join(f"{i+1}. {s}" for i, s in enumerate(key)))
-        return f"📄 Документ «{title}» содержит {word_count} слов.\n\n{content[:400]}..."
-    if any(w in q for w in ['найди', 'найти', 'поиск', 'абзац', 'где']):
-        search = re.sub(r'(найди|найти|поиск|абзац|про|где|мне|пожалуйста)\s*', '', question, flags=re.IGNORECASE).strip()
-        if len(search) > 2:
-            idx = content.lower().find(search.lower())
-            if idx != -1:
-                start = max(0, idx - 150)
-                end = min(len(content), idx + len(search) + 250)
-                return f"🔍 По запросу «{search}»:\n\n...{content[start:end]}..."
-            return f"🔍 По запросу «{search}» ничего не найдено."
-
-    return (f"📖 Документ «{title}» — {word_count} слов.\n\n"
-            f"Попробуйте задать вопрос конкретнее:\n"
-            f"• «О чём этот документ?»\n"
-            f"• «Выдели основные тезисы»\n"
-            f"• «Какие персонажи упоминаются?»\n"
-            f"• «Найди абзац про...»")
+    return _deep_fallback(content, question)
 
 # ===== ANALYSIS =====
 def _perform_basic_analysis(text: str) -> Dict[str, Any]:
@@ -714,7 +777,8 @@ async def chat_ask(request: ChatRequest):
         if request.document_id not in documents_store:
             raise HTTPException(status_code=404, detail="Document not found")
         doc = documents_store[request.document_id]
-        answer = _generate_chat_answer(doc, request.question)
+        history = [{"role": h.role, "content": h.content} for h in request.history] if request.history else []
+        answer = _generate_chat_answer(doc, request.question, history)
         if _hf_available and len(doc.get("content", "")) > 100:
             try:
                 if any(w in request.question.lower() for w in ['тональность', 'настроение', 'эмоциональн']):
@@ -837,6 +901,75 @@ async def get_document_quotes(document_id: int, limit: int = 5):
         return {"document_id": document_id, "quotes": unique_quotes[:limit], "count": len(unique_quotes[:limit]), "ai_analysis": False, "fallback": False}
     except Exception as e:
         return {"document_id": document_id, "quotes": ["Цитаты временно недоступны"], "count": 1, "ai_analysis": False, "fallback": True}
+
+# ===== GOOGLE AUTH =====
+GOOGLE_CLIENT_ID = os.getenv(
+    "GOOGLE_CLIENT_ID",
+    "30105034886-bhnig8s826vllv54q9kiglusqq9647lb.apps.googleusercontent.com",
+)
+
+GOOGLE_CERTS_URL = "https://www.googleapis.com/oauth2/v1/certs"
+
+def _verify_google_token(id_token: str) -> dict:
+    try:
+        certs_resp = http_requests.get(GOOGLE_CERTS_URL, timeout=10)
+        certs = certs_resp.json()
+        unverified = pyjwt.decode(
+            id_token, options={"verify_signature": False}
+        )
+        kid = unverified.get("kid", "")
+        if kid not in certs:
+            raise HTTPException(status_code=401, detail="Invalid token key")
+        public_key = certs[kid]
+        decoded = pyjwt.decode(
+            id_token,
+            public_key,
+            algorithms=["RS256"],
+            audience=GOOGLE_CLIENT_ID,
+        )
+        return decoded
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=401, detail=f"Token verification failed: {str(e)}"
+        )
+
+
+@app.post("/api/auth/google")
+async def google_login(request: dict):
+    try:
+        id_token = request.get("id_token", "")
+        if not id_token:
+            raise HTTPException(
+                status_code=400, detail="Missing id_token"
+            )
+        payload = _verify_google_token(id_token)
+        google_id = payload.get("sub", "")
+        email = payload.get("email", "")
+        name = payload.get("name", email.split("@")[0] if email else "user")
+        user_id = hash(google_id) % 1000000
+        return {
+            "status": "success",
+            "message": "Google login successful",
+            "token": f"google_token_{google_id}_{int(datetime.now().timestamp())}",
+            "user": {
+                "id": user_id,
+                "email": email,
+                "username": name,
+                "created_at": datetime.now().isoformat(),
+            },
+            "timestamp": datetime.now().isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Google login error: {str(e)}"
+        )
+
 
 # ===== AUTH =====
 @app.post("/api/auth/login")

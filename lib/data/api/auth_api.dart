@@ -1,8 +1,12 @@
 import 'package:dio/dio.dart';
 import 'package:versevo_app/data/api/api_client.dart';
 import 'package:versevo_app/data/models/user_model.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 
 class AuthApi {
+  static const String _googleWebClientId =
+      '30105034886-bhnig8s826vllv54q9kiglusqq9647lb.apps.googleusercontent.com';
+
   final Dio _dio = ApiClient.getInstance().dio;
 
   // Моковые данные для пользователей
@@ -148,9 +152,55 @@ class AuthApi {
     }
   }
 
+  Future<UserModel> loginWithGoogle() async {
+    try {
+      final GoogleSignIn googleSignIn = GoogleSignIn(
+        serverClientId: _googleWebClientId.isNotEmpty
+            ? _googleWebClientId
+            : null,
+      );
+      final GoogleSignInAccount? account = await googleSignIn.signIn();
+      if (account == null) {
+        throw 'Вход через Google отменён';
+      }
+
+      final GoogleSignInAuthentication auth =
+          await account.authentication;
+      final String? idToken = auth.idToken;
+      if (idToken == null) {
+        throw 'Не удалось получить токен Google';
+      }
+
+      final response = await _dio.post(
+        '/api/auth/google',
+        data: {'id_token': idToken},
+        options: Options(
+          validateStatus: (status) => status! < 500,
+        ),
+      );
+
+      if (response.statusCode == 200) {
+        final user = UserModel.fromJson(response.data);
+        _mockUsers.removeWhere((u) => u.email == user.email);
+        _mockUsers.add(user);
+        return user;
+      } else {
+        throw response.data['detail'] ?? 'Ошибка входа через Google';
+      }
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data is Map) {
+        throw e.response!.data['detail'] ?? 'Ошибка сервера';
+      }
+      throw 'Ошибка сети: ${e.message}';
+    } catch (e) {
+      rethrow;
+    }
+  }
+
   Future<void> logout() async {
     try {
       print('👋 Выход из системы');
+      await GoogleSignIn().signOut();
       await Future.delayed(const Duration(milliseconds: 300));
     } catch (e) {
       print('⚠️ Ошибка выхода: $e');

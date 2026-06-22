@@ -18,6 +18,7 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
     on<AuthRegisterEvent>(_onRegister);
     on<AuthLogoutEvent>(_onLogout);
     on<AuthCheckStatusEvent>(_onCheckStatus);
+    on<AuthGoogleLoginEvent>(_onGoogleLogin);
   }
 
   Future<void> _onLogin(
@@ -97,6 +98,25 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
       emit(AuthFailure(error: e.toString()));
     }
   }
+  Future<void> _onGoogleLogin(
+      AuthGoogleLoginEvent event,
+      Emitter<AuthState> emit,
+      ) async {
+    emit(AuthLoading());
+    try {
+      final user = await _authApi.loginWithGoogle();
+
+      await _prefs.setString('auth_token', user.token ?? '');
+      await _prefs.setString('user_email', user.email);
+      await _prefs.setString('user_username', user.username);
+      await _prefs.setInt('user_id', user.id);
+
+      emit(AuthSuccess(user: user));
+    } catch (e) {
+      emit(AuthFailure(error: e.toString()));
+    }
+  }
+
   Future<void> _onCheckStatus(
       AuthCheckStatusEvent event,
       Emitter<AuthState> emit,

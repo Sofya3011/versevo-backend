@@ -22,6 +22,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   final DocumentApi _documentApi = DocumentApi();
   final TranslationApi _translationApi = TranslationApi();
   List<DocumentModel> _documents = [];
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   bool _isLoading = true;
   bool _isOpeningDocument = false;
   String? _errorMessage;
@@ -45,16 +46,22 @@ class _LibraryScreenState extends State<LibraryScreen> {
     try {
       final documents = await _documentApi.getDocuments();
       if (mounted) {
-        setState(() {
-          _documents = documents;
-          _isLoading = false;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          setState(() {
+            _documents = documents;
+            _isLoading = false;
+          });
         });
       }
     } catch (e) {
       if (mounted) {
-        setState(() {
-          _errorMessage = e.toString();
-          _isLoading = false;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          setState(() {
+            _errorMessage = e.toString();
+            _isLoading = false;
+          });
         });
       }
     }
@@ -284,6 +291,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     return Scaffold(
+      key: _scaffoldKey,
       backgroundColor: colorScheme.surface,
       appBar: AppBar(
         title: Text('Моя библиотека', style: GoogleFonts.inter(fontWeight: FontWeight.w600)),
@@ -301,19 +309,28 @@ class _LibraryScreenState extends State<LibraryScreen> {
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _navigateToUploadScreen,
-        backgroundColor: colorScheme.primary,
-        tooltip: 'Загрузить документ',
-        child: const Icon(Icons.upload_file, color: Colors.white),
+      floatingActionButton: null,
+      body: Stack(
+        children: [
+          _isLoading
+              ? const Center(child: CircularProgressIndicator())
+              : _errorMessage != null
+                  ? _buildErrorView(colorScheme)
+                  : _documents.isEmpty
+                      ? _buildEmptyView(colorScheme)
+                      : _buildContent(colorScheme),
+          Positioned(
+            right: 16,
+            bottom: 16,
+            child: FloatingActionButton(
+              onPressed: _navigateToUploadScreen,
+              backgroundColor: colorScheme.primary,
+              tooltip: 'Загрузить документ',
+              child: const Icon(Icons.upload_file, color: Colors.white),
+            ),
+          ),
+        ],
       ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : _errorMessage != null
-              ? _buildErrorView(colorScheme)
-              : _documents.isEmpty
-                  ? _buildEmptyView(colorScheme)
-                  : _buildContent(colorScheme),
     );
   }
 

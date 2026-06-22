@@ -939,7 +939,9 @@ class _DocumentReaderScreenState extends State<DocumentReaderScreen> {
 
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (_scrollController.hasClients) {
-            _scrollController.jumpTo(progress.scrollPosition);
+            try {
+              _scrollController.jumpTo(progress.scrollPosition.clamp(0.0, _scrollController.position.maxScrollExtent));
+            } catch (_) {}
           }
         });
       }
@@ -2793,210 +2795,216 @@ class _DocumentReaderScreenState extends State<DocumentReaderScreen> {
           ),
         ),
       ),
-      child: Row(
-        children: [
-          IconButton(
-            icon: Icon(
-              Icons.chevron_left,
-              color: _textColor.withValues(
-                alpha: _currentChapterIndex > 0 ? 1.0 : 0.3,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: [
+            IconButton(
+              icon: Icon(
+                Icons.chevron_left,
+                color: _textColor.withValues(
+                  alpha: _currentChapterIndex > 0 ? 1.0 : 0.3,
+                ),
               ),
+              onPressed: _currentChapterIndex > 0
+                  ? () {
+                      setState(() {
+                        _currentChapterIndex--;
+                        _showTranslation = false;
+                        _translatedContent = null;
+                      });
+                      _scrollController.jumpTo(0);
+                    }
+                  : null,
+              tooltip: 'Предыдущая глава',
+              splashRadius: 18,
+              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+              padding: EdgeInsets.zero,
             ),
-            onPressed: _currentChapterIndex > 0
-                ? () {
-                    setState(() {
-                      _currentChapterIndex--;
-                      _showTranslation = false;
-                      _translatedContent = null;
-                    });
-                    _scrollController.jumpTo(0);
-                  }
-                : null,
-            tooltip: 'Предыдущая глава',
-            splashRadius: 18,
-            constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
-            padding: EdgeInsets.zero,
-          ),
-          Expanded(
-            child: GestureDetector(
-              onTap: () {
-                final renderBox = context.findRenderObject() as RenderBox;
-                showMenu<int>(
-                  context: context,
-                  position: RelativeRect.fromRect(
-                    Rect.fromLTWH(
-                      60,
-                      kToolbarHeight + 4,
-                      renderBox.size.width - 120,
-                      0,
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: GestureDetector(
+                onTap: () {
+                  final RenderBox? renderBox = context.findRenderObject() as RenderBox?;
+                  if (renderBox?.hasSize != true) return;
+                  final double menuWidth = (renderBox!.size.width - 120).clamp(160, 400);
+                  showMenu<int>(
+                    context: context,
+                    position: RelativeRect.fromRect(
+                      Rect.fromLTWH(
+                        60,
+                        kToolbarHeight + 4,
+                        menuWidth,
+                        0,
+                      ),
+                      Offset.zero & renderBox.size,
                     ),
-                    Offset.zero & renderBox.size,
-                  ),
-                  color: _isDarkMode ? const Color(0xFF2A2A3E) : Colors.white,
-                  elevation: 8,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  items: List.generate(_totalChapters, (index) {
-                    final chapters = widget.document.chapters.isNotEmpty
-                        ? widget.document.chapters
-                        : _autoChapters;
-                    final chapterTitle =
-                        chapters[index]['title']?.toString() ??
-                        'Глава ${index + 1}';
-                    final isCurrent = index == _currentChapterIndex;
-                    return PopupMenuItem<int>(
-                      value: index,
-                      child: Row(
-                        children: [
-                          Container(
-                            width: 24,
-                            height: 24,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: isCurrent
-                                  ? _buttonColor
-                                  : Colors.grey[200],
-                            ),
-                            child: Center(
-                              child: Text(
-                                '${index + 1}',
-                                style: GoogleFonts.inter(
-                                  color: isCurrent
-                                      ? Colors.white
-                                      : Colors.grey[600],
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
+                    color: _isDarkMode ? const Color(0xFF2A2A3E) : Colors.white,
+                    elevation: 8,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    items: List.generate(_totalChapters, (index) {
+                      final chapters = widget.document.chapters.isNotEmpty
+                          ? widget.document.chapters
+                          : _autoChapters;
+                      final chapterTitle =
+                          chapters[index]['title']?.toString() ??
+                          'Глава ${index + 1}';
+                      final isCurrent = index == _currentChapterIndex;
+                      return PopupMenuItem<int>(
+                        value: index,
+                        child: Row(
+                          children: [
+                            Container(
+                              width: 24,
+                              height: 24,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: isCurrent
+                                    ? _buttonColor
+                                    : Colors.grey[200],
+                              ),
+                              child: Center(
+                                child: Text(
+                                  '${index + 1}',
+                                  style: GoogleFonts.inter(
+                                    color: isCurrent
+                                        ? Colors.white
+                                        : Colors.grey[600],
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                  ),
                                 ),
                               ),
                             ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              chapterTitle,
-                              style: GoogleFonts.inter(
-                                color: _textColor,
-                                fontWeight: isCurrent
-                                    ? FontWeight.w600
-                                    : FontWeight.w400,
-                                fontSize: 13,
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                chapterTitle,
+                                style: GoogleFonts.inter(
+                                  color: _textColor,
+                                  fontWeight: isCurrent
+                                      ? FontWeight.w600
+                                      : FontWeight.w400,
+                                  fontSize: 13,
+                                ),
+                                overflow: TextOverflow.ellipsis,
                               ),
-                              overflow: TextOverflow.ellipsis,
                             ),
+                            if (isCurrent)
+                              Icon(Icons.check, color: _buttonColor, size: 16),
+                          ],
+                        ),
+                      );
+                    }),
+                  ).then((index) {
+                    if (index != null && index != _currentChapterIndex) {
+                      setState(() {
+                        _currentChapterIndex = index;
+                        _showTranslation = false;
+                        _translatedContent = null;
+                      });
+                      _scrollController.jumpTo(0);
+                    }
+                  });
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: _buttonColor.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: _buttonColor.withValues(alpha: 0.2),
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.layers, size: 13, color: _buttonColor),
+                      const SizedBox(width: 4),
+                      Flexible(
+                        child: Text(
+                          _currentTitle.length < 25
+                              ? _currentTitle
+                              : 'Глава ${_currentChapterIndex + 1}',
+                          style: GoogleFonts.inter(
+                            color: _buttonColor,
+                            fontWeight: FontWeight.w600,
+                            fontSize: 11,
                           ),
-                          if (isCurrent)
-                            Icon(Icons.check, color: _buttonColor, size: 16),
-                        ],
+                          overflow: TextOverflow.ellipsis,
+                        ),
                       ),
-                    );
-                  }),
-                ).then((index) {
-                  if (index != null && index != _currentChapterIndex) {
-                    setState(() {
-                      _currentChapterIndex = index;
-                      _showTranslation = false;
-                      _translatedContent = null;
-                    });
-                    _scrollController.jumpTo(0);
-                  }
-                });
-              },
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 6,
-                ),
-                decoration: BoxDecoration(
-                  color: _buttonColor.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: _buttonColor.withValues(alpha: 0.2),
+                      const SizedBox(width: 2),
+                      Text(
+                        '${_currentChapterIndex + 1}/$_totalChapters',
+                        style: GoogleFonts.inter(
+                          color: _buttonColor.withValues(alpha: 0.6),
+                          fontWeight: FontWeight.w400,
+                          fontSize: 10,
+                        ),
+                      ),
+                      const SizedBox(width: 2),
+                      Icon(
+                        Icons.keyboard_arrow_down,
+                        size: 14,
+                        color: _buttonColor,
+                      ),
+                    ],
                   ),
                 ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.layers, size: 13, color: _buttonColor),
-                    const SizedBox(width: 4),
-                    Flexible(
-                      child: Text(
-                        _currentTitle.length < 25
-                            ? _currentTitle
-                            : 'Глава ${_currentChapterIndex + 1}',
-                        style: GoogleFonts.inter(
-                          color: _buttonColor,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 11,
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    const SizedBox(width: 2),
-                    Text(
-                      '${_currentChapterIndex + 1}/$_totalChapters',
-                      style: GoogleFonts.inter(
-                        color: _buttonColor.withValues(alpha: 0.6),
-                        fontWeight: FontWeight.w400,
-                        fontSize: 10,
-                      ),
-                    ),
-                    const SizedBox(width: 2),
-                    Icon(
-                      Icons.keyboard_arrow_down,
-                      size: 14,
-                      color: _buttonColor,
-                    ),
-                  ],
+              ),
+            ),
+            IconButton(
+              icon: Icon(
+                Icons.chevron_right,
+                color: _textColor.withValues(
+                  alpha: _currentChapterIndex < _totalChapters - 1 ? 1.0 : 0.3,
+                ),
+              ),
+              onPressed: _currentChapterIndex < _totalChapters - 1
+                  ? () {
+                      setState(() {
+                        _currentChapterIndex++;
+                        _showTranslation = false;
+                        _translatedContent = null;
+                      });
+                      _scrollController.jumpTo(0);
+                    }
+                  : null,
+              tooltip: 'Следующая глава',
+              splashRadius: 18,
+              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+              padding: EdgeInsets.zero,
+            ),
+            _buildFontSizeButton(-1, Icons.text_decrease, 'Уменьшить шрифт'),
+            _buildFontSizeButton(1, Icons.text_increase, 'Увеличить шрифт'),
+            Container(
+              margin: const EdgeInsets.symmetric(horizontal: 2),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: _buttonColor.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                '${_fontSize.toInt()}',
+                style: GoogleFonts.inter(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: _buttonColor,
                 ),
               ),
             ),
-          ),
-          IconButton(
-            icon: Icon(
-              Icons.chevron_right,
-              color: _textColor.withValues(
-                alpha: _currentChapterIndex < _totalChapters - 1 ? 1.0 : 0.3,
-              ),
-            ),
-            onPressed: _currentChapterIndex < _totalChapters - 1
-                ? () {
-                    setState(() {
-                      _currentChapterIndex++;
-                      _showTranslation = false;
-                      _translatedContent = null;
-                    });
-                    _scrollController.jumpTo(0);
-                  }
-                : null,
-            tooltip: 'Следующая глава',
-            splashRadius: 18,
-            constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
-            padding: EdgeInsets.zero,
-          ),
-          _buildFontSizeButton(-1, Icons.text_decrease, 'Уменьшить шрифт'),
-          _buildFontSizeButton(1, Icons.text_increase, 'Увеличить шрифт'),
-          Container(
-            margin: const EdgeInsets.symmetric(horizontal: 2),
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-            decoration: BoxDecoration(
-              color: _buttonColor.withValues(alpha: 0.08),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Text(
-              '${_fontSize.toInt()}',
-              style: GoogleFonts.inter(
-                fontSize: 11,
-                fontWeight: FontWeight.w600,
-                color: _buttonColor,
-              ),
-            ),
-          ),
-          _buildBookmarkButton(),
-          if (widget.document.language != 'ru' &&
-              widget.document.language.isNotEmpty)
-            _buildTranslateButton(),
-        ],
+            _buildBookmarkButton(),
+            if (widget.document.language != 'ru' &&
+                widget.document.language.isNotEmpty)
+              _buildTranslateButton(),
+          ],
+        ),
       ),
     );
   }

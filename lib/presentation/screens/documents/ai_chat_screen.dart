@@ -43,6 +43,18 @@ class _AiChatScreenState extends State<AiChatScreen> {
     super.dispose();
   }
 
+  List<Map<String, String>> _buildHistory() {
+    final history = <Map<String, String>>[];
+    final start = _messages.length > 8 ? _messages.length - 8 : 0;
+    for (int i = start; i < _messages.length; i++) {
+      history.add({
+        'role': _messages[i].isUser ? 'user' : 'assistant',
+        'content': _messages[i].text,
+      });
+    }
+    return history;
+  }
+
   Future<void> _sendMessage(String text) async {
     if (text.trim().isEmpty) return;
 
@@ -58,6 +70,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
         documentId: widget.document.id,
         question: text.trim(),
         documentContent: widget.document.content,
+        conversationHistory: _buildHistory(),
       );
       if (mounted) {
         setState(() {
