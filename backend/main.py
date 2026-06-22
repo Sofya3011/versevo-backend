@@ -459,7 +459,7 @@ def _similarity(s1: str, s2: str) -> float:
 
 # ===== CHAT =====
 _HF_API_KEY = os.getenv("HF_API_KEY", "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")
-_HF_MODELS = ["google/flan-t5-xl", "google/flan-t5-large", "google/flan-t5-base"]
+_HF_MODELS = ["google/flan-t5-large", "google/flan-t5-base", "google/flan-t5-small"]
 
 def _call_hf_api(prompt: str, max_tokens: int = 350) -> str:
     for model in _HF_MODELS:
@@ -485,7 +485,7 @@ def _call_hf_api(prompt: str, max_tokens: int = 350) -> str:
                 break
     return ""
 
-def _extract_relevant_context(content: str, question: str, max_chars: int = 1500) -> str:
+def _extract_relevant_context(content: str, question: str, max_chars: int = 800) -> str:
     clean = re.sub(r'<[iI][mM][gG]\b[^>]*>', '', content)
     clean = re.sub(r'!\[([^\]]*)\]\(([^)]*)\)', '', clean)
     if len(clean) <= max_chars:
@@ -525,22 +525,12 @@ def _extract_relevant_context(content: str, question: str, max_chars: int = 1500
 def _build_chat_prompt(document: dict, question: str, history: list) -> str:
     content = document.get("content", "")
     context_chunk = _extract_relevant_context(content, question)
-    lines = []
-    lines.append("Ответь на вопрос по тексту документа на русском языке.")
-    lines.append("Анализируй текст: выдели главные темы, тезисы, факты, персонажей, статистику если есть.")
-    lines.append("Если информации недостаточно, чётко скажи чего именно не хватает.")
-    lines.append("")
     if context_chunk:
-        lines.append("Текст документа:")
-        lines.append(context_chunk)
-        lines.append("")
-    for msg in history[-4:]:
-        role = "Пользователь" if msg.get("role") == "user" else "Ассистент"
-        lines.append(f"{role}: {msg.get('content', '')}")
-    lines.append("")
-    lines.append(f"Вопрос: {question}")
-    lines.append("Ответ:")
-    return "\n".join(lines)
+        return (f"Ты полезный ассистент для анализа документов. Отвечай на русском языке развёрнуто и по делу.\n\n"
+                f"Контекст: {context_chunk}\n\n"
+                f"Вопрос: {question}\n\nОтвет:")
+    return (f"Ты полезный ассистент для анализа документов. Отвечай на русском языке развёрнуто и по делу.\n\n"
+            f"Вопрос: {question}\n\nОтвет:")
 
 def _deep_fallback(content: str, question: str) -> str:
     q = question.lower().strip()

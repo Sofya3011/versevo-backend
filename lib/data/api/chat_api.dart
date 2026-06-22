@@ -7,14 +7,10 @@ class ChatApi {
   final Dio _hfDio;
   static const String _hfApiKey = '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';
 
-  /// Models that work reliably on HF free Inference API
-  /// flan-t5-xl (3B) — best balance of capability & availability
-  /// flan-t5-large (780M) — reliable fallback
-  /// flan-t5-base (250M) — last resort
   static const _models = [
-    'google/flan-t5-xl',
     'google/flan-t5-large',
     'google/flan-t5-base',
+    'google/flan-t5-small',
   ];
 
   String? _cachedContent;
@@ -86,10 +82,11 @@ class ChatApi {
   }
 
   String _extractRelevantContext(String content, String question) {
-    if (content.length <= 1500) return content;
+    const maxChars = 800;
+    if (content.length <= maxChars) return content;
 
     final paragraphs = content.split('\n\n').where((p) => p.trim().length > 20).toList();
-    if (paragraphs.isEmpty) return content.substring(0, 1500);
+    if (paragraphs.isEmpty) return content.substring(0, maxChars);
 
     final keywords = question
         .toLowerCase()
@@ -98,7 +95,7 @@ class ChatApi {
         .where((w) => w.length > 2)
         .toList();
 
-    if (keywords.isEmpty) return content.substring(0, 1500);
+    if (keywords.isEmpty) return content.substring(0, maxChars);
 
     final scored = <int>[];
     for (int i = 0; i < paragraphs.length; i++) {
@@ -110,7 +107,7 @@ class ChatApi {
       if (score > 0) scored.add(i);
     }
 
-    if (scored.isEmpty) return content.substring(0, 1500);
+    if (scored.isEmpty) return content.substring(0, maxChars);
 
     final included = <int>{};
     for (final idx in scored) {
@@ -124,14 +121,14 @@ class ChatApi {
     int chars = 0;
     for (final idx in selected) {
       final add = paragraphs[idx];
-      if (chars + add.length > 1500) break;
+      if (chars + add.length > maxChars) break;
       buffer.writeln(add);
       buffer.writeln();
       chars += add.length;
     }
 
     final result = buffer.toString().trim();
-    if (result.length < 200) return content.substring(0, 1500);
+    if (result.length < 200) return content.substring(0, maxChars);
     return result;
   }
 
@@ -177,29 +174,19 @@ class ChatApi {
     return null;
   }
 
-  /// Simple prompt that flan-t5 models understand reliably
   String _buildPrompt(
     String contextChunk,
     String question,
     List<Map<String, String>> history,
   ) {
-    final buf = StringBuffer();
-
-    buf.writeln('Ответь на вопрос по тексту документа на русском языке.');
-    buf.writeln('Анализируй текст: выдели главные темы, тезисы, факты, персонажей, статистику если есть.');
-    buf.writeln('Если информации недостаточно, чётко скажи чего именно не хватает.');
-    buf.writeln();
-
-    if (contextChunk.isNotEmpty) {
-      buf.writeln('Текст документа:');
-      buf.writeln(contextChunk);
-      buf.writeln();
-    }
-
-    buf.writeln('Вопрос: $question');
-    buf.writeln('Ответ:');
-
-    return buf.toString();
+    return contextChunk.isNotEmpty
+        ? 'Ты полезный ассистент для анализа документов. Отвечай на русском языке развёрнуто и по делу.\n\n'
+            'Контекст: $contextChunk\n\n'
+            'Вопрос: $question\n\n'
+            'Ответ:'
+        : 'Ты полезный ассистент для анализа документов. Отвечай на русском языке развёрнуто и по делу.\n\n'
+            'Вопрос: $question\n\n'
+            'Ответ:';
   }
 
   String _stripImages(String text) {
@@ -217,8 +204,16 @@ class ChatApi {
     return text.trim();
   }
 
+  bool _isModelLoading(Object? data) {
+    if (data is Map) {
+      final err = (data['error']?.toString() ?? '').toLowerCase();
+      if (err.contains('loading') || err.contains('load')) return true;
+    }
+    return false;
+  }
+
   Future<String?> _callHF(String model, String prompt) async {
-    for (int attempt = 0; attempt < 6; attempt++) {
+    for (int attempt = 0; attempt < 10; attempt++) {
       try {
         final response = await _hfDio.post(
           'https://api-inference.huggingface.co/models/$model',
@@ -237,30 +232,47 @@ class ChatApi {
         );
 
         if (response.statusCode == 503) {
-          print('HF $model loading, retry $attempt...');
-          await Future.delayed(Duration(seconds: 2 + attempt * 3));
+          final wait = 3 + attempt * 5;
+          print('HF $model 503, retry $attempt after ${wait}s...');
+          await Future.delayed(Duration(seconds: wait));
           continue;
         }
 
-        if (response.statusCode == 200 && response.data is List && response.data.isNotEmpty) {
-          if (response.data[0] is Map) {
-            final item = response.data[0] as Map;
-            if (item.containsKey('error')) {
-              print('HF $model error: ${item['error']}');
-              break;
+        if (response.statusCode == 200) {
+          if (response.data is List && response.data.isNotEmpty) {
+            if (response.data[0] is Map) {
+              final item = response.data[0] as Map;
+              if (item.containsKey('error')) {
+                if (_isModelLoading(item)) {
+                  print('HF $model loading in body, retry $attempt...');
+                  await Future.delayed(Duration(seconds: 5 + attempt * 3));
+                  continue;
+                }
+                print('HF $model error: ${item['error']}');
+                break;
+              }
+              return item['generated_text']?.toString() ?? '';
             }
-            return item['generated_text']?.toString() ?? '';
+            if (response.data[0] is String) {
+              return response.data[0] as String;
+            }
           }
-          if (response.data[0] is String) {
-            return response.data[0] as String;
+          if (response.data is Map && _isModelLoading(response.data)) {
+            print('HF $model loading (200+Map), retry $attempt...');
+            await Future.delayed(Duration(seconds: 5 + attempt * 3));
+            continue;
           }
         }
 
         print('HF $model unexpected: ${response.statusCode}');
       } on DioException catch (e) {
         if (e.response?.statusCode == 503) {
-          print('HF $model loading (dio), retry $attempt...');
-          await Future.delayed(Duration(seconds: 2 + attempt * 3));
+          print('HF $model 503 dio, retry $attempt...');
+          await Future.delayed(Duration(seconds: 3 + attempt * 5));
+          continue;
+        }
+        if (e.type == DioExceptionType.sendTimeout || e.type == DioExceptionType.receiveTimeout) {
+          print('HF $model timeout, retry $attempt...');
           continue;
         }
         print('HF $model dio: $e');
