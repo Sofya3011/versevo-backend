@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:versevo_app/data/api/api_client.dart';
 
@@ -213,75 +215,123 @@ class ChatApi {
   }
 
   Future<String?> _callHF(String model, String prompt) async {
-    for (int attempt = 0; attempt < 10; attempt++) {
+    for (int attempt = 0; attempt < 8; attempt++) {
+      final wait = 2 + attempt * 4;
+      String? result;
+
+      // Try with dart:io HttpClient first (lower level, no Dio overhead)
       try {
-        final response = await _hfDio.post(
-          'https://api-inference.huggingface.co/models/$model',
-          data: {
+        result = await _callHFWithHttpClient(model, prompt);
+        if (result != null) return result;
+      } catch (e) {
+        print('HF HttpClient [$model] attempt $attempt: $e');
+      }
+
+      // Fallback to Dio
+      if (result == null) {
+        try {
+          result = await _callHFWithDio(model, prompt);
+          if (result != null) return result;
+        } catch (e) {
+          print('HF Dio [$model] attempt $attempt: $e');
+        }
+      }
+
+      if (result == null) {
+        print('HF [$model] attempt $attempt failed, waiting ${wait}s...');
+        await Future.delayed(Duration(seconds: wait));
+      }
+    }
+    return null;
+  }
+
+  Future<String?> _callHFWithHttpClient(String model, String prompt) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 60);
+    try {
+      final request = await client
+          .postUrl(Uri.parse('https://api-inference.huggingface.co/models/$model'))
+          ..headers.set('Authorization', 'Bearer $_hfApiKey')
+          ..headers.set('Content-Type', 'application/json')
+          ..write(jsonEncode({
             'inputs': prompt,
             'parameters': {
               'max_new_tokens': 350,
               'temperature': 0.7,
               'do_sample': true,
             },
-          },
-          options: Options(
-            sendTimeout: const Duration(seconds: 60),
-            receiveTimeout: const Duration(seconds: 120),
-          ),
-        );
+          }));
 
-        if (response.statusCode == 503) {
-          final wait = 3 + attempt * 5;
-          print('HF $model 503, retry $attempt after ${wait}s...');
-          await Future.delayed(Duration(seconds: wait));
-          continue;
-        }
+      final response = await request.close().timeout(const Duration(seconds: 90));
+      if (response.statusCode == 503) return null;
 
-        if (response.statusCode == 200) {
-          if (response.data is List && response.data.isNotEmpty) {
-            if (response.data[0] is Map) {
-              final item = response.data[0] as Map;
-              if (item.containsKey('error')) {
-                if (_isModelLoading(item)) {
-                  print('HF $model loading in body, retry $attempt...');
-                  await Future.delayed(Duration(seconds: 5 + attempt * 3));
-                  continue;
-                }
-                print('HF $model error: ${item['error']}');
-                break;
-              }
-              return item['generated_text']?.toString() ?? '';
-            }
-            if (response.data[0] is String) {
-              return response.data[0] as String;
-            }
-          }
-          if (response.data is Map && _isModelLoading(response.data)) {
-            print('HF $model loading (200+Map), retry $attempt...');
-            await Future.delayed(Duration(seconds: 5 + attempt * 3));
-            continue;
-          }
-        }
+      final body = await response.transform(utf8.decoder).join();
+      if (body.trim().isEmpty) return null;
 
-        print('HF $model unexpected: ${response.statusCode}');
-      } on DioException catch (e) {
-        if (e.response?.statusCode == 503) {
-          print('HF $model 503 dio, retry $attempt...');
-          await Future.delayed(Duration(seconds: 3 + attempt * 5));
-          continue;
-        }
-        if (e.type == DioExceptionType.sendTimeout || e.type == DioExceptionType.receiveTimeout) {
-          print('HF $model timeout, retry $attempt...');
-          continue;
-        }
-        print('HF $model dio: $e');
-      } catch (e) {
-        print('HF $model error: $e');
+      final decoded = jsonDecode(body);
+      if (decoded is List && decoded.isNotEmpty) {
+        return _extractHfResult(decoded[0]);
       }
-      break;
+      if (decoded is Map) {
+        if (_isModelLoading(decoded)) return null;
+        return decoded['generated_text']?.toString() ?? decoded.values.first?.toString();
+      }
+    } catch (e) {
+      rethrow;
+    } finally {
+      client.close(force: true);
     }
     return null;
+  }
+
+  Future<String?> _callHFWithDio(String model, String prompt) async {
+    try {
+      final response = await _hfDio.post(
+        'https://api-inference.huggingface.co/models/$model',
+        data: {
+          'inputs': prompt,
+          'parameters': {
+            'max_new_tokens': 350,
+            'temperature': 0.7,
+            'do_sample': true,
+          },
+        },
+        options: Options(
+          connectTimeout: const Duration(seconds: 60),
+          receiveTimeout: const Duration(seconds: 90),
+        ),
+      );
+
+      if (response.statusCode == 503) return null;
+
+      if (response.statusCode == 200 && response.data != null) {
+        if (response.data is List && response.data.isNotEmpty) {
+          return _extractHfResult(response.data[0]);
+        }
+        if (response.data is Map) {
+          if (_isModelLoading(response.data)) return null;
+          return response.data['generated_text']?.toString() ?? (response.data as Map).values.first?.toString();
+        }
+      }
+    } on DioException catch (e) {
+      if (e.response?.statusCode == 503) return null;
+      if (e.type == DioExceptionType.connectionTimeout ||
+          e.type == DioExceptionType.sendTimeout ||
+          e.type == DioExceptionType.receiveTimeout) {
+        return null;
+      }
+      rethrow;
+    }
+    return null;
+  }
+
+  String? _extractHfResult(dynamic item) {
+    if (item is Map) {
+      if (item.containsKey('error')) return null;
+      return item['generated_text']?.toString() ?? item.values.first?.toString();
+    }
+    if (item is String) return item;
+    return item?.toString();
   }
 
   String _cleanFlanResult(String raw, String prompt) {
